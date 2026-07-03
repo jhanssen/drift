@@ -395,7 +395,7 @@ void WaylandApp::drawFrame()
     }
 
     mGpu->beginFrame(buf->target);
-    mRenderFrame(buf->target.texture.CreateView(), (float)now());
+    mRenderFrame(buf->target.texture.CreateView(), mWidth, mHeight, (float)now());
     mGpu->endFrame(buf->target);
 
     wl_surface_attach(mSurface, buf->buffer, 0, 0);

@@ -276,6 +276,7 @@ To be nailed down on paper before runtime implementation begins:
 - Presentation: bypass Dawn's swapchain — render into self-allocated dmabuf textures imported into Dawn, committed to the layer surface via `linux-dmabuf` (prior art: [overdraw](https://github.com/jhanssen/overdraw)); the same dmabuf import path serves zero-copy video decode later
 - Dev modes, first-class from the start: `--windowed` (xdg-toplevel, develop without replacing the wallpaper) and `--headless` (offscreen render, dump frames as PNG — doubles as the golden-image test harness)
 - Toolchain: C++23, CMake + Ninja, single-threaded core (one decode thread per video node); Dawn via tarball download; glaze (JSON), ffmpeg/VAAPI (video), stb_image + libktx (images), raw wayland-client with scanner-generated protocols
+- Dependency policy: system-coupled C libraries (ffmpeg, libva, wayland-client, gbm, libdrm) come from the system via pkg-config — never vendored (ffmpeg is LGPL; dynamic system linking keeps the Apache-2.0 project clean); portable C++ dependencies (glaze, libktx) via CMake FetchContent pinned to exact release tags, each wrapped in a `3rdparty/<name>/CMakeLists.txt`; Dawn is the one prebuilt tarball; trivial single-headers (stb) vendored in `3rdparty/`
 
 ### 13.3 Explicitly Deferred (post-v1)
 

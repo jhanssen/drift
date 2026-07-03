@@ -4,8 +4,9 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: scaffold — renders an animated placeholder gradient. Wayland
-(wlr-layer-shell compositors) only.
+Status: early. Loads and renders `.sceneproject` scenes with a first node set
+(shader, wave, remap, combine, split, time, output); image/video/transform/
+compositor/mouse nodes are next. Wayland (wlr-layer-shell compositors) only.
 
 ## Build
 
@@ -21,10 +22,12 @@ ninja -C build
 ## Run
 
 ```
-build/drift                    # wallpaper (layer-shell background surface)
-build/drift --windowed         # dev window
-build/drift --headless 60 --out /tmp/frames   # offscreen, writes PNGs
+build/drift examples/plasma.sceneproject              # wallpaper (layer-shell)
+build/drift examples/plasma.sceneproject --windowed   # dev window
+build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 ```
+
+Without a scene argument, a builtin placeholder gradient is rendered.
 
 ## Layout
 

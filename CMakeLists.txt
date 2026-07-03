@@ -12,6 +12,8 @@ endif()
 
 # Sets Dawn_DIR (downloads/extracts the prebuilt bundle on first configure).
 add_subdirectory(3rdparty/dawn)
+# glaze (FetchContent, header-only). Provides glaze::glaze target.
+add_subdirectory(3rdparty/glaze)
 
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -29,9 +31,13 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
 # later recompiles unchanged under Emscripten for the browser runtime.
 add_library(drift_core STATIC
     src/core/Renderer.cpp
+    src/core/Scene.cpp
+    src/core/SceneLoader.cpp
+    src/core/Nodes.cpp
+    src/core/WgslInterface.cpp
 )
 target_include_directories(drift_core PUBLIC src)
-target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn)
+target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn PRIVATE glaze::glaze)
 
 # ---- drift: native Linux/Wayland runtime ----
 set(WLGEN src/platform/linux/wayland-generated)

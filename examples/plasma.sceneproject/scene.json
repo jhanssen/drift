@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "name": "Plasma",
+  "parameters": {
+    "speed": { "type": "scalar", "default": 0.05, "min": 0, "max": 0.5, "label": "Drift speed" },
+    "scale": { "type": "scalar", "default": 3.0, "min": 0.5, "max": 10, "label": "Pattern scale" }
+  },
+  "nodes": [
+    { "id": "phase", "type": "wave", "shape": "saw",
+      "inputs": { "input": "@time.seconds", "frequency": "$speed" } },
+    { "id": "phase01", "type": "remap",
+      "inputs": { "value": "@phase", "inMin": -1, "inMax": 1 } },
+
+    { "id": "plasma", "type": "shader", "shader": "shaders/plasma.wgsl",
+      "inputs": { "phase": "@phase01", "scale": "$scale" } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@plasma" } }
+  ]
+}

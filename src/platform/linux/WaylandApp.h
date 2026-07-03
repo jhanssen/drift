@@ -44,9 +44,10 @@ public:
 
     wgpu::TextureFormat targetFormat() const { return mFormat; }
 
-    // Frame loop until the surface is closed. renderFrame(targetView,
-    // timeSeconds) records and submits the frame's GPU work.
-    using RenderFrame = std::function<void(const wgpu::TextureView&, float)>;
+    // Frame loop until the surface is closed. renderFrame(targetView, width,
+    // height, timeSeconds) records and submits the frame's GPU work.
+    using RenderFrame =
+        std::function<void(const wgpu::TextureView&, uint32_t, uint32_t, float)>;
     int run(RenderFrame renderFrame);
 
     // -- internal, public for C listener trampolines --
