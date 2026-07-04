@@ -774,6 +774,33 @@ TEST_CASE("load warnings: unknown properties, fields, hints, unreachable nodes")
     CHECK_FALSE(r.scene->animated());
 }
 
+TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "editor": { "positions": { "fx": [40, 120], "somethingElse": true } },
+        "nodes": [
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty()); // contents are the editor's business, not ours
+
+    auto bad = load(R"({
+        "version": 1, "name": "x", "editor": 5,
+        "nodes": [
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    REQUIRE(bad.scene != nullptr);
+    CHECK(bad.hasWarning("'editor' must be an object"));
+}
+
 TEST_CASE("parameter step, label, and hint are parsed")
 {
     auto r = load(R"({

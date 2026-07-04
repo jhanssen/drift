@@ -28,7 +28,8 @@ must not escape the project root (`..` is rejected at load).
   "author": "optional",
   "description": "optional",
   "parameters": { },
-  "nodes": [ ]
+  "nodes": [ ],
+  "editor": { }
 }
 ```
 
@@ -38,9 +39,28 @@ must not escape the project root (`..` is rejected at load).
 - `author`, `description` (optional, string): metadata.
 - `parameters` (optional, object): user-tweakable scene parameters (§6).
 - `nodes` (required, array): the scene graph (§8).
+- `editor` (optional, object): tool-owned metadata (§2.1).
 
 Unknown top-level fields are a load warning, not an error (forward
 compatibility within a version).
+
+### 2.1 The `editor` Block
+
+Editing tools need scene-scoped state that has no runtime meaning — node
+positions in a graph view, collapsed panels. The `editor` top-level object is
+that home. The runtime validates only that it is an object (anything else is
+a load warning and the block is ignored) and never reads inside; pushed and
+hot-reloaded documents carry it along unchanged. Runtimes predating this
+section degrade safely: an unknown top-level field is a warning, not an error.
+
+Keys defined so far (tools must preserve keys they do not understand):
+
+- `positions` (object): graph-view placement — node id → `[x, y]`, the node's
+  top-left corner in abstract canvas units (pixels at zoom 1, +y down). The
+  reserved implicit ids `time` and `mouse` (§3) may appear as keys; they can
+  never clash with authored nodes. Entries whose id no longer exists in
+  `nodes` are ignored and may be dropped on save. Nodes without an entry are
+  auto-laid-out by the tool.
 
 ## 3. Identifiers
 
@@ -529,10 +549,10 @@ unknown track `kind`; value track with empty `keys`, non-ascending `t`, `t`
 outside `[0, duration]`, or `value` not matching `type`; event track with
 empty or non-ascending `fires` or a time outside `[0, duration)`.
 
-Load warnings: unknown top-level field; unknown node property; node
-unreachable from `output`; unknown parameter `hint`; a `sequence` output port
-that nothing references; an event track on a `sequence` whose `time` input
-is not wired from `@time` (§9.9).
+Load warnings: unknown top-level field; a non-object `editor` block (§2.1);
+unknown node property; node unreachable from `output`; unknown parameter
+`hint`; a `sequence` output port that nothing references; an event track on a
+`sequence` whose `time` input is not wired from `@time` (§9.9).
 
 ## 14. Example Scenes
 

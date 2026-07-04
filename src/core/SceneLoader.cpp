@@ -1324,8 +1324,15 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
     }
 
     for (const auto& [key, value] : top) {
-        if (key != "version" && key != "name" && key != "author" &&
-            key != "description" && key != "parameters" && key != "nodes") {
+        if (key == "editor") {
+            // Tool-owned metadata (§2.1): only its shape is validated; the
+            // contents belong to editors, never the runtime.
+            if (!value.is_object()) {
+                warn("'editor' must be an object; ignored");
+            }
+        } else if (key != "version" && key != "name" && key != "author" &&
+                   key != "description" && key != "parameters" &&
+                   key != "nodes") {
             warn("unknown top-level field '" + key + "' ignored");
         }
     }
