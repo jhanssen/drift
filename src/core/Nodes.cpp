@@ -281,26 +281,91 @@ void SplitNode::evaluate(FrameContext&)
 
 namespace {
 
-// Converts 8-bit RGBA to the texture-edge contract (§12): linear color,
-// premultiplied alpha, rgba16float.
-void convertRgba8(const uint8_t* rgba, uint32_t width, uint32_t height,
-                  bool srgb, bool premultiplied, std::vector<uint8_t>& out)
+// CPU-side image plumbing for the texture-edge contract (§12): linear
+// color, premultiplied alpha. Filtering happens in this space (the only
+// space where averaging texels is correct), then packs to rgba16float.
+struct FloatImage {
+    std::vector<float> px; // rgba
+    uint32_t width = 0, height = 0;
+};
+
+FloatImage toLinearPremultiplied(const uint8_t* rgba, uint32_t width,
+                                 uint32_t height, bool srgb, bool premultiplied)
 {
     float toLinear[256];
     for (int i = 0; i < 256; ++i) {
         const float c = (float)i / 255.0f;
         toLinear[i] = srgb ? srgbDecode(c) : c;
     }
-    out.resize((size_t)width * height * 8);
-    auto* half = (uint16_t*)out.data();
+    FloatImage img;
+    img.width = width;
+    img.height = height;
+    img.px.resize((size_t)width * height * 4);
     for (size_t i = 0; i < (size_t)width * height; ++i) {
         const float a = (float)rgba[i * 4 + 3] / 255.0f;
         const float mul = premultiplied ? 1.0f : a;
-        half[i * 4 + 0] = floatToHalf(toLinear[rgba[i * 4 + 0]] * mul);
-        half[i * 4 + 1] = floatToHalf(toLinear[rgba[i * 4 + 1]] * mul);
-        half[i * 4 + 2] = floatToHalf(toLinear[rgba[i * 4 + 2]] * mul);
-        half[i * 4 + 3] = floatToHalf(a);
+        img.px[i * 4 + 0] = toLinear[rgba[i * 4 + 0]] * mul;
+        img.px[i * 4 + 1] = toLinear[rgba[i * 4 + 1]] * mul;
+        img.px[i * 4 + 2] = toLinear[rgba[i * 4 + 2]] * mul;
+        img.px[i * 4 + 3] = a;
     }
+    return img;
+}
+
+FloatImage downsample(const FloatImage& src)
+{
+    FloatImage dst;
+    dst.width = std::max(1u, src.width / 2);
+    dst.height = std::max(1u, src.height / 2);
+    dst.px.resize((size_t)dst.width * dst.height * 4);
+    for (uint32_t y = 0; y < dst.height; ++y) {
+        for (uint32_t x = 0; x < dst.width; ++x) {
+            const uint32_t x0 = 2 * x, y0 = 2 * y;
+            const uint32_t x1 = std::min(x0 + 1, src.width - 1);
+            const uint32_t y1 = std::min(y0 + 1, src.height - 1);
+            const float* p00 = &src.px[((size_t)y0 * src.width + x0) * 4];
+            const float* p10 = &src.px[((size_t)y0 * src.width + x1) * 4];
+            const float* p01 = &src.px[((size_t)y1 * src.width + x0) * 4];
+            const float* p11 = &src.px[((size_t)y1 * src.width + x1) * 4];
+            float* d = &dst.px[((size_t)y * dst.width + x) * 4];
+            for (int c = 0; c < 4; ++c) {
+                d[c] = (p00[c] + p10[c] + p01[c] + p11[c]) * 0.25f;
+            }
+        }
+    }
+    return dst;
+}
+
+void packHalf(const FloatImage& img, std::vector<uint8_t>& out,
+              uint32_t& width, uint32_t& height)
+{
+    out.resize(img.px.size() * 2);
+    auto* half = (uint16_t*)out.data();
+    for (size_t i = 0; i < img.px.size(); ++i) {
+        half[i] = floatToHalf(img.px[i]);
+    }
+    width = img.width;
+    height = img.height;
+}
+
+// Full mip chain from an 8-bit RGBA base (§9.1: CPU-decoded sources get
+// generated mips so transform-minified layers don't alias).
+template <typename Level>
+std::vector<Level> buildMipChain(const uint8_t* rgba, uint32_t width,
+                                 uint32_t height, bool srgb, bool premultiplied)
+{
+    std::vector<Level> levels;
+    FloatImage img = toLinearPremultiplied(rgba, width, height, srgb,
+                                           premultiplied);
+    for (;;) {
+        Level& level = levels.emplace_back();
+        packHalf(img, level.data, level.width, level.height);
+        if (img.width == 1 && img.height == 1) {
+            break;
+        }
+        img = downsample(img);
+    }
+    return levels;
 }
 
 // VkFormat values libktx reports for the payloads we accept.
@@ -424,16 +489,27 @@ ImageNode* ImageNode::decode(const std::string& bytes, std::string& error)
         const bool srgb = tex->vkFormat == kVkFormatR8G8B8A8Srgb;
         const bool premultiplied = ktxTexture2_GetPremultipliedAlpha(tex);
 
-        std::vector<Level> levels(tex->numLevels);
-        for (uint32_t l = 0; l < tex->numLevels; ++l) {
-            Level& level = levels[l];
-            level.width = std::max(1u, tex->baseWidth >> l);
-            level.height = std::max(1u, tex->baseHeight >> l);
+        std::vector<Level> levels;
+        if (tex->numLevels == 1) {
+            // No authored chain: generate one like any CPU-decoded source.
             ktx_size_t offset = 0;
-            ktxTexture_GetImageOffset((ktxTexture*)tex, l, 0, 0, &offset);
-            convertRgba8(ktxTexture_GetData((ktxTexture*)tex) + offset,
-                         level.width, level.height, srgb, premultiplied,
-                         level.data);
+            ktxTexture_GetImageOffset((ktxTexture*)tex, 0, 0, 0, &offset);
+            levels = buildMipChain<Level>(
+                ktxTexture_GetData((ktxTexture*)tex) + offset, tex->baseWidth,
+                tex->baseHeight, srgb, premultiplied);
+        } else {
+            levels.resize(tex->numLevels);
+            for (uint32_t l = 0; l < tex->numLevels; ++l) {
+                Level& level = levels[l];
+                const uint32_t w = std::max(1u, tex->baseWidth >> l);
+                const uint32_t h = std::max(1u, tex->baseHeight >> l);
+                ktx_size_t offset = 0;
+                ktxTexture_GetImageOffset((ktxTexture*)tex, l, 0, 0, &offset);
+                packHalf(toLinearPremultiplied(
+                             ktxTexture_GetData((ktxTexture*)tex) + offset, w,
+                             h, srgb, premultiplied),
+                         level.data, level.width, level.height);
+            }
         }
         ktxTexture_Destroy((ktxTexture*)tex);
         return new ImageNode(std::move(levels),
@@ -449,11 +525,9 @@ ImageNode* ImageNode::decode(const std::string& bytes, std::string& error)
             error = "WebP decode failed";
             return nullptr;
         }
-        std::vector<Level> levels(1);
-        levels[0].width = (uint32_t)width;
-        levels[0].height = (uint32_t)height;
-        convertRgba8(rgba, levels[0].width, levels[0].height, /*srgb=*/true,
-                     /*premultiplied=*/false, levels[0].data);
+        auto levels = buildMipChain<Level>(rgba, (uint32_t)width,
+                                           (uint32_t)height, /*srgb=*/true,
+                                           /*premultiplied=*/false);
         WebPFree(rgba);
         return new ImageNode(std::move(levels),
                              wgpu::TextureFormat::RGBA16Float);
@@ -467,11 +541,8 @@ ImageNode* ImageNode::decode(const std::string& bytes, std::string& error)
         error = stbi_failure_reason();
         return nullptr;
     }
-    std::vector<Level> levels(1);
-    levels[0].width = (uint32_t)width;
-    levels[0].height = (uint32_t)height;
-    convertRgba8(rgba, levels[0].width, levels[0].height, /*srgb=*/true,
-                 /*premultiplied=*/false, levels[0].data);
+    auto levels = buildMipChain<Level>(rgba, (uint32_t)width, (uint32_t)height,
+                                       /*srgb=*/true, /*premultiplied=*/false);
     stbi_image_free(rgba);
     return new ImageNode(std::move(levels), wgpu::TextureFormat::RGBA16Float);
 }
