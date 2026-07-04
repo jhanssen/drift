@@ -61,7 +61,7 @@ bool parseParamOverride(const char* arg, ParamOverride& out)
     const char* p = eq + 1;
     while (n < 4) {
         char* end = nullptr;
-        v.v[n] = strtof(p, &end);
+        v.v[n] = strtod(p, &end);
         if (end == p) {
             return false;
         }

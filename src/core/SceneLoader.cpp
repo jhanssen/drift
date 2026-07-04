@@ -90,7 +90,7 @@ bool parseLiteral(const glz::generic& j, Value& out)
 {
     if (j.is_number()) {
         out.type = ValueType::Scalar;
-        out.v[0] = (float)j.get_number();
+        out.v[0] = j.get_number();
         return true;
     }
     if (j.is_array()) {
@@ -102,7 +102,7 @@ bool parseLiteral(const glz::generic& j, Value& out)
             if (!arr[i].is_number()) {
                 return false;
             }
-            out.v[i] = (float)arr[i].get_number();
+            out.v[i] = arr[i].get_number();
         }
         out.type = arr.size() == 2 ? ValueType::Vec2
                  : arr.size() == 3 ? ValueType::Vec3
@@ -218,7 +218,7 @@ struct PortDef {
     std::string name;
     ValueType type;
     bool required;
-    std::array<float, 4> def{};
+    std::array<double, 4> def{};
     bool array = false; // texture[]: expands to one Node::Input per element
 };
 
@@ -373,7 +373,7 @@ bool Loader::parseParameters(const glz::generic& json)
             return false;
         }
         if (param.def.type == ValueType::Scalar && param.type != ValueType::Scalar) {
-            const float s = param.def.v[0];
+            const double s = param.def.v[0];
             param.def.type = param.type;
             param.def.v = { s, s, s, s };
         }
@@ -390,7 +390,7 @@ bool Loader::parseParameters(const glz::generic& json)
                 return false;
             }
             if (out.type == ValueType::Scalar && param.type != ValueType::Scalar) {
-                const float s = out.v[0];
+                const double s = out.v[0];
                 out.type = param.type;
                 out.v = { s, s, s, s };
             }

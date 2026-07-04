@@ -36,7 +36,11 @@ inline const char* valueTypeName(ValueType t)
 
 struct Value {
     ValueType type = ValueType::Scalar;
-    std::array<float, 4> v{}; // Scalar..Vec4 components
+    // Scalar..Vec4 components. Double so unbounded time-like values survive
+    // long uptimes (SCENE_FORMAT.md §17.2): the CPU value graph computes in
+    // f64; conversion to f32 happens only where uniforms are packed for the
+    // GPU.
+    std::array<double, 4> v{};
     wgpu::Texture texture;    // Texture: premultiplied alpha, linear
     uint32_t texWidth = 0, texHeight = 0;
 

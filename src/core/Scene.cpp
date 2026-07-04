@@ -15,7 +15,7 @@ Value Node::inputValue(size_t index) const
         v = in.constant;
     }
     if (in.splat && v.type == ValueType::Scalar && in.type != ValueType::Scalar) {
-        const float s = v.v[0];
+        const double s = v.v[0];
         v.type = in.type;
         v.v = { s, s, s, s };
     }
@@ -46,7 +46,7 @@ bool Scene::setParameter(const std::string& name, Value value)
             continue;
         }
         if (value.type == ValueType::Scalar && param.type != ValueType::Scalar) {
-            const float s = value.v[0];
+            const double s = value.v[0];
             value.type = param.type;
             value.v = { s, s, s, s };
         }

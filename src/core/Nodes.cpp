@@ -15,7 +15,7 @@ namespace drift::core {
 
 namespace {
 
-constexpr float kTau = 6.28318530717958647692f;
+constexpr double kTau = 6.28318530717958647692;
 
 // Fullscreen-triangle vertex stage prepended to every internal pipeline and
 // to shader node fragment sources (SCENE_FORMAT.md §9.10: uv [0,0] top-left).
@@ -142,9 +142,9 @@ TimeNode::TimeNode()
 void TimeNode::evaluate(FrameContext& ctx)
 {
     Value seconds{};
-    seconds.v[0] = (float)ctx.seconds;
+    seconds.v[0] = ctx.seconds;
     Value delta{};
-    delta.v[0] = firstEvaluate ? 0.0f : (float)(ctx.seconds - mLast);
+    delta.v[0] = firstEvaluate ? 0.0 : ctx.seconds - mLast;
     mLast = ctx.seconds;
     writeOutput(outputs[0], seconds);
     writeOutput(outputs[1], delta);
@@ -186,18 +186,21 @@ WaveNode::WaveNode(Shape shape)
 
 void WaveNode::evaluate(FrameContext&)
 {
-    const float input = inputValue(0).v[0];
-    const float frequency = inputValue(1).v[0];
-    const float phase = inputValue(2).v[0];
-    const float x = input * frequency + phase;
-    const float fract = x - std::floor(x);
+    const double input = inputValue(0).v[0];
+    const double frequency = inputValue(1).v[0];
+    const double phase = inputValue(2).v[0];
+    // Reduce to one cycle in double before any trig: with f32 (or an
+    // unreduced trig argument) the waveform turns steppy after ~a day of
+    // scene time (§17.2).
+    const double x = input * frequency + phase;
+    const double fract = x - std::floor(x);
 
-    float result = 0.0f;
+    double result = 0.0;
     switch (mShape) {
-    case Shape::Sine: result = std::sin(x * kTau); break;
-    case Shape::Triangle: result = 4.0f * std::abs(fract - 0.5f) - 1.0f; break;
-    case Shape::Saw: result = 2.0f * fract - 1.0f; break;
-    case Shape::Square: result = fract < 0.5f ? 1.0f : -1.0f; break;
+    case Shape::Sine: result = std::sin(fract * kTau); break;
+    case Shape::Triangle: result = 4.0 * std::abs(fract - 0.5) - 1.0; break;
+    case Shape::Saw: result = 2.0 * fract - 1.0; break;
+    case Shape::Square: result = fract < 0.5 ? 1.0 : -1.0; break;
     }
 
     Value out{};
@@ -225,12 +228,12 @@ void RemapNode::evaluate(FrameContext&)
     out.type = value.type;
     const int n = componentCount(value.type);
     for (int i = 0; i < n; ++i) {
-        const float range = inMax.v[i] - inMin.v[i];
-        float t = range != 0.0f ? (value.v[i] - inMin.v[i]) / range : 0.0f;
-        float r = outMin.v[i] + t * (outMax.v[i] - outMin.v[i]);
+        const double range = inMax.v[i] - inMin.v[i];
+        double t = range != 0.0 ? (value.v[i] - inMin.v[i]) / range : 0.0;
+        double r = outMin.v[i] + t * (outMax.v[i] - outMin.v[i]);
         if (mClamp) {
-            const float lo = std::min(outMin.v[i], outMax.v[i]);
-            const float hi = std::max(outMin.v[i], outMax.v[i]);
+            const double lo = std::min(outMin.v[i], outMax.v[i]);
+            const double hi = std::max(outMin.v[i], outMax.v[i]);
             r = std::min(std::max(r, lo), hi);
         }
         out.v[i] = r;
@@ -996,16 +999,17 @@ void TransformNode::evaluate(FrameContext& ctx)
         mHeight = ctx.targetHeight;
     }
 
-    constexpr float kDegToRad = kTau / 360.0f;
+    constexpr double kDegToRad = kTau / 360.0;
+    // GPU boundary: f64 value graph narrows to f32 uniforms here (§17.2).
     TransformUniforms u{};
-    u.position[0] = inputValue(1).v[0];
-    u.position[1] = inputValue(1).v[1];
-    u.scale[0] = inputValue(3).v[0];
-    u.scale[1] = inputValue(3).v[1];
-    u.anchor[0] = inputValue(4).v[0];
-    u.anchor[1] = inputValue(4).v[1];
-    u.rotation = inputValue(2).v[0] * kDegToRad;
-    u.opacity = inputValue(5).v[0];
+    u.position[0] = (float)inputValue(1).v[0];
+    u.position[1] = (float)inputValue(1).v[1];
+    u.scale[0] = (float)inputValue(3).v[0];
+    u.scale[1] = (float)inputValue(3).v[1];
+    u.anchor[0] = (float)inputValue(4).v[0];
+    u.anchor[1] = (float)inputValue(4).v[1];
+    u.rotation = (float)(inputValue(2).v[0] * kDegToRad);
+    u.opacity = (float)inputValue(5).v[0];
     u.srcAspect = source.texHeight ? (float)source.texWidth / source.texHeight : 1.0f;
     u.outAspect = mHeight ? (float)mWidth / mHeight : 1.0f;
     ctx.device.GetQueue().WriteBuffer(mUniforms, 0, &u, sizeof(u));
@@ -1262,8 +1266,14 @@ void ShaderNode::evaluate(FrameContext& ctx)
         std::vector<uint8_t> data(mInterface.uniformSize, 0);
         for (size_t i = 0; i < mInterface.fields.size(); ++i) {
             const Value v = inputValue(i);
-            std::memcpy(data.data() + mInterface.fields[i].offset, v.v.data(),
-                        componentCount(mInterface.fields[i].type) * sizeof(float));
+            // GPU boundary: f64 value graph narrows to f32 uniforms (§17.2).
+            const int n = componentCount(mInterface.fields[i].type);
+            float f[4];
+            for (int c = 0; c < n; ++c) {
+                f[c] = (float)v.v[c];
+            }
+            std::memcpy(data.data() + mInterface.fields[i].offset, f,
+                        n * sizeof(float));
         }
         ctx.device.GetQueue().WriteBuffer(mUniforms, 0, data.data(), data.size());
     }
