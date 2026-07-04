@@ -192,11 +192,23 @@ Static image source.
 
 Video source. Plays muted; decoding is suspended while no output is presenting.
 
-| Kind     | Name     | Type      | Default | Notes                          |
-|----------|----------|-----------|---------|--------------------------------|
-| property | `src`    | `string`  | —       | path                           |
-| property | `loop`   | `bool`    | `true`  |                                |
-| output   | `result`†| `texture` |         | dirty on each new decoded frame|
+| Kind     | Name      | Type      | Default | Notes                          |
+|----------|-----------|-----------|---------|--------------------------------|
+| property | `src`     | `string`  | —       | path                           |
+| property | `loop`    | `bool`    | `true`  |                                |
+| input    | `playing` | `scalar`  | `1`     | > 0.5 plays; otherwise pauses  |
+| output   | `result`† | `texture` |         | dirty on each new decoded frame|
+
+- **Pause, not stop**: while `playing` ≤ 0.5, decoding is suspended (the same
+  machinery as presentation-suspend), the playback position freezes, and
+  `result` holds the last decoded frame, non-dirty. Resuming continues from
+  the paused position.
+- Change detection (§11) means a `playing` signal wired from a step-like
+  source (e.g. a `sequence` `hold` track) is dirty only on the frames it
+  actually flips — the node sees clean start/stop transitions for free.
+- A `restart: event` port is reserved (§16).
+
+*(`playing` adopted 2026-07-04; runtime support pending.)*
 
 ### 9.3 `shader`
 
@@ -269,6 +281,12 @@ same pattern.
 `seconds` does not advance while the scene is paused (occluded/locked); scenes
 therefore resume where they left off rather than jumping.
 
+Scene time is **non-decreasing**: it advances or holds, never moves backward.
+Nodes may rely on this (e.g. `sequence` cue-crossing, §16, is defined only for
+forward motion). Editors that scrub backward do so by re-evaluating the scene
+from an earlier point with a fresh instance — time within any one scene
+instance still only moves forward.
+
 ### 9.8 `mouse` (implicit)
 
 | Kind   | Name       | Type     | Notes                                       |
@@ -330,6 +348,69 @@ beyond the input's arity (e.g. `.z` of a `vec2`) is a load error:
 | output | `y`     | `scalar`             |          |
 | output | `z`     | `scalar`             |          |
 | output | `w`     | `scalar`             |          |
+
+`sequence` — a timeline: maps one scalar input (typically `@time.seconds`)
+through named keyframe **tracks**, each of which becomes an output port.
+(Event tracks — cues that fire at instants — are the reserved half of this
+node; see §16.)
+
+| Kind     | Name       | Type      | Default | Notes                              |
+|----------|------------|-----------|---------|------------------------------------|
+| property | `duration` | `scalar`  | —       | required, > 0, seconds             |
+| property | `loop`     | `bool`    | `true`  |                                    |
+| property | `tracks`   | —         | —       | required, array (see below)        |
+| input    | `time`     | `scalar`  | —       | required; typically `@time.seconds`|
+| output   | *(per track)* | *(per track)* |  | first track is the default output† |
+
+Local time is `t = loop ? mod(time, duration) : clamp(time, 0, duration)`,
+computed in double precision before any f32 conversion (§17.2).
+
+**Track objects** (`tracks` is an array; order fixes the default output and an
+editor's lane order):
+
+- `name` (required): identifier (§3), unique within the node; becomes the
+  output port name.
+- `kind` (required): `"value"`. (`"event"` is reserved; §16.)
+- `type` (required): `scalar`, `vec2`, `vec3`, or `vec4`.
+- `interpolate` (optional, default `"linear"`): `"hold"` (step), `"linear"`,
+  or `"smooth"` (smoothstep between keys). Per-key easing is reserved.
+- `keys` (required, non-empty): array of `{ "t": seconds, "value": literal }`,
+  strictly ascending `t`, each `t` in `[0, duration]`.
+- Before the first key the output is the first key's value; after the last,
+  the last key's value. There is no wrap-around interpolation: when looping,
+  the value holds until local time wraps back past the first key — for a
+  seamless loop, end with a key at `duration` matching the first key.
+
+```json
+{
+  "id": "seq", "type": "sequence",
+  "duration": 40.0,
+  "loop": true,
+  "tracks": [
+    { "name": "videoOn", "kind": "value", "type": "scalar", "interpolate": "hold",
+      "keys": [ { "t": 0, "value": 0 }, { "t": 10, "value": 1 }, { "t": 25, "value": 0 } ] },
+    { "name": "drift", "kind": "value", "type": "vec2", "interpolate": "smooth",
+      "keys": [ { "t": 0, "value": [0.5, 0.5] }, { "t": 20, "value": [0.52, 0.48] } ] }
+  ],
+  "inputs": { "time": "@time.seconds" }
+}
+```
+
+Dirty semantics: the node executes whenever `time` is dirty — every rendered
+frame, like `wave` — and outputs follow §11 change detection, so a `hold`
+track is dirty only on key-transition frames and downstream nodes (e.g. a
+paused video) stay fully quiescent between steps. Multiple `sequence` nodes
+per scene are allowed; each is just a value node. Because `time` is an
+ordinary input, `sequence` also serves as a general keyframe-curve lookup for
+non-time signals (e.g. an author-drawn pointer-response curve).
+
+Efficiency note (DESIGN.md §10): a visually static scene that is merely
+*waiting* for a key transition still ticks the CPU value graph each frame
+callback; the GPU schedules nothing. Runtimes may additionally compute the
+next transition time and skip even CPU evaluation until then; this is an
+implementation optimization with no format impact.
+
+*(Value tracks adopted 2026-07-04; runtime support pending.)*
 
 This set is expected to grow (add/multiply/mix/clamp etc.) as real scenes
 demand; additions are backward compatible.
@@ -412,10 +493,14 @@ type; unknown port name; type mismatch on a connection or literal; missing
 required input; unknown `$parameter`; reference to unknown node; cycle without
 a `previous` edge; zero or multiple `output` nodes; missing asset or shader
 file; path escaping the project root; WGSL that fails to compile or reflect;
-unbound shader port.
+unbound shader port. For `sequence`: `duration` missing or ≤ 0; missing or
+empty `tracks`; duplicate or invalid track `name`; unknown or reserved track
+`kind`; value track with empty `keys`, non-ascending `t`, `t` outside
+`[0, duration]`, or `value` not matching `type`.
 
 Load warnings: unknown top-level field; unknown node property; node
-unreachable from `output`; unknown parameter `hint`.
+unreachable from `output`; unknown parameter `hint`; a `sequence` output port
+that nothing references.
 
 ## 14. Example Scenes
 
@@ -497,6 +582,8 @@ Collected from the sections above — features the format's structure already
 accounts for but v1 does not implement:
 
 - `event` and `buffer` edge types (§4)
+- `sequence` event tracks, per-key easing, and wake-until-next-key scheduling
+  hints (§9.9, §16)
 - Inline references inside vector literals, as sugar desugaring to `combine` (§7, §9.9)
 - Per-layer blend modes on `compositor` (§9.5)
 - Pixel-exact `fit` mode on `transform` (§9.4)
@@ -506,12 +593,14 @@ accounts for but v1 does not implement:
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
 - `modules/` (WASM logic) and `graphs/` project directories (§1)
 
-## 16. Proposed Extension: Events & Sequencing (draft, not yet adopted)
+## 16. Proposed Extension: Events & Sequencing (draft, partially adopted)
 
-Status: proposal. Nothing in this section is part of the v1 format until folded
-into the sections above. It specifies discrete/timed behavior: starting and
-stopping video playback at chosen times, and — post-v1 — triggering things like
-particle bursts. It activates the `event` edge type reserved in §4.
+Status: the **level-triggered half was adopted 2026-07-04** — `video.playing`
+(§9.2) and `sequence` value tracks (§9.9) are part of the main format. This
+section retains the **edge-triggered half**: the `event` edge type reserved in
+§4 and its consumers (video `restart`, `sequence` event tracks), which stay a
+draft until a one-shot consumer ships (video restart alone is thin; particles
+are the canonical customer).
 
 ### 16.1 Motivation
 
@@ -528,11 +617,8 @@ of time). Two further kinds of control are needed:
 
 A future particle node is the canonical consumer of both: a continuous
 `rate: scalar` input (particles/sec) and a discrete `burst: event` input.
-
-The two halves are independently adoptable: `playing` (§16.3) plus `sequence`
-value tracks (§16.4) cover timed video start/stop with **no new edge type**;
-`event` edges can stay reserved until a one-shot consumer (video `restart`,
-particles) ships.
+The level-triggered half needed no new edge type and is now adopted; what
+follows is the event half.
 
 ### 16.2 The `event` Edge Type
 
@@ -551,76 +637,25 @@ Amends §4. `event` becomes a wireable edge type:
 
 ### 16.3 `video` Playback Control
 
-Amends §9.2 with two input ports (both optional; a bare `video` node behaves
-exactly as today):
+`playing` is adopted (§9.2). Remaining: one event-consuming input port
+(optional; a bare `video` node behaves exactly as today):
 
 | Kind  | Name      | Type     | Default | Notes                                    |
 |-------|-----------|----------|---------|------------------------------------------|
-| input | `playing` | `scalar` | `1`     | > 0.5 plays; otherwise pauses            |
 | input | `restart` | `event`  | —       | on fire: seek to 0, decode first frame   |
 
-- **Pause, not stop**: while `playing` ≤ 0.5, decoding is suspended (the same
-  machinery as presentation-suspend), the playback position freezes, and
-  `result` holds the last decoded frame, non-dirty. Resuming continues from
-  the paused position.
 - `restart` fires while paused: the first frame is decoded and `result` goes
   dirty once (a poster frame); playback then waits on `playing`.
-- Change detection (§11) means a `playing` signal wired from a step-like
-  source is dirty only on the frames it actually flips — the node sees clean
-  start/stop transitions for free.
 
-### 16.4 The `sequence` Node
+### 16.4 `sequence` Event Tracks
 
-A CPU-evaluated value node (§9.9 family): a timeline. It maps one scalar input
-(typically `@time.seconds`) through named **tracks**, each of which becomes an
-output port. Value tracks emit interpolated levels; event tracks fire at cue
-times.
+The `sequence` node and its value tracks are adopted (§9.9). Remaining: the
+`"event"` track `kind`. An event track becomes an `event`-typed output port
+and fires at cue times:
 
 ```json
-{
-  "id": "seq", "type": "sequence",
-  "duration": 40.0,
-  "loop": true,
-  "tracks": [
-    { "name": "videoOn", "kind": "value", "type": "scalar", "interpolate": "hold",
-      "keys": [ { "t": 0, "value": 0 }, { "t": 10, "value": 1 }, { "t": 25, "value": 0 } ] },
-    { "name": "drift", "kind": "value", "type": "vec2", "interpolate": "smooth",
-      "keys": [ { "t": 0, "value": [0.5, 0.5] }, { "t": 20, "value": [0.52, 0.48] } ] },
-    { "name": "burst", "kind": "event", "fires": [ 12.0, 30.0 ] }
-  ],
-  "inputs": { "time": "@time.seconds" }
-}
+{ "name": "burst", "kind": "event", "fires": [ 12.0, 30.0 ] }
 ```
-
-| Kind     | Name       | Type      | Default | Notes                              |
-|----------|------------|-----------|---------|------------------------------------|
-| property | `duration` | `scalar`  | —       | required, > 0, seconds             |
-| property | `loop`     | `bool`    | `true`  |                                    |
-| property | `tracks`   | —         | —       | required, array (see below)        |
-| input    | `time`     | `scalar`  | —       | required; typically `@time.seconds`|
-| output   | *(per track)* | *(per track)* |  | first track is the default output† |
-
-Local time is `t = loop ? mod(time, duration) : clamp(time, 0, duration)`.
-
-**Track objects** (`tracks` is an array; order fixes the default output and the
-editor's lane order):
-
-- `name` (required): identifier (§3), unique within the node; becomes the
-  output port name.
-- `kind` (required): `"value"` or `"event"`.
-
-Value tracks:
-
-- `type` (required): `scalar`, `vec2`, `vec3`, or `vec4`.
-- `interpolate` (optional, default `"linear"`): `"hold"` (step), `"linear"`,
-  or `"smooth"` (smoothstep between keys). Per-key easing is reserved.
-- `keys` (required, non-empty): array of `{ "t": seconds, "value": literal }`,
-  strictly ascending `t`, each `t` in `[0, duration]`.
-- Before the first key the output is the first key's value; after the last,
-  the last key's value (no wrap-around interpolation — when looping, the value
-  holds until local time wraps back past the first key).
-
-Event tracks:
 
 - `fires` (required, non-empty): ascending array of times in `[0, duration)`.
 - Crossing semantics: with previous local time `t0` and current `t1`, cues in
@@ -628,21 +663,12 @@ Event tracks:
   fire. On the node's first evaluation, cues in `[0, t1]` fire. A cue therefore
   fires exactly once per pass of the playhead, including once per loop
   iteration.
+- Crossing semantics assume a monotonic `time` input. Value tracks are pure
+  functions of `time` and tolerate any signal (the curve-lookup use, §9.9),
+  but an event track on a `sequence` whose `time` input is not derived from
+  `@time` should be a load warning.
 
-### 16.5 Dirty & Scheduling Semantics
-
-- The `sequence` node executes whenever `time` is dirty — every rendered
-  frame, like `wave`. Value-track outputs follow §11 change detection: a
-  `hold` track is dirty only on key-transition frames, so downstream nodes
-  (e.g. a paused video) stay fully quiescent between cues.
-- Consequence for the efficiency contract (DESIGN.md §10): a visually static
-  scene that is merely *waiting* for a cue still ticks the CPU value graph
-  each frame callback; the GPU schedules nothing. Runtimes may additionally
-  compute the next key/cue time and skip even CPU evaluation until then; this
-  is an implementation optimization with no format impact.
-- Multiple `sequence` nodes per scene are allowed; each is just a value node.
-
-### 16.6 Editor Mapping
+### 16.5 Editor Mapping
 
 The node is deliberately shaped so a conventional timeline panel edits it
 directly — the JSON *is* the UI model:
@@ -654,13 +680,17 @@ directly — the JSON *is* the UI model:
 - **What vs. when**: the graph view owns *what* is affected (wiring
   `@seq.videoOn` → `video.playing`); the timeline panel owns *when*. Neither
   edits the other's domain, so the two views cannot conflict.
-- **Scrubbing**: the editor drives the node's `time` input directly (overriding
-  the wire while scrubbing). Value tracks are pure functions of `time`, so
-  scrub preview is exact and deterministic. Event cues are edge-triggered and
-  therefore a transport-policy question, not a format one — suggested policy:
-  fire cues when crossed during editor *playback*, suppress them during
-  drag-scrub, and offer a per-cue "fire now" button (a live-sync verb) for
-  testing one-shot effects in isolation.
+- **Scrubbing**: scene time is non-decreasing (§9.7), so an editor never
+  rewinds a live instance. Scrub preview plays back a *recorded pass*: the
+  editor simulates the scene once at fixed step (determinism makes this
+  exact, feedback scenes included) and caches output frames; resuming
+  playback from a scrubbed position re-simulates `0 → t` on a fresh
+  instance. Timeline lanes themselves need no simulation — value tracks are
+  pure functions of `time`. Event cues are edge-triggered and therefore a
+  transport-policy question, not a format one — suggested policy: fire cues
+  when crossed during editor *playback*, suppress them during the recorded
+  pass and drag-scrub, and offer a per-cue "fire now" button (a live-sync
+  verb) for testing one-shot effects in isolation.
 - **Live edit cost**: `tracks` is a property, so edits reload the node (§5) —
   a CPU-only rebuild of key arrays, well within the <100ms hot-reload target;
   output ports (and thus wiring) survive unless a track is renamed or removed.
@@ -668,21 +698,21 @@ directly — the JSON *is* the UI model:
   creates a matching value track and wires it; dragging a lane's header onto a
   port wires that track.
 
-### 16.7 Validation Additions
+### 16.6 Validation Additions
 
-Load errors: `duration` missing or ≤ 0; empty `tracks`; duplicate or invalid
-track `name`; unknown `kind`; value track with empty `keys`, non-ascending
-`t`, `t` outside `[0, duration]`, or `value` not matching `type`; event track
-with empty or non-ascending `fires` or a time outside `[0, duration)`;
-`event` connection to a non-`event` port or vice versa.
+(Value-track validation is adopted; see §13.) Load errors: event track with
+empty or non-ascending `fires` or a time outside `[0, duration)`; `event`
+connection to a non-`event` port or vice versa.
 
-Load warnings: a `sequence` output port that nothing references.
+Load warnings: an event track on a `sequence` whose `time` input is not
+derived from `@time` (§16.4).
 
-### 16.8 Effect on §15
+### 16.7 Effect on §15
 
 If adopted: `event` moves from "reserved" to specified (§16.2); event
-payloads, per-key easing, per-cue payload/latch nodes, and wake-until-next-cue
-scheduling hints join the reserved list.
+payloads, per-cue payload/latch nodes, and wake-until-next-cue scheduling
+hints join the reserved list. (Per-key easing is already listed there via the
+adopted value tracks.)
 
 ## 17. Proposed Amendments: Spec Gaps (draft, not yet adopted)
 
@@ -733,8 +763,8 @@ components end to end, narrowing to f32 only where uniforms are packed for
 the GPU (transform, shader); `wave` reduces its phase to one cycle in double
 before trig; JSON literals parse without a float round-trip. Unit-tested at
 a month and a year of scene time (`value_precision_test.cpp`), both of which
-fail with an f32 value path. `sequence` (§16.4) is specified to do the same
-reduction when it lands.
+fail with an f32 value path. `sequence` (§9.9) is specified to do the same
+reduction (runtime support pending).
 
 Amendments:
 
@@ -744,7 +774,7 @@ Amendments:
   as authors are concerned.
 - Nodes that reduce an unbounded time-like input to a bounded range perform
   the reduction in double precision *before* any f32 conversion: `wave`
-  reduces `input × frequency + phase` modulo one cycle; `sequence` (§16.4)
+  reduces `input × frequency + phase` modulo one cycle; `sequence` (§9.9)
   reduces to local time modulo `duration`.
 - Authoring guidance (non-normative): wire bounded signals (a `wave` output, a
   `sequence` track) into shader params rather than raw `@time.seconds`; a raw
@@ -780,7 +810,7 @@ Amendment to §2 — optional top-level field:
 Depends on §16. Gap: behavior at end of a `loop: false` video is unspecified,
 and nothing can react to playback finishing.
 
-Amendment to §9.2 (with §16.3's ports):
+Amendment to §9.2 (with `playing` from §9.2 and `restart` from §16.3):
 
 - With `loop: false`, after the final frame is produced the node holds that
   frame (`result` non-dirty) and enters the finished state; `playing` has no
