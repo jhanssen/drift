@@ -4,8 +4,10 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: v1 feature-complete. Full node set — image (PNG/JPEG/WebP/KTX2,
-including Basis-supercompressed KTX2 and stored mip chains), video
+Status: v1 feature-complete. Full node set — image (PNG/JPEG/WebP/KTX2;
+Basis-supercompressed KTX2 transcodes to BC7 and stays compressed in
+VRAM, with stored mip chains — author UASTC or ETC1S, premultiplied or
+opaque), video
 (ffmpeg software decode; AV1/H.264/anything your ffmpeg has), shader,
 transform, compositor, wave, remap, combine, split, the implicit
 time/mouse inputs, and previous-frame feedback edges (`"previous": true`)

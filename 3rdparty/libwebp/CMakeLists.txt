@@ -1,5 +1,8 @@
 # libwebp: WebP image decoding. Provides the webpdecoder target.
 include(FetchContent)
+# Both fetched image libraries must link statically — the drift binary must
+# not depend on .so files inside the build tree.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(WEBP_BUILD_ANIM_UTILS OFF)
 set(WEBP_BUILD_CWEBP OFF)
 set(WEBP_BUILD_DWEBP OFF)

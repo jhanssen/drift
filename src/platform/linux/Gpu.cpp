@@ -129,18 +129,20 @@ bool Gpu::init(bool needPresent)
         printf("drift: render node: %s\n", node.c_str());
     }
 
-    std::vector<wgpu::FeatureName> features;
+    // BC texture compression carries the KTX2 path; present on all desktop
+    // Vulkan drivers including lavapipe.
+    std::vector<wgpu::FeatureName> features = {
+        wgpu::FeatureName::TextureCompressionBC,
+    };
     if (needPresent) {
-        features = {
-            wgpu::FeatureName::SharedTextureMemoryDmaBuf,
-            wgpu::FeatureName::SharedFenceSyncFD,
-            wgpu::FeatureName::DawnDrmFormatCapabilities,
-        };
-        for (auto f : features) {
-            if (!mAdapter.HasFeature(f)) {
-                fprintf(stderr, "drift: adapter missing required feature %d\n", (int)f);
-                return false;
-            }
+        features.push_back(wgpu::FeatureName::SharedTextureMemoryDmaBuf);
+        features.push_back(wgpu::FeatureName::SharedFenceSyncFD);
+        features.push_back(wgpu::FeatureName::DawnDrmFormatCapabilities);
+    }
+    for (auto f : features) {
+        if (!mAdapter.HasFeature(f)) {
+            fprintf(stderr, "drift: adapter missing required feature %d\n", (int)f);
+            return false;
         }
     }
 

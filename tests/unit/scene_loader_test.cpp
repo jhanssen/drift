@@ -109,6 +109,47 @@ drift::core::VideoDecoderFactory stubVideoFactory()
     };
 }
 
+// A 4x4 Basis-supercompressed (ETC1S) KTX2. withAlpha selects RGBA input
+// with a varying (straight) alpha channel vs. opaque RGB.
+std::string makeBasisKtx2(bool withAlpha)
+{
+    ktxTextureCreateInfo ci{};
+    ci.vkFormat = withAlpha ? 43 /*R8G8B8A8_SRGB*/ : 29 /*R8G8B8_SRGB*/;
+    ci.baseWidth = 4;
+    ci.baseHeight = 4;
+    ci.baseDepth = 1;
+    ci.numDimensions = 2;
+    ci.numLevels = 1;
+    ci.numLayers = 1;
+    ci.numFaces = 1;
+
+    ktxTexture2* tex = nullptr;
+    REQUIRE(ktxTexture2_Create(&ci, KTX_TEXTURE_CREATE_ALLOC_STORAGE, &tex) ==
+            KTX_SUCCESS);
+    unsigned char pixels[4 * 4 * 4];
+    const int comp = withAlpha ? 4 : 3;
+    for (int i = 0; i < 16; ++i) {
+        pixels[i * comp + 0] = (unsigned char)(i * 16);
+        pixels[i * comp + 1] = (unsigned char)(255 - i * 16);
+        pixels[i * comp + 2] = 128;
+        if (withAlpha) {
+            pixels[i * comp + 3] = (unsigned char)(i * 17);
+        }
+    }
+    REQUIRE(ktxTexture_SetImageFromMemory((ktxTexture*)tex, 0, 0, 0, pixels,
+                                          (ktx_size_t)(16 * comp)) ==
+            KTX_SUCCESS);
+    REQUIRE(ktxTexture2_CompressBasis(tex, 0) == KTX_SUCCESS);
+    ktx_uint8_t* mem = nullptr;
+    ktx_size_t size = 0;
+    REQUIRE(ktxTexture_WriteToMemory((ktxTexture*)tex, &mem, &size) ==
+            KTX_SUCCESS);
+    std::string bytes((const char*)mem, size);
+    free(mem);
+    ktxTexture_Destroy((ktxTexture*)tex);
+    return bytes;
+}
+
 struct LoadResult {
     std::unique_ptr<Scene> scene;
     std::vector<std::string> errors;
@@ -143,6 +184,8 @@ LoadResult load(const std::string& json,
         { "assets/tiny.webp",
           std::string((const char*)kTinyWebp, sizeof(kTinyWebp)) },
         { "assets/tiny.ktx2", makeTinyKtx2() },
+        { "assets/opaque.basis.ktx2", makeBasisKtx2(false) },
+        { "assets/alpha.basis.ktx2", makeBasisKtx2(true) },
         { "assets/corrupt.png", "this is not a png" },
         { "assets/corrupt.webp",
           std::string("RIFF\x10\0\0\0WEBPgarbage", 19) },
@@ -503,6 +546,29 @@ TEST_CASE("webp and ktx2 image sources load")
     })");
     CHECK(corrupt.scene == nullptr);
     CHECK(corrupt.hasError("cannot decode"));
+}
+
+TEST_CASE("basis ktx2 uploads compressed: opaque accepted, straight alpha rejected")
+{
+    auto opaque = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "bg", "type": "image", "src": "assets/opaque.basis.ktx2" },
+            { "id": "out", "type": "output", "inputs": { "color": "@bg" } }
+        ]
+    })");
+    CAPTURE(opaque.joined());
+    CHECK(opaque.scene != nullptr);
+
+    auto alpha = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "bg", "type": "image", "src": "assets/alpha.basis.ktx2" },
+            { "id": "out", "type": "output", "inputs": { "color": "@bg" } }
+        ]
+    })");
+    CHECK(alpha.scene == nullptr);
+    CHECK(alpha.hasError("premultiplied"));
 }
 
 TEST_CASE("image validation: missing src, missing file, corrupt file, escaping path")

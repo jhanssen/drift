@@ -68,10 +68,12 @@ public:
 
 // §9.1 image: static texture source, dirty on load only. Decoding happens in
 // the loader (validation without a GPU); PNG/JPEG via stb, WebP via libwebp,
-// KTX2 via libktx (Basis-supercompressed payloads transcode to RGBA32, and
-// a stored mip chain is kept — consumers minify through it). Pixels arrive
-// here already linear, premultiplied, packed rgba16float; upload happens on
-// first evaluate.
+// KTX2 via libktx. Basis-supercompressed KTX2 transcodes to BC7 and uploads
+// compressed (with its stored mip chain); since compressed blocks can't be
+// premultiplied after the fact, such content must be authored premultiplied
+// or opaque — anything else is a load error, never a silent decompress. All
+// other sources convert on CPU to premultiplied linear rgba16float. Upload
+// happens on first evaluate.
 class ImageNode : public Node {
 public:
     // bytes: encoded file contents. Returns nullptr with error set on decode
@@ -82,12 +84,13 @@ public:
 
 private:
     struct Level {
-        std::vector<uint16_t> pixels; // rgba16float, tightly packed
+        std::vector<uint8_t> data; // texel or BC7 block bytes, tightly packed
         uint32_t width = 0, height = 0;
     };
-    explicit ImageNode(std::vector<Level> levels);
+    ImageNode(std::vector<Level> levels, wgpu::TextureFormat format);
 
     std::vector<Level> mLevels; // [0] = base; released after upload
+    wgpu::TextureFormat mFormat;
     uint32_t mWidth = 0, mHeight = 0;
     wgpu::Texture mTexture;
 };

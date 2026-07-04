@@ -1,7 +1,7 @@
 # libktx (KTX-Software): KTX2 container + Basis Universal transcoding.
 # Provides the ktx target (read+write; tests use write to author fixtures).
 include(FetchContent)
-set(KTX_FEATURE_STATIC_LIBRARY ON)
+set(KTX_FEATURE_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
 set(KTX_FEATURE_TESTS OFF)
 set(KTX_FEATURE_TOOLS OFF)
 set(KTX_FEATURE_DOC OFF)
