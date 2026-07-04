@@ -63,8 +63,8 @@
   <div id="transport">
     <button id="playBtn" title="pause/resume both runtimes">⏸</button>
     <span id="timeText">—</span>
-    <span class="dim" style="color:var(--dim)">click a timeline to seek ·
-      drag keys to edit · double-click a lane to re-fit its scale</span>
+    <span class="dim" style="color:var(--dim)">click to seek · drag keys
+      (shift = fine) · wheel zooms a lane's scale · double-click re-fits</span>
   </div>
   <div id="timeline"><span class="dim">no scene yet</span></div>
   <div id="statusbar">
@@ -432,12 +432,38 @@ function refreshTimeline() {
       if (!hit) {
         return;
       }
-      const range = tl.laneRanges[hit.lane];
       dragState = { tl, lane: hit.lane, keyIdx: hit.keyIdx, comp: hit.comp,
-                    range: { ...range }, moved: false };
+                    lastX: e.clientX, lastY: e.clientY, moved: false };
       suppressClick = true;
       e.preventDefault();
     };
+    canvas.addEventListener('wheel', (e) => {
+      // Zoom a lane's value scale around the value under the cursor;
+      // over the name gutter the wheel still scrolls the strip.
+      if (e.offsetX < GUTTER_W) {
+        return;
+      }
+      const lane = Math.floor((e.offsetY - RULER_H) / LANE_H);
+      if (lane < 0 || lane >= seq.tracks.length) {
+        return;
+      }
+      e.preventDefault();
+      const range = laneRangeMemory.get(
+          `${activeManifest()?.scene}/${seq.id}/${seq.tracks[lane].name}`);
+      const geom = tl.laneRanges[lane];
+      if (!range || !geom) {
+        return;
+      }
+      const span = range.vmax - range.vmin;
+      const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+      if ((span < 1e-6 && factor < 1) || (span > 1e6 && factor > 1)) {
+        return;
+      }
+      const f = (geom.bottom - e.offsetY) / (geom.bottom - geom.top);
+      const pivot = range.vmin + f * span;
+      range.vmin = pivot + (range.vmin - pivot) * factor;
+      range.vmax = pivot + (range.vmax - pivot) * factor;
+    }, { passive: false });
     canvas.onclick = (e) => {
       if (suppressClick) {
         suppressClick = false;
@@ -496,30 +522,35 @@ let suppressClick = false;
 // re-fit its scale. Keyed per scene/sequence/track.
 const laneRangeMemory = new Map();
 
+// Incremental deltas (not absolute cursor mapping): no jump on grab, and
+// it composes with mid-drag lane zooming. Shift = 10x finer.
 window.addEventListener('mousemove', (e) => {
   if (!dragState) {
     return;
   }
-  const { tl, lane, keyIdx, comp, range } = dragState;
-  const rect = tl.canvas.getBoundingClientRect();
+  const { tl, lane, keyIdx, comp } = dragState;
   const seq = tl.seq;
-  const track = seq.tracks[lane];
-  const keys = track.keys;
+  const keys = seq.tracks[lane].keys;
+  const geom = tl.laneRanges[lane];
+  const fine = e.shiftKey ? 0.1 : 1;
+  const dx = e.clientX - dragState.lastX;
+  const dy = e.clientY - dragState.lastY;
+  dragState.lastX = e.clientX;
+  dragState.lastY = e.clientY;
 
   const plotW = tl.canvas.clientWidth - GUTTER_W;
-  const t = ((e.clientX - rect.left - GUTTER_W) / plotW) * seq.duration;
+  const t = keys[keyIdx].t + (dx / plotW) * seq.duration * fine;
   const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
   const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
                                       : seq.duration;
   keys[keyIdx].t = Math.min(Math.max(t, lo), Math.max(lo, hi));
 
-  const f = (range.bottom - (e.clientY - rect.top)) /
-            (range.bottom - range.top);
-  const v = range.vmin + f * (range.vmax - range.vmin);
+  const dv = (-dy / (geom.bottom - geom.top)) *
+             (geom.vmax - geom.vmin) * fine;
   if (Array.isArray(keys[keyIdx].value)) {
-    keys[keyIdx].value[comp] = v;
+    keys[keyIdx].value[comp] += dv;
   } else {
-    keys[keyIdx].value = v;
+    keys[keyIdx].value += dv;
   }
   dragState.moved = true;
 });
