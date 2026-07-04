@@ -1233,10 +1233,15 @@ void ShaderNode::evaluate(FrameContext& ctx)
     }
 
     // Size: explicit, else first texture input, else the output target
-    // (SCENE_FORMAT.md §9.3).
+    // (SCENE_FORMAT.md §9.3, §17.5). Feedback edges never drive sizing —
+    // otherwise a shader reading its own previous frame locks onto its own
+    // size and stops tracking output resizes.
     uint32_t width = mExplicitWidth, height = mExplicitHeight;
     if (width == 0) {
         for (size_t i = textureInputStart(); i < inputs.size(); ++i) {
+            if (inputs[i].previous) {
+                continue;
+            }
             const Value v = inputValue(i);
             if (v.texWidth != 0) {
                 width = v.texWidth;

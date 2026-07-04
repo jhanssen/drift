@@ -93,6 +93,24 @@ TEST_CASE("comments do not confuse the recognizer")
     CHECK(iface.textures.empty());
 }
 
+TEST_CASE("texture ports order by (group, binding), not declaration order")
+{
+    // "First texture input" drives auto-sizing (SCENE_FORMAT.md §17.5), so
+    // the order must not depend on how the author arranged the file.
+    const auto iface = parseOk(R"(
+        @group(1) @binding(0) var late: texture_2d<f32>;
+        @group(1) @binding(1) var late_sampler: sampler;
+        @group(0) @binding(1) var early: texture_2d<f32>;
+        @group(0) @binding(2) var early_sampler: sampler;
+        @group(0) @binding(0) var first: texture_2d<f32>;
+        @group(0) @binding(3) var first_sampler: sampler;
+    )");
+    REQUIRE(iface.textures.size() == 3);
+    CHECK(iface.textures[0].name == "first");
+    CHECK(iface.textures[1].name == "early");
+    CHECK(iface.textures[2].name == "late");
+}
+
 TEST_CASE("orphan sampler is an error")
 {
     const auto error = parseFail(R"(

@@ -1,5 +1,6 @@
 #include "WgslInterface.h"
 
+#include <algorithm>
 #include <regex>
 
 namespace drift::core {
@@ -95,6 +96,14 @@ bool WgslInterface::parse(const std::string& rawSource, WgslInterface& out, std:
             return false;
         }
     }
+
+    // Texture port order is (group, binding), not declaration order — it
+    // defines "first texture input" for auto-sizing (SCENE_FORMAT.md §17.5).
+    std::sort(out.textures.begin(), out.textures.end(),
+              [](const WgslTexture& a, const WgslTexture& b) {
+                  return a.group != b.group ? a.group < b.group
+                                            : a.binding < b.binding;
+              });
 
     // Match samplers to textures by the <texture>_sampler convention.
     for (const auto& s : samplers) {
