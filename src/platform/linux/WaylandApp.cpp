@@ -16,6 +16,8 @@
 #include "xdg-shell-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
 
 namespace drift::platform {
 
@@ -96,6 +98,16 @@ void pointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {
 void pointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
 const wl_pointer_listener kPointerListener = {
     pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis
+};
+
+void fractionalScalePreferred(void* data, wp_fractional_scale_v1*,
+                              uint32_t scale120)
+{
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onPreferredScale(surf, scale120);
+}
+const wp_fractional_scale_v1_listener kFractionalScaleListener = {
+    fractionalScalePreferred
 };
 
 void wmBasePing(void*, xdg_wm_base* wmBase, uint32_t serial)
@@ -180,6 +192,9 @@ WaylandApp::~WaylandApp()
     }
     if (mPointer) wl_pointer_destroy(mPointer);
     if (mSeat) wl_seat_destroy(mSeat);
+    if (mFractionalScaleManager)
+        wp_fractional_scale_manager_v1_destroy(mFractionalScaleManager);
+    if (mViewporter) wp_viewporter_destroy(mViewporter);
     if (mFeedback) zwp_linux_dmabuf_feedback_v1_destroy(mFeedback);
     if (mFormatTable) munmap(const_cast<void*>(mFormatTable), mFormatTableSize);
     if (mDmabuf) zwp_linux_dmabuf_v1_destroy(mDmabuf);
@@ -217,6 +232,13 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         } else {
             zwp_linux_dmabuf_v1_add_listener(mDmabuf, &kDmabufListener, this);
         }
+    } else if (!strcmp(interface, wp_viewporter_interface.name)) {
+        mViewporter = (wp_viewporter*)wl_registry_bind(
+            mRegistry, name, &wp_viewporter_interface, 1);
+    } else if (!strcmp(interface, wp_fractional_scale_manager_v1_interface.name)) {
+        mFractionalScaleManager =
+            (wp_fractional_scale_manager_v1*)wl_registry_bind(
+                mRegistry, name, &wp_fractional_scale_manager_v1_interface, 1);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
         mSeat = (wl_seat*)wl_registry_bind(mRegistry, name, &wl_seat_interface,
                                            std::min(version, 2u));
@@ -407,6 +429,15 @@ void WaylandApp::onSurfaceClosed(OutputSurface* surf)
     // Keep running with zero surfaces: outputs may come back.
 }
 
+void WaylandApp::onPreferredScale(OutputSurface* surf, uint32_t scale120)
+{
+    const double scale = scale120 / 120.0;
+    if (scale > 0.0 && scale != surf->scale) {
+        surf->scale = scale;
+        surf->wantRedraw = true; // drawFrame reallocates the ring
+    }
+}
+
 void WaylandApp::onFrameDone(OutputSurface* surf)
 {
     surf->framePending = false;
@@ -464,6 +495,19 @@ bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
         surf->pendingHeight = mInitialHeight;
     }
 
+    // Fractional HiDPI: render at physical pixels, present at logical size.
+    // Both objects are optional; without them the surface renders at scale 1
+    // (the compositor upscales, as before).
+    if (mViewporter && mFractionalScaleManager) {
+        surf->viewport = wp_viewporter_get_viewport(mViewporter, surf->surface);
+        surf->fractionalScale =
+            wp_fractional_scale_manager_v1_get_fractional_scale(
+                mFractionalScaleManager, surf->surface);
+        wp_fractional_scale_v1_add_listener(surf->fractionalScale,
+                                            &kFractionalScaleListener,
+                                            surf.get());
+    }
+
     wl_surface_commit(surf->surface);
     mSurfaces.push_back(std::move(surf));
     return true;
@@ -472,6 +516,8 @@ bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
 void WaylandApp::destroyOutputSurface(OutputSurface* surf)
 {
     destroyRing(*surf);
+    if (surf->fractionalScale) wp_fractional_scale_v1_destroy(surf->fractionalScale);
+    if (surf->viewport) wp_viewport_destroy(surf->viewport);
     if (surf->layerSurface) zwlr_layer_surface_v1_destroy(surf->layerSurface);
     if (surf->toplevel) xdg_toplevel_destroy(surf->toplevel);
     if (surf->xdgSurface) xdg_surface_destroy(surf->xdgSurface);
@@ -609,11 +655,14 @@ bool WaylandApp::createRing(OutputSurface& surf)
     if (surf.width == 0 || surf.height == 0) {
         return false;
     }
+    surf.ringScale = surf.viewport ? surf.scale : 1.0;
+    surf.bufferWidth = (uint32_t)std::lround(surf.width * surf.ringScale);
+    surf.bufferHeight = (uint32_t)std::lround(surf.height * surf.ringScale);
 
     std::vector<Buffer> buffers(kBufferCount);
     for (auto& buf : buffers) {
-        if (!mGpu->createTarget(surf.width, surf.height, mFourcc, mRingModifiers,
-                                buf.target) ||
+        if (!mGpu->createTarget(surf.bufferWidth, surf.bufferHeight, mFourcc,
+                                mRingModifiers, buf.target) ||
             !createWlBuffer(surf, buf)) {
             for (auto& b : buffers) {
                 if (b.buffer) wl_buffer_destroy(b.buffer);
@@ -623,6 +672,16 @@ bool WaylandApp::createRing(OutputSurface& surf)
         }
     }
     surf.buffers = std::move(buffers);
+
+    if (surf.viewport) {
+        wp_viewport_set_destination(surf.viewport, (int32_t)surf.width,
+                                    (int32_t)surf.height);
+    }
+    if (surf.ringScale != 1.0) {
+        printf("drift: output %u: %ux%u buffer for %ux%u logical (scale %.2f)\n",
+               surf.id, surf.bufferWidth, surf.bufferHeight, surf.width,
+               surf.height, surf.ringScale);
+    }
 
     // The whole surface is opaque (background wallpaper / dev window).
     wl_region* region = wl_compositor_create_region(mCompositor);
@@ -679,9 +738,10 @@ void WaylandApp::drawFrame(OutputSurface& surf)
         return;
     }
 
-    // First frame / resize: (re)allocate the ring at the pending size.
+    // First frame / resize / scale change: (re)allocate the ring.
     if (surf.buffers.empty() || surf.pendingWidth != surf.width ||
-        surf.pendingHeight != surf.height) {
+        surf.pendingHeight != surf.height ||
+        (surf.viewport && surf.scale != surf.ringScale)) {
         destroyRing(surf);
         if (!createRing(surf)) {
             fprintf(stderr, "drift: buffer allocation failed for output %u\n",
@@ -715,8 +775,8 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     FrameRequest request;
     request.outputId = surf.id;
     request.target = buf->target.texture.CreateView();
-    request.width = surf.width;
-    request.height = surf.height;
+    request.width = surf.bufferWidth;
+    request.height = surf.bufferHeight;
     request.seconds = surf.sceneTime;
     request.mouseX = surf.pointerSeen && surf.width
                          ? (float)(surf.pointerX / surf.width)

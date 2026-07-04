@@ -56,6 +56,8 @@ add_executable(drift
     ${WLGEN}/xdg-shell-protocol.c
     ${WLGEN}/wlr-layer-shell-unstable-v1-protocol.c
     ${WLGEN}/linux-dmabuf-v1-protocol.c
+    ${WLGEN}/viewporter-protocol.c
+    ${WLGEN}/fractional-scale-v1-protocol.c
 )
 target_include_directories(drift PRIVATE
     ${WLGEN}

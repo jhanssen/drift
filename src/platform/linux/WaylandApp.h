@@ -32,6 +32,10 @@ struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
 struct zwp_linux_dmabuf_v1;
 struct zwp_linux_dmabuf_feedback_v1;
+struct wp_viewporter;
+struct wp_viewport;
+struct wp_fractional_scale_manager_v1;
+struct wp_fractional_scale_v1;
 
 namespace drift::platform {
 
@@ -94,9 +98,17 @@ public:
         zwlr_layer_surface_v1* layerSurface = nullptr;
         xdg_surface* xdgSurface = nullptr;
         xdg_toplevel* toplevel = nullptr;
+        wp_viewport* viewport = nullptr;
+        wp_fractional_scale_v1* fractionalScale = nullptr;
         std::vector<Buffer> buffers;
+        // Logical (surface-coordinate) size from configure; buffers are
+        // allocated at logical x scale physical pixels and mapped back via
+        // the viewport, so scaled outputs render at native resolution.
         uint32_t width = 0, height = 0;
         uint32_t pendingWidth = 0, pendingHeight = 0;
+        uint32_t bufferWidth = 0, bufferHeight = 0;
+        double scale = 1.0;     // wp-fractional-scale preferred scale
+        double ringScale = 1.0; // scale the current ring was built for
         bool configured = false;
         bool framePending = false; // a commit awaits its frame callback
         bool wantRedraw = false;   // input/configure while idle
@@ -123,6 +135,7 @@ public:
     void onLayerConfigure(OutputSurface* surf, uint32_t serial, uint32_t width,
                           uint32_t height);
     void onSurfaceClosed(OutputSurface* surf);
+    void onPreferredScale(OutputSurface* surf, uint32_t scale120);
     void onFrameDone(OutputSurface* surf);
     void onBufferRelease(wl_buffer* buffer);
 
@@ -147,6 +160,8 @@ private:
     xdg_wm_base* mWmBase = nullptr;
     zwlr_layer_shell_v1* mLayerShell = nullptr;
     zwp_linux_dmabuf_v1* mDmabuf = nullptr;
+    wp_viewporter* mViewporter = nullptr;
+    wp_fractional_scale_manager_v1* mFractionalScaleManager = nullptr;
 
     // dmabuf v4 default feedback: mmap'd format+modifier table. On v3 the
     // flat modifier event list fills mCompositorModifiers directly.
