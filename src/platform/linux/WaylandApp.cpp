@@ -767,7 +767,7 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     // (occlusion, lock — no frames drawn) it stays put, so scenes resume
     // where they left off (SCENE_FORMAT.md §9.7).
     const double t = now();
-    if (surf.lastDrawTime >= 0.0) {
+    if (surf.lastDrawTime >= 0.0 && !mScenePaused) {
         surf.sceneTime += std::min(t - surf.lastDrawTime, 0.1);
     }
     surf.lastDrawTime = t;

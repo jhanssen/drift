@@ -110,6 +110,22 @@ public:
         return t;
     }
 
+    // Transport (control endpoint). Pause freezes the scene clock — the
+    // time node then produces nothing dirty, so the graph quiesces on its
+    // own (§11); rendering still reacts to input/parameter changes.
+    void setScenePaused(bool paused) { mScenePaused = paused; }
+    bool scenePaused() const { return mScenePaused; }
+
+    // Jumps every surface clock (forward-only within live instances, §9.7;
+    // the caller handles backward by re-creating the scene instances).
+    void seekSceneTime(double seconds)
+    {
+        for (auto& surf : mSurfaces) {
+            surf->sceneTime = seconds;
+            surf->wantRedraw = true;
+        }
+    }
+
     // Frame loop until the (windowed) surface is closed. animated: the
     // scene advances with time, so frames are produced continuously
     // (frame-callback throttled, timer-ticked while nothing commits);
@@ -218,6 +234,7 @@ private:
 
     bool mRunning = true;
     bool mAnimated = false;
+    bool mScenePaused = false;
     RenderFrame mRenderFrame;
     OutputRemoved mOutputRemoved;
     int mControlFd = -1;

@@ -5,7 +5,10 @@
 //
 // usage: driftctl.mjs [--port N] describe
 //        driftctl.mjs [--port N] set NAME VALUE   (VALUE: number or x,y[,z,w])
-//        driftctl.mjs [--port N] watch            (print parameter events)
+//        driftctl.mjs [--port N] pause | resume
+//        driftctl.mjs [--port N] seek SECONDS
+//        driftctl.mjs [--port N] reload           (re-read scene from disk)
+//        driftctl.mjs [--port N] watch            (print events)
 
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -19,13 +22,14 @@ if (args[0] === '--port') {
 const command = args.shift();
 
 function usage() {
-  console.error('usage: driftctl.mjs [--port N] describe | set NAME VALUE | watch');
+  console.error('usage: driftctl.mjs [--port N] describe | set NAME VALUE | ' +
+                'pause | resume | seek SECONDS | reload | watch');
   process.exit(2);
 }
 
 let request;
-if (command === 'describe') {
-  request = { id: 1, method: 'describe' };
+if (command === 'describe' || command === 'reload') {
+  request = { id: 1, method: command };
 } else if (command === 'set') {
   const name = args.shift();
   const raw = args.shift();
@@ -34,6 +38,13 @@ if (command === 'describe') {
   if (parts.some(Number.isNaN)) usage();
   const value = parts.length === 1 ? parts[0] : parts;
   request = { id: 1, method: 'set', params: { name, value } };
+} else if (command === 'pause' || command === 'resume') {
+  request = { id: 1, method: 'pause',
+              params: { paused: command === 'pause' } };
+} else if (command === 'seek') {
+  const time = Number(args.shift());
+  if (Number.isNaN(time)) usage();
+  request = { id: 1, method: 'seek', params: { time } };
 } else if (command !== 'watch') {
   usage();
 }

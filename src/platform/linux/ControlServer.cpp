@@ -187,6 +187,31 @@ void ControlServer::drive()
     }
 }
 
+std::string ControlServer::transportJson() const
+{
+    const double seconds = mCallbacks.time ? mCallbacks.time() : 0.0;
+    const bool paused = mCallbacks.paused && mCallbacks.paused();
+    return "{\"seconds\":" + numberJson(seconds) +
+           ",\"paused\":" + (paused ? "true" : "false") + "}";
+}
+
+// Collect fds first: a failed send closes the client and mutates the map.
+void ControlServer::broadcast(const std::string& message, int exceptFd)
+{
+    const std::string frame = ws::encodeFrame(ws::Opcode::Text, message);
+    std::vector<int> targets;
+    for (const auto& [fd, client] : mClients) {
+        if (fd != exceptFd && client.upgraded && !client.closing) {
+            targets.push_back(fd);
+        }
+    }
+    for (int target : targets) {
+        if (auto it = mClients.find(target); it != mClients.end()) {
+            send(target, it->second, frame);
+        }
+    }
+}
+
 void ControlServer::acceptClients()
 {
     for (;;) {
@@ -418,29 +443,68 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
                 valueJson(applied) + "}");
 
         // Everyone else learns about the change (last-write-wins), with the
-        // value as applied — clamping may have altered the request. Collect
-        // fds first: a failed send closes the client and mutates the map.
-        const std::string event = ws::encodeFrame(
-            ws::Opcode::Text, "{\"event\":\"parameter\",\"name\":\"" +
-                                  jsonEscape(name) +
-                                  "\",\"value\":" + valueJson(applied) + "}");
-        std::vector<int> targets;
-        for (const auto& [otherFd, other] : mClients) {
-            if (otherFd != fd && other.upgraded && !other.closing) {
-                targets.push_back(otherFd);
-            }
-        }
-        for (int target : targets) {
-            if (auto it = mClients.find(target); it != mClients.end()) {
-                send(target, it->second, event);
-            }
-        }
+        // value as applied — clamping may have altered the request.
+        broadcast("{\"event\":\"parameter\",\"name\":\"" + jsonEscape(name) +
+                      "\",\"value\":" + valueJson(applied) + "}",
+                  fd);
         return;
     }
 
     if (method == "time") {
-        const double seconds = mCallbacks.time ? mCallbacks.time() : 0.0;
-        respond("\"result\":{\"seconds\":" + numberJson(seconds) + "}");
+        respond("\"result\":" + transportJson());
+        return;
+    }
+
+    if (method == "pause") {
+        const auto paramsIt = obj.find("params");
+        if (paramsIt == obj.end() || !paramsIt->second.is_object()) {
+            respond("\"error\":\"'pause' needs a params object\"");
+            return;
+        }
+        const auto& params = paramsIt->second.get_object();
+        const auto pausedIt = params.find("paused");
+        if (pausedIt == params.end() || !pausedIt->second.is_boolean()) {
+            respond("\"error\":\"'pause' needs a boolean 'paused'\"");
+            return;
+        }
+        mCallbacks.setPaused(pausedIt->second.get_boolean());
+        respond("\"result\":" + transportJson());
+        broadcast("{\"event\":\"transport\"," + transportJson().substr(1), fd);
+        return;
+    }
+
+    if (method == "seek") {
+        const auto paramsIt = obj.find("params");
+        double seconds = -1.0;
+        if (paramsIt != obj.end() && paramsIt->second.is_object()) {
+            const auto& params = paramsIt->second.get_object();
+            if (auto it = params.find("time");
+                it != params.end() && it->second.is_number()) {
+                seconds = it->second.get_number();
+            }
+        }
+        if (seconds < 0.0) {
+            respond("\"error\":\"'seek' needs a non-negative 'time'\"");
+            return;
+        }
+        std::string error;
+        if (!mCallbacks.seek(seconds, error)) {
+            respond("\"error\":\"" + jsonEscape(error) + "\"");
+            return;
+        }
+        respond("\"result\":" + transportJson());
+        broadcast("{\"event\":\"transport\"," + transportJson().substr(1), fd);
+        return;
+    }
+
+    if (method == "reload") {
+        std::string error;
+        if (!mCallbacks.reload(error)) {
+            respond("\"error\":\"" + jsonEscape(error) + "\"");
+            return;
+        }
+        respond("\"result\":{}");
+        broadcast("{\"event\":\"reload\"}", fd);
         return;
     }
 

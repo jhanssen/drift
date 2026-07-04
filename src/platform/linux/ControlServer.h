@@ -11,8 +11,15 @@
 //   <- {"id":2,"result":{}}  or  {"id":2,"error":"..."}
 //   <- {"event":"parameter","name":"p","value":V}   (to the other clients)
 //   -> {"id":3,"method":"time"}
-//   <- {"id":3,"result":{"seconds":T}}     (scene clock; editors sync their
-//                                           preview clocks to it)
+//   <- {"id":3,"result":{"seconds":T,"paused":B}}   (scene clock; editors
+//                                            sync their preview clocks to it)
+//   -> {"id":4,"method":"pause","params":{"paused":B}}
+//   -> {"id":5,"method":"seek","params":{"time":T}}   (backward re-creates
+//                                            the scene instances, §9.7)
+//   -> {"id":6,"method":"reload"}          (re-read scene from disk, keeping
+//                                            clock and parameter values)
+//   <- {"event":"transport","paused":B,"seconds":T}   (after pause/seek)
+//   <- {"event":"reload"}                  (clients should re-describe)
 //
 // V is a number (scalar) or an array of 2-4 numbers (vecN), like scene.json
 // literals (§4). Browser pages may connect only from localhost origins: a
@@ -48,7 +55,11 @@ public:
         std::function<bool(const std::string& name, const core::Value& value,
                            std::string& error, core::Value& applied)>
             setParameter;
-        std::function<double()> time; // current scene clock, seconds
+        std::function<double()> time;         // current scene clock, seconds
+        std::function<bool()> paused;
+        std::function<void(bool paused)> setPaused;
+        std::function<bool(double seconds, std::string& error)> seek;
+        std::function<bool(std::string& error)> reload;
     };
 
     ~ControlServer();
@@ -67,6 +78,8 @@ private:
     };
 
     void acceptClients();
+    void broadcast(const std::string& message, int exceptFd);
+    std::string transportJson() const;
     void readClient(int fd);
     bool handshake(int fd, Client& client);
     bool handleFrames(int fd, Client& client);

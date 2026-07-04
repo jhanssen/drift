@@ -43,6 +43,7 @@ struct App {
     std::unique_ptr<drift::core::Scene> scene;
 
     bool started = false;
+    bool paused = false;
     double startMs = 0.0;
     double pendingSeekSeconds = -1.0; // applied on the next frame
     double lastSeconds = 0.0;
@@ -164,6 +165,12 @@ bool onFrame(double nowMs, void*)
     if (gApp.pendingSeekSeconds >= 0.0) {
         gApp.startMs = nowMs - gApp.pendingSeekSeconds * 1000.0;
         gApp.pendingSeekSeconds = -1.0;
+    }
+    if (gApp.paused) {
+        // Re-anchor each frame so the clock holds still; the frozen time
+        // node dirties nothing and the graph quiesces (§11), while input
+        // and parameter changes still re-render.
+        gApp.startMs = nowMs - gApp.lastSeconds * 1000.0;
     }
 
     drift::core::FrameContext ctx{};
@@ -338,6 +345,27 @@ EMSCRIPTEN_KEEPALIVE int drift_seek(double seconds)
     gApp.pendingSeekSeconds = seconds;
     gApp.lastSeconds = seconds;
     return reloaded;
+}
+
+EMSCRIPTEN_KEEPALIVE void drift_pause(int paused)
+{
+    gApp.paused = paused != 0;
+}
+
+// Re-reads the scene from the bundle, keeping the clock (fresh instance
+// starting mid-time — forward-only per §9.7). The caller re-applies
+// parameter values. Returns 1 on success.
+EMSCRIPTEN_KEEPALIVE int drift_reload()
+{
+    if (gApp.scenePath.empty()) {
+        return 0;
+    }
+    auto fresh = loadScene(gApp.scenePath, gApp.device);
+    if (!fresh) {
+        return 0;
+    }
+    gApp.scene = std::move(fresh);
+    return 1;
 }
 
 // count selects scalar (1) through vec4 (4). Returns 0 for an unknown

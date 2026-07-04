@@ -327,6 +327,11 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
         scenes.erase(outputId);
     });
 
+    // Parameter values set at runtime (control endpoint). Applied to scene
+    // instances created later (output hotplug, reload) so parameters stay
+    // shared across outputs (§17.6).
+    std::map<std::string, drift::core::Value> runtimeParams;
+
     // Control endpoint (--listen): parameters are shared across outputs
     // (§17.6), so a set applies to every instance.
     drift::platform::ControlServer control;
@@ -354,7 +359,8 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
             }
             return info;
         };
-        callbacks.setParameter = [anyScene, &firstScene, &scenes, &app](
+        callbacks.setParameter = [anyScene, &firstScene, &scenes, &app,
+                                  &runtimeParams](
                                      const std::string& name,
                                      const drift::core::Value& value,
                                      std::string& error,
@@ -383,10 +389,48 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                     break;
                 }
             }
+            runtimeParams[name] = applied;
             app.requestRedrawAll();
             return true;
         };
         callbacks.time = [&app] { return app.currentSceneTime(); };
+        callbacks.paused = [&app] { return app.scenePaused(); };
+        callbacks.setPaused = [&app](bool paused) {
+            app.setScenePaused(paused);
+        };
+
+        // Fresh instances from disk, keeping runtime parameter values. The
+        // clock is left alone (reload) or set by the caller (seek).
+        auto reloadScenes = [&scenePath, &device, &overrides, &scenes,
+                             &firstScene, &runtimeParams,
+                             &app](std::string& error) {
+            if (scenePath.empty()) {
+                error = "no scene loaded";
+                return false;
+            }
+            auto fresh = loadScene(scenePath, device, overrides);
+            if (!fresh) {
+                error = "scene reload failed (see runtime log)";
+                return false;
+            }
+            for (const auto& [name, value] : runtimeParams) {
+                fresh->setParameter(name, value);
+            }
+            scenes.clear();
+            firstScene = std::move(fresh);
+            app.requestRedrawAll();
+            return true;
+        };
+        callbacks.seek = [&app, reloadScenes](double seconds,
+                                              std::string& error) {
+            // Backward violates §9.7 within an instance; re-create instead.
+            if (seconds < app.currentSceneTime() && !reloadScenes(error)) {
+                return false;
+            }
+            app.seekSceneTime(seconds);
+            return true;
+        };
+        callbacks.reload = reloadScenes;
         std::string error;
         if (!control.start(listenPort, std::move(callbacks), error)) {
             fprintf(stderr, "drift: control: %s\n", error.c_str());
@@ -410,6 +454,12 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                                              : loadScene(scenePath, device,
                                                          overrides))
                          .first;
+                if (it->second) {
+                    // Late instance (hotplug/reload): match runtime state.
+                    for (const auto& [name, value] : runtimeParams) {
+                        it->second->setParameter(name, value);
+                    }
+                }
             }
             if (!it->second) {
                 return false;
