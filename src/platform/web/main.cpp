@@ -42,7 +42,9 @@ struct App {
     std::string scenePath;
     std::unique_ptr<drift::core::Scene> scene;
 
-    double startMs = -1.0;
+    bool started = false;
+    double startMs = 0.0;
+    double pendingSeekSeconds = -1.0; // applied on the next frame
     double lastSeconds = 0.0;
     float mouseX = 0.5f, mouseY = 0.5f;
     bool mouseActive = false;
@@ -155,8 +157,13 @@ bool onFrame(double nowMs, void*)
     if (!syncSurfaceSize()) {
         return true; // canvas not laid out yet; try again next frame
     }
-    if (gApp.startMs < 0.0) {
+    if (!gApp.started) {
+        gApp.started = true;
         gApp.startMs = nowMs;
+    }
+    if (gApp.pendingSeekSeconds >= 0.0) {
+        gApp.startMs = nowMs - gApp.pendingSeekSeconds * 1000.0;
+        gApp.pendingSeekSeconds = -1.0;
     }
 
     drift::core::FrameContext ctx{};
@@ -306,6 +313,31 @@ EMSCRIPTEN_KEEPALIVE const char* drift_describe()
 EMSCRIPTEN_KEEPALIVE double drift_time()
 {
     return gApp.lastSeconds;
+}
+
+// Sets the preview's scene clock, so the editor can sync it to a live
+// runtime's. Forward is a clock shift (§9.7 allows forward snaps); going
+// backward re-creates the scene — time within one instance never
+// decreases — so the caller must re-apply parameter overrides. Returns 1
+// when it reloaded.
+EMSCRIPTEN_KEEPALIVE int drift_seek(double seconds)
+{
+    if (!gApp.scene || seconds < 0.0) {
+        return 0;
+    }
+    int reloaded = 0;
+    if (seconds < gApp.lastSeconds) {
+        gApp.scene = loadScene(gApp.scenePath, gApp.device);
+        if (!gApp.scene) {
+            return 0; // reload failed; console has the loader errors
+        }
+        reloaded = 1;
+    }
+    // Applied in the next frame callback, where a trustworthy rAF
+    // timestamp exists (a seek can arrive before the first frame).
+    gApp.pendingSeekSeconds = seconds;
+    gApp.lastSeconds = seconds;
+    return reloaded;
 }
 
 // count selects scalar (1) through vec4 (4). Returns 0 for an unknown

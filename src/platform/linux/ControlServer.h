@@ -10,6 +10,9 @@
 //   -> {"id":2,"method":"set","params":{"name":"p","value":V}}
 //   <- {"id":2,"result":{}}  or  {"id":2,"error":"..."}
 //   <- {"event":"parameter","name":"p","value":V}   (to the other clients)
+//   -> {"id":3,"method":"time"}
+//   <- {"id":3,"result":{"seconds":T}}     (scene clock; editors sync their
+//                                           preview clocks to it)
 //
 // V is a number (scalar) or an array of 2-4 numbers (vecN), like scene.json
 // literals (§4). Browser pages may connect only from localhost origins: a
@@ -45,6 +48,7 @@ public:
         std::function<bool(const std::string& name, const core::Value& value,
                            std::string& error, core::Value& applied)>
             setParameter;
+        std::function<double()> time; // current scene clock, seconds
     };
 
     ~ControlServer();

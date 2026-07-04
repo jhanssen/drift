@@ -386,6 +386,7 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
             app.requestRedrawAll();
             return true;
         };
+        callbacks.time = [&app] { return app.currentSceneTime(); };
         std::string error;
         if (!control.start(listenPort, std::move(callbacks), error)) {
             fprintf(stderr, "drift: control: %s\n", error.c_str());

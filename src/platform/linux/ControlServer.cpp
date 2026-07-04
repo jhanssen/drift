@@ -438,6 +438,12 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
         return;
     }
 
+    if (method == "time") {
+        const double seconds = mCallbacks.time ? mCallbacks.time() : 0.0;
+        respond("\"result\":{\"seconds\":" + numberJson(seconds) + "}");
+        return;
+    }
+
     respond("\"error\":\"unknown method '" + jsonEscape(method) + "'\"");
 }
 

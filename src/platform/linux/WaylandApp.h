@@ -8,6 +8,7 @@
 // windowed dev mode creates a single xdg toplevel. Each surface has its own
 // buffer ring, frame-callback state, pointer state, and scene clock.
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -95,6 +96,18 @@ public:
         for (auto& surf : mSurfaces) {
             surf->wantRedraw = true;
         }
+    }
+
+    // The scene clock, for the control endpoint's "time" method. Surfaces
+    // keep per-surface clocks that pause under occlusion; the shared clock
+    // (§17.6) is the furthest one along.
+    double currentSceneTime() const
+    {
+        double t = 0.0;
+        for (const auto& surf : mSurfaces) {
+            t = std::max(t, surf->sceneTime);
+        }
+        return t;
     }
 
     // Frame loop until the (windowed) surface is closed. animated: the
