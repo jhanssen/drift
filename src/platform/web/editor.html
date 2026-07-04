@@ -133,7 +133,7 @@
 
 // ---- wasm preview runtime (same artifacts as drift.html) -----------------
 
-const SCENES = ['plasma', 'buoy', 'follow', 'trail', 'pulse'];
+const SCENES = ['plasma', 'buoy', 'follow', 'trail', 'pulse', 'handoff'];
 const query = new URLSearchParams(location.search);
 const sceneName = query.get('scene') || SCENES[0];
 
@@ -217,6 +217,13 @@ var Module = {
         if (query.get('scratch')) {
           newScene();
         }
+      } else if (wasm.errors()) {
+        // The scene failed to load (e.g. video nodes have no web decoder
+        // yet); the editor still works live-only.
+        clearInterval(timer);
+        const reason = wasm.errors().split('\n')[0];
+        setStatus('wasmStatus', `preview: ${reason}`, 'warn');
+        console.log(`editor: wasm preview unavailable: ${reason}`);
       } else if (Date.now() - started > 8000) {
         clearInterval(timer);
         setStatus('wasmStatus', 'preview: unavailable (WebGPU?)', 'bad');

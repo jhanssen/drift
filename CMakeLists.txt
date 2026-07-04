@@ -67,7 +67,10 @@ if(EMSCRIPTEN)
         OUTPUT_NAME drift
         SUFFIX ".html"
         LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
-    set(DRIFT_WEB_SCENES plasma buoy follow trail pulse)
+    # handoff has video nodes (unsupported in the web preview until a
+    # WebCodecs decoder exists); it's bundled anyway so the editor can be
+    # used live-only against a native runtime playing it.
+    set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
