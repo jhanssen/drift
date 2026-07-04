@@ -20,6 +20,15 @@ private:
     float mLast = 0.0f;
 };
 
+// §9.8 mouse (implicit): outputs position (last-known, output space),
+// active (1 while the pointer is over the scene surface).
+class MouseNode : public Node {
+public:
+    MouseNode();
+    void evaluate(FrameContext& ctx) override;
+    bool alwaysEvaluate() const override { return true; }
+};
+
 // §9.9 wave: inputs input, frequency, phase; property shape.
 class WaveNode : public Node {
 public:

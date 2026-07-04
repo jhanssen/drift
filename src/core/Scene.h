@@ -16,6 +16,10 @@ namespace drift::core {
 struct FrameContext {
     wgpu::Device device;
     float seconds = 0.0f; // scene time; does not advance while paused
+    // Pointer state in output space (§9.8). x/y hold the last known
+    // position; the platform keeps them across leave events.
+    float mouseX = 0.5f, mouseY = 0.5f;
+    bool mouseActive = false;
     uint64_t frame = 0;
     wgpu::TextureView target;
     uint32_t targetWidth = 0, targetHeight = 0;

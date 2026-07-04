@@ -34,6 +34,34 @@ void dmabufModifier(void* data, zwp_linux_dmabuf_v1*, uint32_t format,
 }
 const zwp_linux_dmabuf_v1_listener kDmabufListener = { dmabufFormat, dmabufModifier };
 
+void seatCapabilities(void* data, wl_seat*, uint32_t capabilities)
+{
+    static_cast<WaylandApp*>(data)->onSeatCapabilities(capabilities);
+}
+void seatName(void*, wl_seat*, const char*) {}
+const wl_seat_listener kSeatListener = { seatCapabilities, seatName };
+
+void pointerEnter(void* data, wl_pointer*, uint32_t /*serial*/,
+                  wl_surface* surface, wl_fixed_t sx, wl_fixed_t sy)
+{
+    static_cast<WaylandApp*>(data)->onPointerEnter(
+        surface, wl_fixed_to_double(sx), wl_fixed_to_double(sy));
+}
+void pointerLeave(void* data, wl_pointer*, uint32_t, wl_surface* surface)
+{
+    static_cast<WaylandApp*>(data)->onPointerLeave(surface);
+}
+void pointerMotion(void* data, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy)
+{
+    static_cast<WaylandApp*>(data)->onPointerMotion(wl_fixed_to_double(sx),
+                                                    wl_fixed_to_double(sy));
+}
+void pointerButton(void*, wl_pointer*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void pointerAxis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
+const wl_pointer_listener kPointerListener = {
+    pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis
+};
+
 void wmBasePing(void*, xdg_wm_base* wmBase, uint32_t serial)
 {
     xdg_wm_base_pong(wmBase, serial);
@@ -106,6 +134,8 @@ constexpr int kBufferCount = 2;
 WaylandApp::~WaylandApp()
 {
     destroyRing();
+    if (mPointer) wl_pointer_destroy(mPointer);
+    if (mSeat) wl_seat_destroy(mSeat);
     if (mLayerSurface) zwlr_layer_surface_v1_destroy(mLayerSurface);
     if (mToplevel) xdg_toplevel_destroy(mToplevel);
     if (mXdgSurface) xdg_surface_destroy(mXdgSurface);
@@ -136,6 +166,49 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         mDmabuf = (zwp_linux_dmabuf_v1*)wl_registry_bind(
             mRegistry, name, &zwp_linux_dmabuf_v1_interface, std::min(version, 3u));
         zwp_linux_dmabuf_v1_add_listener(mDmabuf, &kDmabufListener, this);
+    } else if (!strcmp(interface, wl_seat_interface.name)) {
+        mSeat = (wl_seat*)wl_registry_bind(mRegistry, name, &wl_seat_interface,
+                                           std::min(version, 2u));
+        wl_seat_add_listener(mSeat, &kSeatListener, this);
+    }
+}
+
+void WaylandApp::onSeatCapabilities(uint32_t capabilities)
+{
+    const bool hasPointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+    if (hasPointer && !mPointer) {
+        mPointer = wl_seat_get_pointer(mSeat);
+        wl_pointer_add_listener(mPointer, &kPointerListener, this);
+    } else if (!hasPointer && mPointer) {
+        wl_pointer_destroy(mPointer);
+        mPointer = nullptr;
+        mPointerOver = false;
+    }
+}
+
+void WaylandApp::onPointerEnter(wl_surface* surface, double x, double y)
+{
+    if (surface != mSurface) {
+        return;
+    }
+    mPointerOver = true;
+    mPointerSeen = true;
+    mPointerX = x;
+    mPointerY = y;
+}
+
+void WaylandApp::onPointerLeave(wl_surface* surface)
+{
+    if (surface == mSurface) {
+        mPointerOver = false;
+    }
+}
+
+void WaylandApp::onPointerMotion(double x, double y)
+{
+    if (mPointerOver) {
+        mPointerX = x;
+        mPointerY = y;
     }
 }
 

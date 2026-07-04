@@ -6,8 +6,8 @@ and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 
 Status: early. Loads and renders `.sceneproject` scenes with the core node
 set: image (PNG/JPEG), shader, transform, compositor, wave, remap, combine,
-split, time, output. Video, mouse input, and previous-frame feedback are
-next. Wayland (wlr-layer-shell compositors) only.
+split, and the implicit time/mouse inputs. Video and previous-frame feedback
+are next. Wayland (wlr-layer-shell compositors) only.
 
 ## Build
 
@@ -30,6 +30,8 @@ build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 
 Without a scene argument, a builtin placeholder gradient is rendered.
 `DRIFT_ADAPTER=<substring>` selects a specific GPU adapter by device name.
+Headless runs take `--mouse X,Y` to inject a fixed pointer position
+(scenes using `@mouse` stay deterministic and golden-testable).
 
 ## Test
 

@@ -171,16 +171,49 @@ TEST_CASE("previous-frame reads are a load error until implemented")
     CHECK(r.hasError("not implemented"));
 }
 
-TEST_CASE("mouse input is a load error until implemented")
+TEST_CASE("mouse is an implicit input node")
 {
+    // position (vec2, default output) and active (scalar) both wire up.
     auto r = load(R"({
         "version": 1, "name": "x",
         "nodes": [
-            { "id": "a", "type": "split", "inputs": { "value": "@mouse.position" } }
+            { "id": "s", "type": "split", "inputs": { "value": "@mouse.position" } },
+            { "id": "fade", "type": "remap",
+              "inputs": { "value": "@mouse.active", "outMin": 0.2, "outMax": 1 } },
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": "@s.x" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
         ]
     })");
-    CHECK(r.scene == nullptr);
-    CHECK(r.hasError("not implemented"));
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+
+    auto defaultPort = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "s", "type": "split", "inputs": { "value": "@mouse" } }
+        ]
+    })");
+    CHECK(defaultPort.scene == nullptr); // fails only on missing output node
+    CHECK(defaultPort.hasError("no output node"));
+
+    auto badPort = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "s", "type": "split", "inputs": { "value": "@mouse.wheel" } }
+        ]
+    })");
+    CHECK(badPort.scene == nullptr);
+    CHECK(badPort.hasError("no output port 'wheel'"));
+
+    auto typeMismatch = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "w", "type": "wave", "inputs": { "input": "@mouse.position" } }
+        ]
+    })");
+    CHECK(typeMismatch.scene == nullptr);
+    CHECK(typeMismatch.hasError("type mismatch"));
 }
 
 TEST_CASE("a scene must have exactly one output node")

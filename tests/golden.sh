@@ -7,6 +7,7 @@
 # The golden dir contains frame_NNNN.png files (which frames to render is
 # derived from their names) and optionally:
 #   size   - render resolution as WxH (default 320x180)
+#   mouse  - fixed pointer position as X,Y (passed as --mouse)
 #
 # Renders on the lavapipe software rasterizer by default so results are
 # reproducible across machines; set DRIFT_ADAPTER to override (imgcmp's
@@ -24,6 +25,8 @@ export DRIFT_ADAPTER
 
 size=320x180
 [ -f "$golden/size" ] && size=$(cat "$golden/size")
+mouse_args=()
+[ -f "$golden/mouse" ] && mouse_args=(--mouse "$(cat "$golden/mouse")")
 
 frames=""
 for f in "$golden"/frame_*.png; do
@@ -37,7 +40,7 @@ done
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
-"$drift" "$scene" --frames "$frames" --size "$size" --out "$out"
+"$drift" "$scene" --frames "$frames" --size "$size" --out "$out" "${mouse_args[@]}"
 
 rc=0
 for f in "$golden"/frame_*.png; do

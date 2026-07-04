@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "name": "Follow",
+  "description": "Mouse input demo: the buoy follows the pointer and fades out while the pointer is away",
+  "nodes": [
+    { "id": "bg",   "type": "image", "src": "assets/sea.png" },
+    { "id": "buoy", "type": "image", "src": "assets/buoy.png" },
+
+    { "id": "fade", "type": "remap",
+      "inputs": { "value": "@mouse.active", "outMin": 0.25, "outMax": 1 } },
+
+    { "id": "place", "type": "transform",
+      "inputs": { "source": "@buoy", "position": "@mouse.position", "scale": 0.25,
+                  "opacity": "@fade" } },
+
+    { "id": "comp", "type": "compositor", "inputs": { "layers": ["@bg", "@place"] } },
+    { "id": "out",  "type": "output",     "inputs": { "color": "@comp" } }
+  ]
+}

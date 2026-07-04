@@ -29,6 +29,8 @@ void usage(const char* argv0)
             "      --frames LIST  only write the comma-separated frame indices\n"
             "                     (still evaluates every frame up to the last;\n"
             "                     implies --headless if N is omitted)\n"
+            "      --mouse X,Y    headless: fixed pointer position in [0,1]\n"
+            "                     output space, active (default: inactive)\n"
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
             "      --out DIR      output directory for --headless (default .)\n"
@@ -91,9 +93,14 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
 // writeFrames: frame indices to write as PNGs; empty = all. Every frame up
 // to the last is evaluated regardless, since dirty state (and later,
 // feedback loops) depends on frame history.
+struct MouseArg {
+    float x = 0.5f, y = 0.5f;
+    bool active = false;
+};
+
 int runHeadless(const std::string& scenePath, int frames, uint32_t width,
                 uint32_t height, const std::string& outDir,
-                const std::set<int>& writeFrames)
+                const std::set<int>& writeFrames, const MouseArg& mouse)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/false)) {
@@ -133,6 +140,9 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
             drift::core::FrameContext ctx{};
             ctx.device = device;
             ctx.seconds = t;
+            ctx.mouseX = mouse.x;
+            ctx.mouseY = mouse.y;
+            ctx.mouseActive = mouse.active;
             ctx.target = texture.CreateView();
             ctx.targetWidth = width;
             ctx.targetHeight = height;
@@ -226,6 +236,9 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
             drift::core::FrameContext ctx{};
             ctx.device = device;
             ctx.seconds = t;
+            ctx.mouseX = app.mouseX();
+            ctx.mouseY = app.mouseY();
+            ctx.mouseActive = app.mouseActive();
             ctx.target = target;
             ctx.targetWidth = w;
             ctx.targetHeight = h;
@@ -247,6 +260,7 @@ int main(int argc, char** argv)
     std::string outDir = ".";
     std::string scenePath;
     std::set<int> writeFrames;
+    MouseArg mouse;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -270,6 +284,12 @@ int main(int argc, char** argv)
                 usage(argv[0]);
                 return 2;
             }
+        } else if (!strcmp(arg, "--mouse") && i + 1 < argc) {
+            if (sscanf(argv[++i], "%f,%f", &mouse.x, &mouse.y) != 2) {
+                usage(argv[0]);
+                return 2;
+            }
+            mouse.active = true;
         } else if (!strcmp(arg, "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &width, &height) != 2) {
                 usage(argv[0]);
@@ -294,7 +314,7 @@ int main(int argc, char** argv)
     if (headlessFrames >= 0) {
         if (width == 0) { width = 1920; height = 1080; }
         return runHeadless(scenePath, headlessFrames, width, height, outDir,
-                           writeFrames);
+                           writeFrames, mouse);
     }
     if (width == 0) { width = 1280; height = 720; }
     return runWayland(scenePath,

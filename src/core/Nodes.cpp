@@ -145,6 +145,31 @@ void TimeNode::evaluate(FrameContext& ctx)
     writeOutput(outputs[1], delta);
 }
 
+// ---- MouseNode ----
+
+MouseNode::MouseNode()
+{
+    outputs.resize(2); // 0=position (default), 1=active
+    outputs[0].value.type = ValueType::Vec2;
+    outputs[0].value.v = { 0.5f, 0.5f, 0.0f, 0.0f };
+    outputs[1].value.type = ValueType::Scalar;
+}
+
+void MouseNode::evaluate(FrameContext& ctx)
+{
+    // position holds its last value while inactive (§9.8); scenes use
+    // 'active' to fade rather than snap.
+    if (ctx.mouseActive) {
+        Value pos{};
+        pos.type = ValueType::Vec2;
+        pos.v = { ctx.mouseX, ctx.mouseY, 0.0f, 0.0f };
+        writeOutput(outputs[0], pos);
+    }
+    Value active{};
+    active.v[0] = ctx.mouseActive ? 1.0f : 0.0f;
+    writeOutput(outputs[1], active);
+}
+
 // ---- WaveNode ----
 
 WaveNode::WaveNode(Shape shape)

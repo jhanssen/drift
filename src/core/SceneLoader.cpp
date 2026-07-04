@@ -254,9 +254,15 @@ struct OutputPortDef {
 std::vector<OutputPortDef> outputPortsFor(const std::string& type)
 {
     if (type == "time") return { { "seconds", 0 }, { "delta", 1 } };
+    if (type == "mouse") return { { "position", 0 }, { "active", 1 } };
     if (type == "split") return { { "x", 0 }, { "y", 1 }, { "z", 2 }, { "w", 3 } };
     if (type == "output") return {};
     return { { "result", 0 } };
+}
+
+bool isImplicitNode(const std::string& id)
+{
+    return id == "time" || id == "mouse";
 }
 
 class Loader {
@@ -290,6 +296,7 @@ private:
     std::map<std::string, size_t> mRawIndex;
     std::vector<size_t> mTopoOrder;
     bool mNeedsTime = false;
+    bool mNeedsMouse = false;
 
     std::map<std::string, Node*> mInstances;
     std::vector<std::unique_ptr<Node>> mNodes;
@@ -400,12 +407,10 @@ bool Loader::parseNodes(const glz::generic& json)
                         fail("node '" + raw.id + "' input '" + port +
                              "': previous-frame reads are not implemented yet");
                         connOk = false;
-                    } else if (conn.node == "mouse") {
-                        fail("node '" + raw.id + "' input '" + port +
-                             "': mouse input is not implemented yet");
-                        connOk = false;
                     } else if (conn.node == "time") {
                         mNeedsTime = true;
+                    } else if (conn.node == "mouse") {
+                        mNeedsMouse = true;
                     }
                 });
                 if (!connOk) {
@@ -431,7 +436,7 @@ bool Loader::topoSort()
         for (const auto& [port, in] : mRawNodes[i].inputs) {
             bool ok = true;
             forEachConn(in, [&](const RawConn& conn) {
-                if (conn.node == "time") {
+                if (isImplicitNode(conn.node)) {
                     return;
                 }
                 auto it = mRawIndex.find(conn.node);
@@ -491,7 +496,8 @@ bool Loader::resolveInputType(const RawNode& raw, const RawInput& in, ValueType&
     case RawInput::Kind::Conn: {
         Node* src = mInstances[in.conn.node]; // topo order: already created
         const auto ports = outputPortsFor(
-            in.conn.node == "time" ? "time" : mRawNodes[mRawIndex[in.conn.node]].type);
+            isImplicitNode(in.conn.node) ? in.conn.node
+                                         : mRawNodes[mRawIndex[in.conn.node]].type);
         int idx = 0;
         if (!in.conn.port.empty()) {
             idx = -1;
@@ -813,8 +819,8 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
             in.srcPort = 0;
             if (!rawIn.conn.port.empty()) {
                 const auto srcPorts = outputPortsFor(
-                    rawIn.conn.node == "time"
-                        ? "time"
+                    isImplicitNode(rawIn.conn.node)
+                        ? rawIn.conn.node
                         : mRawNodes[mRawIndex[rawIn.conn.node]].type);
                 for (const auto& p : srcPorts) {
                     if (rawIn.conn.port == p.name) {
@@ -909,6 +915,12 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         time->id = "time";
         mNodes.emplace_back(time);
         mInstances["time"] = time;
+    }
+    if (mNeedsMouse) {
+        auto* mouse = new MouseNode();
+        mouse->id = "mouse";
+        mNodes.emplace_back(mouse);
+        mInstances["mouse"] = mouse;
     }
     for (size_t idx : mTopoOrder) {
         if (!instantiate(mRawNodes[idx])) {

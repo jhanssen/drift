@@ -18,6 +18,8 @@ struct wl_compositor;
 struct wl_surface;
 struct wl_buffer;
 struct wl_callback;
+struct wl_seat;
+struct wl_pointer;
 struct xdg_wm_base;
 struct xdg_surface;
 struct xdg_toplevel;
@@ -44,6 +46,19 @@ public:
 
     wgpu::TextureFormat targetFormat() const { return mFormat; }
 
+    // Pointer state in output space (last-known position; active while the
+    // pointer is over our surface). On Wayland a background layer surface
+    // only receives pointer events while the cursor is over the bare desktop.
+    float mouseX() const
+    {
+        return mPointerSeen && mWidth ? (float)(mPointerX / mWidth) : 0.5f;
+    }
+    float mouseY() const
+    {
+        return mPointerSeen && mHeight ? (float)(mPointerY / mHeight) : 0.5f;
+    }
+    bool mouseActive() const { return mPointerOver; }
+
     // Frame loop until the surface is closed. renderFrame(targetView, width,
     // height, timeSeconds) records and submits the frame's GPU work.
     using RenderFrame =
@@ -53,6 +68,10 @@ public:
     // -- internal, public for C listener trampolines --
     void onGlobal(uint32_t name, const char* interface, uint32_t version);
     void onDmabufModifier(uint32_t fourcc, uint64_t modifier);
+    void onSeatCapabilities(uint32_t capabilities);
+    void onPointerEnter(wl_surface* surface, double x, double y);
+    void onPointerLeave(wl_surface* surface);
+    void onPointerMotion(double x, double y);
     void onXdgSurfaceConfigure(uint32_t serial);
     void onToplevelConfigure(int32_t width, int32_t height);
     void onLayerConfigure(uint32_t serial, uint32_t width, uint32_t height);
@@ -82,6 +101,12 @@ private:
     xdg_wm_base* mWmBase = nullptr;
     zwlr_layer_shell_v1* mLayerShell = nullptr;
     zwp_linux_dmabuf_v1* mDmabuf = nullptr;
+
+    wl_seat* mSeat = nullptr;
+    wl_pointer* mPointer = nullptr;
+    double mPointerX = 0.0, mPointerY = 0.0; // surface-local, last known
+    bool mPointerOver = false;
+    bool mPointerSeen = false; // false until the first enter: report center
 
     wl_surface* mSurface = nullptr;
     xdg_surface* mXdgSurface = nullptr;
