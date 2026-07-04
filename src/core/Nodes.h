@@ -80,9 +80,11 @@ public:
     };
     struct Track {
         std::string name;
+        bool event = false; // §16: cue track; fires instead of keys
         ValueType type = ValueType::Scalar;
         Interpolate interpolate = Interpolate::Linear;
-        std::vector<Key> keys; // strictly ascending t, validated at load
+        std::vector<Key> keys;      // value tracks: strictly ascending t
+        std::vector<double> fires;  // event tracks: ascending, [0, duration)
     };
 
     SequenceNode(double duration, bool loop, std::vector<Track> tracks);
@@ -96,6 +98,7 @@ private:
     const double mDuration;
     const bool mLoop;
     const std::vector<Track> mTracks;
+    double mLastLocalTime = 0.0; // cue-crossing window start (§9.9)
 };
 
 // §9.1 image: static texture source, dirty on load only. Decoding happens in
@@ -150,6 +153,8 @@ private:
     // spans, so an unpaused video tracks scene time exactly.
     double mPausedTotal = 0.0;
     double mLastSeconds = 0.0;
+    // §17.4: final frame produced (loop: false); holds until 'restart'.
+    bool mFinished = false;
 
 #ifndef __EMSCRIPTEN__
     // The zero-copy path is the one sanctioned exception to the portable-API

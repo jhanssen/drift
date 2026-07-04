@@ -34,6 +34,9 @@ struct VideoFrame {
     uint64_t surfaceId = 0;
     bool bt709 = false;     // YUV matrix (else BT.601)
     bool fullRange = false; // YUV range (else limited/video)
+    // Final frame of a non-looping stream (§17.4): the consumer fires its
+    // 'finished' event when it observes this.
+    bool last = false;
     uint32_t width = 0, height = 0;
     int64_t index = -1; // increases with every newly decoded frame, loop-aware
 };
@@ -53,6 +56,11 @@ public:
     // The consumer failed to import this decoder's zero-copy planes (e.g.
     // the GPU can't take the dmabuf): produce CPU frames from now on.
     virtual void disableZeroCopy() {}
+
+    // Seek back to the start (video 'restart' input, §9.2): subsequent
+    // frameAt calls will use small timestamps again, and frame indices keep
+    // increasing. Also rearms a finished non-looping stream.
+    virtual void restart() {}
 };
 
 // Opens path (project-relative; the platform resolves and confines it).

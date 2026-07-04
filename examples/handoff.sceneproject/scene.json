@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "Video Handoff",
-  "description": "Timed video playback: one sequence's hold tracks drive each video's 'playing' AND its layer opacity, so a video is hidden (and fully quiescent - no decode, no GPU work) outside its window. Scaled-down reference for 'play A at 0:30, B at 1:05'-style scenes.",
+  "description": "Timed video playback: one sequence's hold tracks drive each video's 'playing' AND its layer opacity, so a video is hidden (and fully quiescent - no decode, no GPU work) outside its window; event tracks fire 'restart' at each window start, so every loop pass plays from the top. Scaled-down reference for 'play A at 0:30, B at 1:05'-style scenes.",
   "nodes": [
     { "id": "seq", "type": "sequence", "duration": 12, "loop": true,
       "tracks": [
@@ -10,14 +10,16 @@
                     { "t": 6.5, "value": 0 } ] },
         { "name": "playB", "kind": "value", "type": "scalar", "interpolate": "hold",
           "keys": [ { "t": 0, "value": 0 }, { "t": 6.5, "value": 1 },
-                    { "t": 11, "value": 0 } ] }
+                    { "t": 11, "value": 0 } ] },
+        { "name": "cueA", "kind": "event", "fires": [ 3 ] },
+        { "name": "cueB", "kind": "event", "fires": [ 6.5 ] }
       ],
       "inputs": { "time": "@time.seconds" } },
 
     { "id": "vidA", "type": "video", "src": "assets/a.mp4",
-      "inputs": { "playing": "@seq.playA" } },
+      "inputs": { "playing": "@seq.playA", "restart": "@seq.cueA" } },
     { "id": "vidB", "type": "video", "src": "assets/b.mp4",
-      "inputs": { "playing": "@seq.playB" } },
+      "inputs": { "playing": "@seq.playB", "restart": "@seq.cueB" } },
 
     { "id": "placeA", "type": "transform",
       "inputs": { "source": "@vidA", "opacity": "@seq.playA" } },

@@ -22,6 +22,16 @@ Value Node::inputValue(size_t index) const
     return v;
 }
 
+bool Node::inputFired(size_t index) const
+{
+    const Input& in = inputs[index];
+    if (!in.srcNode) {
+        return false;
+    }
+    const Output& src = in.srcNode->outputs[in.srcPort];
+    return in.previous ? src.prevDirty : src.dirty;
+}
+
 bool Node::inputsDirty() const
 {
     for (const Input& in : inputs) {

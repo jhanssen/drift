@@ -288,7 +288,8 @@ SequenceNode::SequenceNode(double duration, bool loop, std::vector<Track> tracks
 {
     outputs.resize(mTracks.size());
     for (size_t i = 0; i < mTracks.size(); ++i) {
-        outputs[i].value.type = mTracks[i].type;
+        outputs[i].value.type =
+            mTracks[i].event ? ValueType::Event : mTracks[i].type;
     }
 }
 
@@ -308,6 +309,25 @@ void SequenceNode::evaluate(FrameContext&)
 
     for (size_t i = 0; i < mTracks.size(); ++i) {
         const Track& track = mTracks[i];
+        if (track.event) {
+            // Cue crossing (§9.9): with previous local time t0 and current
+            // t1, cues in (t0, t1] fire; on a loop wrap, (t0, duration) and
+            // [0, t1]; on the first evaluation, [0, t1]. A fire is the
+            // output's dirty flag — no value, no change detection.
+            const double t0 = mLastLocalTime;
+            const bool wrapped = !firstEvaluate && t < t0;
+            for (double cue : track.fires) {
+                const bool fired =
+                    firstEvaluate ? cue <= t
+                    : wrapped     ? cue > t0 || cue <= t
+                                  : cue > t0 && cue <= t;
+                if (fired) {
+                    outputs[i].dirty = true;
+                    break;
+                }
+            }
+            continue;
+        }
         // Last key with key.t <= t; before the first key, the first key's
         // value; after the last, the last key's (§9.9 — no wrap-around
         // interpolation).
@@ -331,6 +351,7 @@ void SequenceNode::evaluate(FrameContext&)
         }
         writeOutput(outputs[i], out);
     }
+    mLastLocalTime = t;
 }
 
 // ---- ImageNode ----
@@ -702,8 +723,9 @@ void yuvMatrix(bool bt709, bool fullRange, float rows[12])
 VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
     : mDecoder(std::move(decoder))
 {
-    outputs.resize(1);
+    outputs.resize(2); // 0=result (default), 1=finished (§17.4)
     outputs[0].value.type = ValueType::Texture;
+    outputs[1].value.type = ValueType::Event;
 }
 
 #ifndef __EMSCRIPTEN__ // zero-copy import (see Nodes.h on the exception)
@@ -879,26 +901,41 @@ void VideoNode::evaluate(FrameContext& ctx)
     // freezes (paused spans accumulate into mPausedTotal), the decoder is
     // never pulled — frameAt is what drives decode-ahead — and result stays
     // non-dirty. The first evaluate decodes even when paused, so a scene
-    // that starts paused still shows a poster frame.
+    // that starts paused still shows a poster frame; a 'restart' fire does
+    // the same (§9.2: poster, then playback waits on 'playing').
     const bool playing = inputs.empty() || inputValue(0).v[0] > 0.5;
-    if (!firstEvaluate && !playing) {
+    const bool restarted = inputs.size() > 1 && inputFired(1);
+    if (restarted) {
+        mDecoder->restart();
+        mPausedTotal = ctx.seconds; // playback clock back to zero
+        mFinished = false;
+    } else if (!firstEvaluate && !playing) {
         mPausedTotal += ctx.seconds - mLastSeconds;
     }
     mLastSeconds = ctx.seconds;
-    if (!playing && !firstEvaluate) {
+    if (!playing && !firstEvaluate && !restarted) {
         return;
+    }
+    if (mFinished) {
+        return; // §17.4: hold the final frame until a restart rearms
     }
 
     const VideoFrame* frame = mDecoder->frameAt(ctx.seconds - mPausedTotal);
     if (!frame) {
         return; // decode error; hold the previous frame
     }
+    if (frame->last && outputs.size() > 1) {
+        // §17.4 finished: fires on the frame the final decoded frame is
+        // produced; never fires while looping (last is never set then).
+        mFinished = true;
+        outputs[1].dirty = true;
+    }
+    if (frame->index == mLastIndex) {
+        return; // already uploaded/imported this frame
+    }
 
 #ifndef __EMSCRIPTEN__
     if (frame->planes.size() == 2) {
-        if (frame->index == mLastIndex) {
-            return;
-        }
         if (evaluateZeroCopy(ctx, *frame)) {
             mLastIndex = frame->index;
         } else {

@@ -144,6 +144,44 @@ TEST_CASE("hold tracks are dirty only on key transitions")
     CHECK(seq.node.outputs[0].dirty);   // crossed the key
 }
 
+namespace {
+
+SequenceNode::Track eventTrack(std::vector<double> fires)
+{
+    SequenceNode::Track track;
+    track.name = "cue";
+    track.event = true;
+    track.fires = std::move(fires);
+    return track;
+}
+
+} // namespace
+
+TEST_CASE("event tracks fire on cue crossings (§9.9)")
+{
+    SeqHarness seq(8.0, true, { eventTrack({ 2.0, 5.0 }) });
+    CHECK(seq.node.outputs[0].value.type == ValueType::Event);
+    seq.at(1.0); // first evaluation: [0, 1] holds no cue
+    CHECK(!seq.node.outputs[0].dirty);
+    seq.at(2.0); // (1, 2] contains 2
+    CHECK(seq.node.outputs[0].dirty);
+    seq.at(3.0);
+    CHECK(!seq.node.outputs[0].dirty); // a fire is one frame only
+    seq.at(5.5); // (3, 5.5] contains 5
+    CHECK(seq.node.outputs[0].dirty);
+    seq.at(7.9);
+    CHECK(!seq.node.outputs[0].dirty);
+    seq.at(10.5); // wrap to local 2.5: (7.9, 8) ∪ [0, 2.5] contains 2
+    CHECK(seq.node.outputs[0].dirty);
+}
+
+TEST_CASE("event track first evaluation fires cues at or before now")
+{
+    SeqHarness seq(8.0, true, { eventTrack({ 2.0 }) });
+    seq.at(3.0); // [0, 3] contains 2
+    CHECK(seq.node.outputs[0].dirty);
+}
+
 TEST_CASE("sequence local-time reduction survives a month of scene time")
 {
     // A 40 s linear ramp equal to local time. 2'592'000 is an exact multiple
@@ -163,28 +201,50 @@ namespace {
 
 struct RecordingDecoder : VideoDecoder {
     std::vector<double> calls;
+    int restarts = 0;
+    VideoFrame frame; // served when serve is set; else "decode error"
+    bool serve = false;
     const VideoFrame* frameAt(double seconds) override
     {
         calls.push_back(seconds);
-        return nullptr; // "decode error": evaluate holds and skips GPU work
+        return serve ? &frame : nullptr;
     }
+    void restart() override { ++restarts; }
+};
+
+// An event producer standing in for a sequence cue track.
+struct EventSource : Node {
+    EventSource()
+    {
+        outputs.resize(1);
+        outputs[0].value.type = ValueType::Event;
+    }
+    void evaluate(FrameContext&) override {}
 };
 
 struct VideoHarness {
     RecordingDecoder* decoder;
     std::unique_ptr<VideoNode> node;
+    EventSource cue;
 
     VideoHarness()
     {
         auto owned = std::make_unique<RecordingDecoder>();
         decoder = owned.get();
         node = std::make_unique<VideoNode>(std::move(owned));
-        node->inputs.resize(1);
+        node->inputs.resize(2); // playing, restart
         node->inputs[0].constant.type = ValueType::Scalar;
+        node->inputs[1].type = ValueType::Event;
+        node->inputs[1].srcNode = &cue;
+        node->inputs[1].srcPort = 0;
     }
 
-    void frame(double seconds, bool playing)
+    void frame(double seconds, bool playing, bool fireRestart = false)
     {
+        cue.outputs[0].dirty = fireRestart;
+        for (auto& out : node->outputs) {
+            out.dirty = false;
+        }
         node->inputs[0].constant.v[0] = playing ? 1.0 : 0.0;
         FrameContext ctx{};
         ctx.seconds = seconds;
@@ -224,4 +284,50 @@ TEST_CASE("video starting paused decodes a poster frame only")
     v.frame(2.0, false);
     v.frame(3.0, true);
     CHECK(v.decoder->calls == std::vector<double>{ 0.0, 1.0 });
+}
+
+TEST_CASE("video restart resets the playback clock and seeks the decoder")
+{
+    VideoHarness v;
+    v.frame(0.0, true);
+    v.frame(1.0, true);
+    v.frame(2.0, true);
+    v.frame(3.0, true, /*fireRestart=*/true);
+    CHECK(v.decoder->restarts == 1);
+    CHECK(v.decoder->calls == std::vector<double>{ 0.0, 1.0, 2.0, 0.0 });
+    v.frame(4.0, true);
+    CHECK(v.decoder->calls.back() == 1.0); // continues from the restart
+}
+
+TEST_CASE("restart while paused pulls one poster frame (§9.2)")
+{
+    VideoHarness v;
+    v.frame(0.0, true);
+    v.frame(1.0, false);
+    v.frame(2.0, false);
+    CHECK(v.decoder->calls == std::vector<double>{ 0.0 });
+    v.frame(3.0, false, /*fireRestart=*/true);
+    CHECK(v.decoder->restarts == 1);
+    CHECK(v.decoder->calls == std::vector<double>{ 0.0, 0.0 });
+    v.frame(4.0, false); // still paused: no further pulls
+    CHECK(v.decoder->calls.size() == 2);
+}
+
+TEST_CASE("video fires finished once and holds until restart (§17.4)")
+{
+    VideoHarness v;
+    v.decoder->serve = true;
+    v.decoder->frame.index = -1; // == initial mLastIndex: skips GPU upload
+    v.frame(0.0, true);
+    CHECK(!v.node->outputs[1].dirty);
+    v.decoder->frame.last = true;
+    v.frame(1.0, true);
+    CHECK(v.node->outputs[1].dirty); // final frame produced -> fire
+    v.frame(2.0, true);
+    CHECK(!v.node->outputs[1].dirty); // held; no re-fire
+    CHECK(v.decoder->calls.size() == 2); // and no decoder pulls while held
+    v.decoder->frame.last = false;
+    v.frame(3.0, true, /*fireRestart=*/true); // rearms playback
+    CHECK(v.decoder->calls.size() == 3);
+    CHECK(v.decoder->calls.back() == 0.0);
 }

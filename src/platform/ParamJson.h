@@ -145,6 +145,17 @@ inline std::string describeJson(bool loaded, const std::string& name,
                 out += ",";
             }
             out += "{\"name\":\"" + jsonEscape(track.name) + "\"";
+            if (track.event) {
+                out += ",\"kind\":\"event\",\"fires\":[";
+                for (size_t f = 0; f < track.fires.size(); ++f) {
+                    if (f) {
+                        out += ",";
+                    }
+                    out += numberJson(track.fires[f]);
+                }
+                out += "]}";
+                continue;
+            }
             out += ",\"kind\":\"value\",\"type\":\"";
             out += core::valueTypeName(track.type);
             out += "\",\"interpolate\":\"";

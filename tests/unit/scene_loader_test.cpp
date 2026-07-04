@@ -955,16 +955,25 @@ TEST_CASE("sequence validation rejects malformed nodes")
               "keys": [ { "t": 0, "value": 0 } ] } ],
         "inputs": { "time": "@time.seconds" } })",
         "duplicate track name 'a'");
-    // reserved and unknown kinds
-    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
-        "tracks": [ { "name": "a", "kind": "event", "fires": [ 1 ] } ],
-        "inputs": { "time": "@time.seconds" } })",
-        "event tracks are reserved");
+    // unknown kinds
     reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
         "tracks": [ { "name": "a", "kind": "wiggle", "type": "scalar",
                       "keys": [ { "t": 0, "value": 0 } ] } ],
         "inputs": { "time": "@time.seconds" } })",
         "unknown kind 'wiggle'");
+    // event tracks (§9.9): fires non-empty, ascending, in [0, duration)
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "event", "fires": [] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "non-empty 'fires'");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "event", "fires": [ 5, 5 ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "must be ascending");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "event", "fires": [ 10 ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "outside [0, duration)");
     // keys: empty, non-ascending, out of range, type mismatch
     reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
         "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
@@ -1030,4 +1039,83 @@ TEST_CASE("video accepts a playing input (§9.2)")
     })", stubVideoFactory());
     CHECK(bad.scene == nullptr);
     CHECK(bad.hasError("type mismatch"));
+}
+
+TEST_CASE("event edges wire from sequence cues to video restart (§16)")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "seq", "type": "sequence", "duration": 10,
+              "tracks": [ { "name": "cue", "kind": "event", "fires": [ 2 ] } ],
+              "inputs": { "time": "@time.seconds" } },
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "restart": "@seq.cue" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
+    CHECK(r.warnings.empty());
+}
+
+TEST_CASE("event type mismatches are rejected (§4)")
+{
+    // event output -> scalar port
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "seq", "type": "sequence", "duration": 10,
+              "tracks": [ { "name": "cue", "kind": "event", "fires": [ 2 ] } ],
+              "inputs": { "time": "@time.seconds" } },
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "playing": "@seq.cue" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("type mismatch (event -> scalar)"));
+
+    // scalar -> event port (no splat into event, §4)
+    auto r2 = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "restart": 1 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    CHECK(r2.scene == nullptr);
+    CHECK(r2.hasError("type mismatch (scalar -> event)"));
+}
+
+TEST_CASE("event tracks on a non-@time sequence warn (§9.9)")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "seq", "type": "sequence", "duration": 10,
+              "tracks": [ { "name": "cue", "kind": "event", "fires": [ 2 ] } ],
+              "inputs": { "time": "@mouse.active" } },
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "restart": "@seq.cue" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
+    CHECK(r.hasWarning("monotonic 'time' input"));
+}
+
+TEST_CASE("video exposes a finished event output (§17.4)")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "a", "type": "video", "src": "assets/clip.mp4", "loop": false },
+            { "id": "b", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "restart": "@a.finished" } },
+            { "id": "comp", "type": "compositor", "inputs": { "layers": ["@a", "@b"] } },
+            { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+        ]
+    })", stubVideoFactory());
+    REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
 }

@@ -239,10 +239,34 @@ public:
                 return &mCurrent.frame; // next queued frame is in the future
             }
             if (mEof || mError) {
-                return mHaveCurrent ? &mCurrent.frame : nullptr;
+                if (mHaveCurrent) {
+                    // The stream is drained: what we hold is the final
+                    // frame (§17.4). Set here on the render thread —
+                    // mCurrent is only touched under the lock.
+                    if (mEof && !mLoop) {
+                        mCurrent.frame.last = true;
+                    }
+                    return &mCurrent.frame;
+                }
+                return nullptr;
             }
             mProduced.wait(lock); // decoder is behind; wait for it
         }
+    }
+
+    void restart() override
+    {
+        std::lock_guard lock(mMutex);
+        mRestart = true;
+        // Un-finish immediately so a frameAt right after us blocks for the
+        // re-decoded first frame (the poster) instead of returning the old
+        // tail; the stale queue would otherwise serve pre-restart frames.
+        mEof = false;
+        for (auto& item : mQueue) {
+            releaseItem(item);
+        }
+        mQueue.clear();
+        mConsumed.notify_all();
     }
 
     void disableZeroCopy() override
@@ -284,11 +308,29 @@ private:
         while (true) {
             {
                 std::unique_lock lock(mMutex);
+                // At non-looping EOS the thread idles here (mEof blocks the
+                // predicate) until a restart rearms it or teardown.
                 mConsumed.wait(lock, [this] {
-                    return mStop || mQueue.size() < kMaxQueued;
+                    return mStop || mRestart ||
+                           (!mEof && mQueue.size() < kMaxQueued);
                 });
                 if (mStop) {
                     break;
+                }
+                if (mRestart) {
+                    mRestart = false;
+                    lock.unlock();
+                    if (av_seek_frame(mFormat, mStream, 0,
+                                      AVSEEK_FLAG_BACKWARD) < 0) {
+                        finish(true);
+                        break;
+                    }
+                    avcodec_flush_buffers(mCodec);
+                    // Timestamps restart from zero, and so does the
+                    // playback clock upstream (§9.2 restart).
+                    mLoopOffset = 0.0;
+                    mMaxPts = 0.0;
+                    continue;
                 }
             }
 
@@ -308,7 +350,7 @@ private:
                     continue;
                 }
                 finish(false);
-                break;
+                continue; // idle awaiting restart (§17.4 rearm) or stop
             }
             if (ret < 0) {
                 finish(true);
@@ -510,7 +552,7 @@ private:
     std::mutex mMutex;
     std::condition_variable mProduced, mConsumed;
     std::deque<Item> mQueue;
-    bool mEof = false, mError = false, mStop = false;
+    bool mEof = false, mError = false, mStop = false, mRestart = false;
 
     Item mCurrent; // render thread only (released under the lock)
     bool mHaveCurrent = false;

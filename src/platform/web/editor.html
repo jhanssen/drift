@@ -388,18 +388,25 @@ async function pushDocument() {
     if (!node) {
       continue;
     }
-    node.tracks = seq.tracks.map((track) => ({
-      ...node.tracks?.find((t) => t.name === track.name),
-      name: track.name,
-      kind: 'value',
-      type: track.type,
-      interpolate: track.interpolate,
-      keys: track.keys.map((k) => ({
-        t: +k.t.toFixed(3),
-        value: Array.isArray(k.value)
-            ? k.value.map((v) => +v.toFixed(4)) : +k.value.toFixed(4),
-      })),
-    }));
+    node.tracks = seq.tracks.map((track) => track.kind === 'event'
+      ? {
+          ...node.tracks?.find((t) => t.name === track.name),
+          name: track.name,
+          kind: 'event',
+          fires: track.fires.map((t) => +t.toFixed(3)),
+        }
+      : {
+          ...node.tracks?.find((t) => t.name === track.name),
+          name: track.name,
+          kind: 'value',
+          type: track.type,
+          interpolate: track.interpolate,
+          keys: track.keys.map((k) => ({
+            t: +k.t.toFixed(3),
+            value: Array.isArray(k.value)
+                ? k.value.map((v) => +v.toFixed(4)) : +k.value.toFixed(4),
+          })),
+        });
   }
   const json = JSON.stringify(sceneSource, null, 2);
   if (wasm && wasm.load(json)) {
@@ -714,7 +721,7 @@ window.addEventListener('mousemove', (e) => {
   }
   const { tl, lane, keyIdx, comp } = dragState;
   const seq = tl.seq;
-  const keys = seq.tracks[lane].keys;
+  const track = seq.tracks[lane];
   const geom = tl.laneRanges[lane];
   const fine = e.shiftKey ? 0.1 : 1;
   const dx = e.clientX - dragState.lastX;
@@ -723,7 +730,22 @@ window.addEventListener('mousemove', (e) => {
   dragState.lastY = e.clientY;
 
   const plotW = tl.canvas.clientWidth - GUTTER_W;
-  const t = keys[keyIdx].t + (dx / plotW) * seq.duration * fine;
+  const dt = (dx / plotW) * seq.duration * fine;
+
+  if (comp < 0) {
+    // Event cue: time only, ascending, within [0, duration).
+    const fires = track.fires;
+    const lo = keyIdx > 0 ? fires[keyIdx - 1] + 0.01 : 0;
+    const hi = keyIdx < fires.length - 1 ? fires[keyIdx + 1] - 0.01
+                                         : seq.duration - 0.01;
+    fires[keyIdx] = Math.min(Math.max(fires[keyIdx] + dt, lo),
+                             Math.max(lo, hi));
+    dragState.moved = true;
+    return;
+  }
+
+  const keys = track.keys;
+  const t = keys[keyIdx].t + dt;
   const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
   const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
                                       : seq.duration;
@@ -758,38 +780,56 @@ const keyEdit = document.getElementById('keyEdit');
 let keyEditState = null;
 
 function openKeyEditor(tl, lane, keyIdx, comp, screenX, screenY) {
-  const key = tl.seq.tracks[lane].keys[keyIdx];
+  const track = tl.seq.tracks[lane];
+  const isCue = comp < 0;
   keyEditState = { tl, lane, keyIdx, comp };
-  document.getElementById('keyEditT').value = +key.t.toFixed(3);
-  document.getElementById('keyEditV').value =
-      +[].concat(key.value)[comp].toFixed(4);
+  document.getElementById('keyEditT').value = isCue
+      ? +track.fires[keyIdx].toFixed(3)
+      : +track.keys[keyIdx].t.toFixed(3);
+  const valueInput = document.getElementById('keyEditV');
+  valueInput.parentElement.hidden = isCue; // cues have no value
+  if (!isCue) {
+    valueInput.value =
+        +[].concat(track.keys[keyIdx].value)[comp].toFixed(4);
+  }
   keyEdit.hidden = false;
   keyEdit.style.left =
       Math.min(screenX + 10, innerWidth - 200) + 'px';
   keyEdit.style.top = Math.max(screenY - 44, 4) + 'px';
-  const valueInput = document.getElementById('keyEditV');
-  valueInput.focus();
-  valueInput.select();
+  const focusInput = isCue ? document.getElementById('keyEditT') : valueInput;
+  focusInput.focus();
+  focusInput.select();
 }
 
 function closeKeyEditor(apply) {
   if (keyEditState && apply) {
     const { tl, lane, keyIdx, comp } = keyEditState;
-    const keys = tl.seq.tracks[lane].keys;
-    const key = keys[keyIdx];
+    const track = tl.seq.tracks[lane];
     const t = parseFloat(document.getElementById('keyEditT').value);
-    const v = parseFloat(document.getElementById('keyEditV').value);
-    if (!Number.isNaN(t)) {
-      const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
-      const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
-                                          : tl.seq.duration;
-      key.t = Math.min(Math.max(t, lo), Math.max(lo, hi));
-    }
-    if (!Number.isNaN(v)) {
-      if (Array.isArray(key.value)) {
-        key.value[comp] = v;
-      } else {
-        key.value = v;
+    if (comp < 0) {
+      if (!Number.isNaN(t)) {
+        const fires = track.fires;
+        const lo = keyIdx > 0 ? fires[keyIdx - 1] + 0.01 : 0;
+        const hi = keyIdx < fires.length - 1 ? fires[keyIdx + 1] - 0.01
+                                             : tl.seq.duration - 0.01;
+        fires[keyIdx] = Math.min(Math.max(t, lo), Math.max(lo, hi));
+      }
+    } else {
+      const keys = track.keys;
+      const key = keys[keyIdx];
+      const v = parseFloat(document.getElementById('keyEditV').value);
+      if (!Number.isNaN(t)) {
+        const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
+        const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
+                                            : tl.seq.duration;
+        key.t = Math.min(Math.max(t, lo), Math.max(lo, hi));
+      }
+      if (!Number.isNaN(v)) {
+        if (Array.isArray(key.value)) {
+          key.value[comp] = v;
+        } else {
+          key.value = v;
+        }
       }
     }
     pushDocument();
@@ -869,7 +909,38 @@ function drawTimeline(tl, playTime) {
     ctx.fillText(track.name, 8, top + 14);
     ctx.fillStyle = '#8a8f98';
     ctx.font = '9px system-ui';
-    ctx.fillText(track.interpolate, 8, top + 26);
+    ctx.fillText(track.kind === 'event' ? 'event' : track.interpolate,
+                 8, top + 26);
+
+    if (track.kind === 'event') {
+      // Cue markers on a center line; drag moves them in time only.
+      const y = (top + 8 + bottom) / 2;
+      tl.laneRanges[lane] = { vmin: 0, vmax: 1, top: top + 8, bottom };
+      ctx.strokeStyle = '#2c3038';
+      ctx.beginPath();
+      ctx.moveTo(GUTTER_W, y);
+      ctx.lineTo(cssW, y);
+      ctx.stroke();
+      ctx.fillStyle = '#e3c56d';
+      track.fires.forEach((cue, keyIdx) => {
+        const x = xOf(cue);
+        ctx.beginPath();
+        ctx.moveTo(x, y - 5);
+        ctx.lineTo(x + 5, y);
+        ctx.lineTo(x, y + 5);
+        ctx.lineTo(x - 5, y);
+        ctx.fill();
+        tl.hits.push({ x, y, lane, keyIdx, comp: -1 });
+        if (dragState && dragState.tl === tl && dragState.lane === lane &&
+            dragState.keyIdx === keyIdx) {
+          ctx.fillStyle = '#d6d9de';
+          ctx.font = '10px system-ui';
+          ctx.fillText(`${cue.toFixed(2)}s`, x + 8, y - 7);
+          ctx.fillStyle = '#e3c56d';
+        }
+      });
+      return;
+    }
 
     // Stable lane scale: first fit wins (see laneRangeMemory above).
     const memoryKey = `${activeManifest()?.scene}/${seq.id}/${track.name}`;

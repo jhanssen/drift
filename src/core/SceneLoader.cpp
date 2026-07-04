@@ -264,6 +264,7 @@ const PortDef kSequenceInputs[] = {
 };
 const PortDef kVideoInputs[] = {
     { "playing", ValueType::Scalar, false, { 1, 0, 0, 0 } },
+    { "restart", ValueType::Event, false },
 };
 
 struct OutputPortDef {
@@ -277,6 +278,7 @@ std::vector<OutputPortDef> outputPortsFor(const std::string& type)
     if (type == "time") return { { "seconds", 0 }, { "delta", 1 } };
     if (type == "mouse") return { { "position", 0 }, { "active", 1 } };
     if (type == "split") return { { "x", 0 }, { "y", 1 }, { "z", 2 }, { "w", 3 } };
+    if (type == "video") return { { "result", 0 }, { "finished", 1 } };
     if (type == "output") return {};
     return { { "result", 0 } };
 }
@@ -808,13 +810,49 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             }
             if (const std::string& kind = kindIt->second.get_string();
                 kind == "event") {
-                fail("node '" + raw.id + "' track '" + track.name +
-                     "': event tracks are reserved for a future version");
-                return nullptr;
+                track.event = true;
             } else if (kind != "value") {
                 fail("node '" + raw.id + "' track '" + track.name +
                      "': unknown kind '" + kind + "'");
                 return nullptr;
+            }
+
+            if (track.event) {
+                // §9.9 event tracks: 'fires' cues, ascending, [0, duration).
+                for (const auto& [key, value] : tobj) {
+                    if (key != "name" && key != "kind" && key != "fires") {
+                        warn("node '" + raw.id + "' track '" + track.name +
+                             "': unknown field '" + key + "' ignored");
+                    }
+                }
+                auto firesIt = tobj.find("fires");
+                if (firesIt == tobj.end() || !firesIt->second.is_array() ||
+                    firesIt->second.get_array().empty()) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': needs a non-empty 'fires' array");
+                    return nullptr;
+                }
+                for (const auto& cue : firesIt->second.get_array()) {
+                    if (!cue.is_number()) {
+                        fail("node '" + raw.id + "' track '" + track.name +
+                             "': 'fires' entries must be numbers");
+                        return nullptr;
+                    }
+                    const double t = cue.get_number();
+                    if (t < 0.0 || t >= duration) {
+                        fail("node '" + raw.id + "' track '" + track.name +
+                             "': fire time outside [0, duration)");
+                        return nullptr;
+                    }
+                    if (!track.fires.empty() && t <= track.fires.back()) {
+                        fail("node '" + raw.id + "' track '" + track.name +
+                             "': fire times must be ascending");
+                        return nullptr;
+                    }
+                    track.fires.push_back(t);
+                }
+                tracks.push_back(std::move(track));
+                continue;
             }
 
             auto typeIt = tobj.find("type");
@@ -892,6 +930,19 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
                 track.keys.push_back(std::move(key));
             }
             tracks.push_back(std::move(track));
+        }
+
+        // Cue-crossing semantics assume a monotonic time input (§9.9);
+        // value tracks are pure and tolerate any signal.
+        if (std::any_of(tracks.begin(), tracks.end(),
+                        [](const SequenceNode::Track& t) { return t.event; })) {
+            auto timeIt = raw.inputs.find("time");
+            if (timeIt == raw.inputs.end() ||
+                timeIt->second.kind != RawInput::Kind::Conn ||
+                timeIt->second.conn.node != "time") {
+                warn("node '" + raw.id + "': event tracks assume a "
+                     "monotonic 'time' input; wire it from @time");
+            }
         }
 
         portsOut.assign(std::begin(kSequenceInputs), std::end(kSequenceInputs));
@@ -1126,7 +1177,9 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
             return false;
         }
         if (srcType != portType) {
-            if (srcType == ValueType::Scalar && portType != ValueType::Texture) {
+            if (srcType == ValueType::Scalar &&
+                portType != ValueType::Texture &&
+                portType != ValueType::Event) {
                 in.splat = true; // §4: scalar splats to vecN
             } else {
                 fail("node '" + raw.id + "' input '" + portName + "': type mismatch (" +
@@ -1208,7 +1261,9 @@ bool Loader::bindDeferred()
         const ValueType srcType = src->outputs[idx].value.type;
         Node::Input& in = d.node->inputs[d.inputIdx];
         if (srcType != d.portType) {
-            if (srcType == ValueType::Scalar && d.portType != ValueType::Texture) {
+            if (srcType == ValueType::Scalar &&
+                d.portType != ValueType::Texture &&
+                d.portType != ValueType::Event) {
                 in.splat = true;
             } else {
                 fail("node '" + d.consumerId + "' input '" + d.portName +

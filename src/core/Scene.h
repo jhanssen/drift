@@ -72,6 +72,9 @@ public:
 
     Value inputValue(size_t index) const;
     bool inputsDirty() const;
+    // Event inputs (§16.2): fired this frame (or last frame for a
+    // `previous` edge). Always false for unconnected ports.
+    bool inputFired(size_t index) const;
 
     std::string id;
     std::vector<Input> inputs;

@@ -62,21 +62,30 @@ Edge/value types in v1:
 | `vec3`   | `[x, y, z]`                  |                                    |
 | `vec4`   | `[x, y, z, w]`               | also used for colors (RGBA)        |
 | `texture`| — (connections only)         | 2D texture, premultiplied alpha    |
+| `event`  | — (connections only)         | fires or not, per frame (see below)|
 | `bool`   | `true` / `false`             | properties only, not wireable      |
 | `string` | `"..."`                      | properties only, not wireable      |
 
-Reserved for future versions: `event`, `buffer`.
+Reserved for future versions: `buffer`.
 
 Rules:
 
 - Typing is static; all connections are checked at load time.
 - Exactly one implicit conversion exists: a `scalar` may connect to (or be the
   literal for) any `vecN` input — it splats to all components. No other
-  implicit conversions.
+  implicit conversions; `event` takes part in none.
 - Some value-node ports are **polymorphic** (written `T`): the port's type is
   resolved at load from whatever connects to it, and all `T` ports on that node
   instance must resolve to the same type. `T` ranges over `scalar`/`vec2`/
   `vec3`/`vec4` only.
+
+Event edges: an event edge carries no value — on any given frame it either
+**fires** or does not (payloads are reserved). Connections only; parameters
+cannot be of type `event`. Dirty semantics (§11): an event output is dirty
+exactly on frames it fires; a fire is a one-frame phenomenon with no
+"current value" to retain, so change detection does not apply. A connection
+with `previous: true` (§7) reads "fired on frame N−1"; the §10 acyclicity
+rule applies unchanged.
 
 ## 5. Ports vs. Properties
 
@@ -192,12 +201,14 @@ Static image source.
 
 Video source. Plays muted; decoding is suspended while no output is presenting.
 
-| Kind     | Name      | Type      | Default | Notes                          |
-|----------|-----------|-----------|---------|--------------------------------|
-| property | `src`     | `string`  | —       | path                           |
-| property | `loop`    | `bool`    | `true`  |                                |
-| input    | `playing` | `scalar`  | `1`     | > 0.5 plays; otherwise pauses  |
-| output   | `result`† | `texture` |         | dirty on each new decoded frame|
+| Kind     | Name       | Type      | Default | Notes                          |
+|----------|------------|-----------|---------|--------------------------------|
+| property | `src`      | `string`  | —       | path                           |
+| property | `loop`     | `bool`    | `true`  |                                |
+| input    | `playing`  | `scalar`  | `1`     | > 0.5 plays; otherwise pauses  |
+| input    | `restart`  | `event`   | —       | on fire: seek to 0, decode first frame |
+| output   | `result`†  | `texture` |         | dirty on each new decoded frame|
+| output   | `finished` | `event`   |         | fires when the final frame of a `loop: false` stream is produced |
 
 - **Pause, not stop**: while `playing` ≤ 0.5, decoding is suspended (the same
   machinery as presentation-suspend), the playback position freezes, and
@@ -206,7 +217,14 @@ Video source. Plays muted; decoding is suspended while no output is presenting.
 - Change detection (§11) means a `playing` signal wired from a step-like
   source (e.g. a `sequence` `hold` track) is dirty only on the frames it
   actually flips — the node sees clean start/stop transitions for free.
-- A `restart: event` port is reserved (§16).
+- `restart` fires while paused: the first frame is decoded and `result` goes
+  dirty once (a poster frame); playback then waits on `playing`.
+- **End of stream** (`loop: false`): after the final frame is produced the
+  node holds that frame (`result` non-dirty) and enters the finished state;
+  `playing` has no further effect until `restart` fires, which rearms
+  playback from the start. `finished` never fires while `loop: true`.
+  Chaining is the point: `finished` wired into another video's `restart`
+  enables playlist- and intro/loop-style scenes.
 
 ### 9.3 `shader`
 
@@ -280,8 +298,8 @@ same pattern.
 therefore resume where they left off rather than jumping.
 
 Scene time is **non-decreasing**: it advances or holds, never moves backward.
-Nodes may rely on this (e.g. `sequence` cue-crossing, §16, is defined only for
-forward motion). Editors that scrub backward do so by re-evaluating the scene
+Nodes may rely on this (e.g. `sequence` cue-crossing, §9.9, is defined only
+for forward motion). Editors that scrub backward do so by re-evaluating the scene
 from an earlier point with a fresh instance — time within any one scene
 instance still only moves forward.
 
@@ -348,9 +366,8 @@ beyond the input's arity (e.g. `.z` of a `vec2`) is a load error:
 | output | `w`     | `scalar`             |          |
 
 `sequence` — a timeline: maps one scalar input (typically `@time.seconds`)
-through named keyframe **tracks**, each of which becomes an output port.
-(Event tracks — cues that fire at instants — are the reserved half of this
-node; see §16.)
+through named **tracks**, each of which becomes an output port. Value
+tracks emit interpolated levels; event tracks fire at cue times.
 
 | Kind     | Name       | Type      | Default | Notes                              |
 |----------|------------|-----------|---------|------------------------------------|
@@ -368,7 +385,10 @@ editor's lane order):
 
 - `name` (required): identifier (§3), unique within the node; becomes the
   output port name.
-- `kind` (required): `"value"`. (`"event"` is reserved; §16.)
+- `kind` (required): `"value"` or `"event"`.
+
+Value tracks:
+
 - `type` (required): `scalar`, `vec2`, `vec3`, or `vec4`.
 - `interpolate` (optional, default `"linear"`): `"hold"` (step), `"linear"`,
   or `"smooth"` (smoothstep between keys). Per-key easing is reserved.
@@ -378,6 +398,19 @@ editor's lane order):
   the last key's value. There is no wrap-around interpolation: when looping,
   the value holds until local time wraps back past the first key — for a
   seamless loop, end with a key at `duration` matching the first key.
+
+Event tracks (output type `event`, §4):
+
+- `fires` (required, non-empty): ascending array of times in `[0, duration)`.
+- Crossing semantics: with previous local time `t0` and current `t1`, cues in
+  `(t0, t1]` fire; if the loop wrapped, cues in `(t0, duration)` and `[0, t1]`
+  fire. On the node's first evaluation, cues in `[0, t1]` fire. A cue
+  therefore fires exactly once per pass of the playhead, including once per
+  loop iteration.
+- Crossing assumes a monotonic `time` input. Value tracks are pure functions
+  of `time` and tolerate any signal (the curve-lookup use below), but an
+  event track on a `sequence` whose `time` input is not wired from `@time`
+  is a load warning.
 
 ```json
 {
@@ -489,14 +522,17 @@ type; unknown port name; type mismatch on a connection or literal; missing
 required input; unknown `$parameter`; reference to unknown node; cycle without
 a `previous` edge; zero or multiple `output` nodes; missing asset or shader
 file; path escaping the project root; WGSL that fails to compile or reflect;
-unbound shader port. For `sequence`: `duration` missing or ≤ 0; missing or
-empty `tracks`; duplicate or invalid track `name`; unknown or reserved track
-`kind`; value track with empty `keys`, non-ascending `t`, `t` outside
-`[0, duration]`, or `value` not matching `type`.
+unbound shader port; `event` connection to a non-`event` port or vice versa
+(§4: events take part in no conversions). For `sequence`: `duration` missing
+or ≤ 0; missing or empty `tracks`; duplicate or invalid track `name`;
+unknown track `kind`; value track with empty `keys`, non-ascending `t`, `t`
+outside `[0, duration]`, or `value` not matching `type`; event track with
+empty or non-ascending `fires` or a time outside `[0, duration)`.
 
 Load warnings: unknown top-level field; unknown node property; node
 unreachable from `output`; unknown parameter `hint`; a `sequence` output port
-that nothing references.
+that nothing references; an event track on a `sequence` whose `time` input
+is not wired from `@time` (§9.9).
 
 ## 14. Example Scenes
 
@@ -577,9 +613,9 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 Collected from the sections above — features the format's structure already
 accounts for but v1 does not implement:
 
-- `event` and `buffer` edge types (§4)
-- `sequence` event tracks, per-key easing, and wake-until-next-key scheduling
-  hints (§9.9, §16)
+- `buffer` edge type (§4)
+- Event payloads, and event→level `latch`/`toggle` value nodes (§4, §9.9)
+- Per-key easing and wake-until-next-key scheduling hints (§9.9)
 - Inline references inside vector literals, as sugar desugaring to `combine` (§7, §9.9)
 - Per-layer blend modes on `compositor` (§9.5)
 - Pixel-exact `fit` mode on `transform` (§9.4)
@@ -589,82 +625,17 @@ accounts for but v1 does not implement:
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
 - `modules/` (WASM logic) and `graphs/` project directories (§1)
 
-## 16. Proposed Extension: Events & Sequencing (draft, partially adopted)
+## 16. Events & Sequencing (adopted)
 
-Status: the **level-triggered half was adopted 2026-07-04** — `video.playing`
-(§9.2) and `sequence` value tracks (§9.9) are part of the main format. This
-section retains the **edge-triggered half**: the `event` edge type reserved in
-§4 and its consumers (video `restart`, `sequence` event tracks), which stay a
-draft until a one-shot consumer ships (video restart alone is thin; particles
-are the canonical customer).
+Status: **fully adopted 2026-07-04** — first the level-triggered half
+(`video.playing`, `sequence` value tracks), then the edge-triggered half
+(the `event` edge type, `sequence` event tracks, `video.restart` and
+`finished`). Normative text lives in §4 (the `event` type), §9.2 (video
+playback control and end of stream), and §9.9 (`sequence`). Reserved
+growth moved to §15: event payloads, `latch`/`toggle` nodes, per-key
+easing, wake-until-next-cue scheduling hints.
 
-### 16.1 Motivation
-
-The format currently expresses only *continuous* animation (values as functions
-of time). Two further kinds of control are needed:
-
-- **Level-triggered** — a condition that holds over a span ("video plays from
-  10s to 25s"). Representable as an ordinary `scalar` that steps between 0 and
-  1; needs no new edge type, only a source for such signals and ports that
-  consume them.
-- **Edge-triggered** — an impulse at an instant ("restart the video", "burst
-  100 particles at t=12"). Not representable as a level; this is what `event`
-  edges are for.
-
-A future particle node is the canonical consumer of both: a continuous
-`rate: scalar` input (particles/sec) and a discrete `burst: event` input.
-The level-triggered half needed no new edge type and is now adopted; what
-follows is the event half.
-
-### 16.2 The `event` Edge Type
-
-Amends §4. `event` becomes a wireable edge type:
-
-- An event edge carries no value; on any given frame it either **fires** or
-  does not. (Payloads are reserved for a future version.)
-- Connections only — there is no literal form, and parameters cannot be of
-  type `event` (unchanged: parameters are `scalar`/`vecN`).
-- No implicit conversions to or from `event`. (An event→level `latch`/`toggle`
-  value node is future §9.9 growth.)
-- Dirty semantics (§11): an event output is dirty exactly on frames it fires.
-  A fire is a one-frame phenomenon; there is no "current value" to retain.
-- `previous: true` (§7) is valid on an event edge and reads "fired on frame
-  N−1". The §10 acyclicity rule applies unchanged.
-
-### 16.3 `video` Playback Control
-
-`playing` is adopted (§9.2). Remaining: one event-consuming input port
-(optional; a bare `video` node behaves exactly as today):
-
-| Kind  | Name      | Type     | Default | Notes                                    |
-|-------|-----------|----------|---------|------------------------------------------|
-| input | `restart` | `event`  | —       | on fire: seek to 0, decode first frame   |
-
-- `restart` fires while paused: the first frame is decoded and `result` goes
-  dirty once (a poster frame); playback then waits on `playing`.
-
-### 16.4 `sequence` Event Tracks
-
-The `sequence` node and its value tracks are adopted (§9.9). Remaining: the
-`"event"` track `kind`. An event track becomes an `event`-typed output port
-and fires at cue times:
-
-```json
-{ "name": "burst", "kind": "event", "fires": [ 12.0, 30.0 ] }
-```
-
-- `fires` (required, non-empty): ascending array of times in `[0, duration)`.
-- Crossing semantics: with previous local time `t0` and current `t1`, cues in
-  `(t0, t1]` fire; if the loop wrapped, cues in `(t0, duration)` and `[0, t1]`
-  fire. On the node's first evaluation, cues in `[0, t1]` fire. A cue therefore
-  fires exactly once per pass of the playhead, including once per loop
-  iteration.
-- Crossing semantics assume a monotonic `time` input. Value tracks are pure
-  functions of `time` and tolerate any signal (the curve-lookup use, §9.9),
-  but an event track on a `sequence` whose `time` input is not derived from
-  `@time` should be a load warning.
-
-### 16.5 Editor Mapping
+### 16.1 Editor Mapping (non-normative)
 
 The node is deliberately shaped so a conventional timeline panel edits it
 directly — the JSON *is* the UI model:
@@ -694,26 +665,10 @@ directly — the JSON *is* the UI model:
   creates a matching value track and wires it; dragging a lane's header onto a
   port wires that track.
 
-### 16.6 Validation Additions
-
-(Value-track validation is adopted; see §13.) Load errors: event track with
-empty or non-ascending `fires` or a time outside `[0, duration)`; `event`
-connection to a non-`event` port or vice versa.
-
-Load warnings: an event track on a `sequence` whose `time` input is not
-derived from `@time` (§16.4).
-
-### 16.7 Effect on §15
-
-If adopted: `event` moves from "reserved" to specified (§16.2); event
-payloads, per-cue payload/latch nodes, and wake-until-next-cue scheduling
-hints join the reserved list. (Per-key easing is already listed there via the
-adopted value tracks.)
-
 ## 17. Proposed Amendments: Spec Gaps (draft, not yet adopted)
 
 Status: proposals. Each subsection is independently adoptable and states which
-existing section it amends. §17.4 additionally depends on §16 (`event`).
+existing section it amends.
 Where noted, a proposal *codifies* what the runtime already does (verified
 against `src/core` as of 2026-07-04) rather than prescribing new behavior.
 
@@ -803,20 +758,10 @@ Amendment to §2 — optional top-level field:
 
 ### 17.4 `video` End of Stream
 
-Depends on §16. Gap: behavior at end of a `loop: false` video is unspecified,
-and nothing can react to playback finishing.
-
-Amendment to §9.2 (with `playing` from §9.2 and `restart` from §16.3):
-
-- With `loop: false`, after the final frame is produced the node holds that
-  frame (`result` non-dirty) and enters the finished state; `playing` has no
-  further effect until `restart` fires, which rearms playback from the start.
-  (Hold-last-frame is already the decoder's behavior — `VideoDecoder::frameAt`
-  returns the final frame forever after end of stream; this codifies it.)
-- New output port `finished: event` — fires on the frame the final decoded
-  frame is produced. Never fires while `loop: true`.
-- Chaining is the point: `finished` wired into a `sequence`-adjacent graph (or
-  another video's `restart`) enables playlist- and intro/loop-style scenes.
+**Adopted 2026-07-04** into §9.2 alongside the event half of §16: the
+finished state, the `finished: event` output, and `restart` rearming are
+specified there and implemented (the decoder marks the final frame of a
+non-looping stream; a restart seeks to the start and re-decodes).
 
 ### 17.5 Shader `size: "auto"` Resolution Rules
 
