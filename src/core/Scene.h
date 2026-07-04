@@ -76,13 +76,16 @@ public:
 };
 
 // A user-tweakable scene parameter (§6): declaration metadata plus the
-// current value.
+// current value. Doubles as the settings-UI manifest.
 struct SceneParam {
     std::string name;
     ValueType type = ValueType::Scalar;
     Value value; // current (starts at the declared default)
     Value min, max;
     bool hasMin = false, hasMax = false;
+    float step = 0.0f;   // 0 = unspecified
+    std::string label;   // empty = use the name
+    std::string hint;    // e.g. "color"; empty = none
 };
 
 // Reads a project-relative file (text or binary) into out. The platform
@@ -92,13 +95,15 @@ using AssetReader = std::function<bool(const std::string& path, std::string& out
 class Scene {
 public:
     // Parses and validates scene.json. Returns nullptr on failure with
-    // human-readable messages appended to errors. videoFactory may be null:
-    // scenes with video nodes then fail to load.
+    // human-readable messages appended to errors; non-fatal findings (§13:
+    // unknown fields/properties/hints, unreachable nodes) go to warnings.
+    // videoFactory may be null: scenes with video nodes then fail to load.
     static std::unique_ptr<Scene> load(const std::string& sceneJson,
                                        const AssetReader& readAsset,
                                        const VideoDecoderFactory& videoFactory,
                                        const wgpu::Device& device,
-                                       std::vector<std::string>& errors);
+                                       std::vector<std::string>& errors,
+                                       std::vector<std::string>& warnings);
 
     // Evaluates the graph for one frame. Returns ctx.presented.
     bool render(FrameContext& ctx);

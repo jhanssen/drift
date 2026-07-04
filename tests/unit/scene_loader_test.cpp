@@ -153,11 +153,21 @@ std::string makeBasisKtx2(bool withAlpha)
 struct LoadResult {
     std::unique_ptr<Scene> scene;
     std::vector<std::string> errors;
+    std::vector<std::string> warnings;
 
     bool hasError(const std::string& needle) const
     {
         for (const auto& e : errors) {
             if (e.find(needle) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool hasWarning(const std::string& needle) const
+    {
+        for (const auto& w : warnings) {
+            if (w.find(needle) != std::string::npos) {
                 return true;
             }
         }
@@ -201,7 +211,7 @@ LoadResult load(const std::string& json,
             out = it->second;
             return true;
         },
-        videoFactory, wgpu::Device(), r.errors);
+        videoFactory, wgpu::Device(), r.errors, r.warnings);
     return r;
 }
 
@@ -731,6 +741,59 @@ TEST_CASE("transform requires source and rejects unknown ports")
     })");
     CHECK(badPort.scene == nullptr);
     CHECK(badPort.hasError("unknown input port 'skew'"));
+}
+
+TEST_CASE("load warnings: unknown properties, fields, hints, unreachable nodes")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x", "flavor": "salty",
+        "parameters": {
+            "tint": { "type": "vec4", "default": [1,1,1,1], "hint": "color" },
+            "amount": { "type": "scalar", "default": 1, "hint": "slider" }
+        },
+        "nodes": [
+            { "id": "w", "type": "wave", "shpae": "saw",
+              "inputs": { "input": "@time.seconds" } },
+            { "id": "orphan", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": "@w" } },
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("unknown property 'shpae'"));
+    CHECK(r.hasWarning("unknown top-level field 'flavor'"));
+    CHECK(r.hasWarning("unknown hint 'slider'"));
+    CHECK_FALSE(r.hasWarning("hint 'color'")); // valid hint: no warning
+    CHECK(r.hasWarning("'orphan' is not reachable"));
+    CHECK(r.hasWarning("'w' is not reachable"));
+    // Pruned orphans must not force animation: only the reachable graph
+    // counts, and nothing reachable here uses time.
+    CHECK_FALSE(r.scene->animated());
+}
+
+TEST_CASE("parameter step, label, and hint are parsed")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "parameters": {
+            "glow": { "type": "vec3", "default": [1,1,1], "hint": "color",
+                      "step": 0.05, "label": "Glow color" }
+        },
+        "nodes": [
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty());
+    const auto& p = r.scene->parameters()[0];
+    CHECK(p.step == 0.05f);
+    CHECK(p.label == "Glow color");
+    CHECK(p.hint == "color");
 }
 
 TEST_CASE("setParameter validates, clamps, and splats")

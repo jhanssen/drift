@@ -143,9 +143,12 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
         return nullptr;
     }
 
-    std::vector<std::string> errors;
+    std::vector<std::string> errors, warnings;
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
-                                          device, errors);
+                                          device, errors, warnings);
+    for (const auto& w : warnings) {
+        fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
+    }
     for (const auto& e : errors) {
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
     }

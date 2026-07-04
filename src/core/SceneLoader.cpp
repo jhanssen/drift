@@ -62,6 +62,9 @@ struct Param {
     Value def;
     Value min, max;
     bool hasMin = false, hasMax = false;
+    float step = 0.0f;
+    std::string label;
+    std::string hint;
 };
 
 bool validId(const std::string& s)
@@ -278,9 +281,10 @@ bool isImplicitNode(const std::string& id)
 class Loader {
 public:
     Loader(const AssetReader& readAsset, const VideoDecoderFactory& videoFactory,
-           const wgpu::Device& device, std::vector<std::string>& errors)
+           const wgpu::Device& device, std::vector<std::string>& errors,
+           std::vector<std::string>& warnings)
         : mReadAsset(readAsset), mVideoFactory(videoFactory), mDevice(device),
-          mErrors(errors)
+          mErrors(errors), mWarnings(warnings)
     {
     }
 
@@ -288,6 +292,7 @@ public:
 
 private:
     void fail(const std::string& msg) { mErrors.push_back(msg); }
+    void warn(const std::string& msg) { mWarnings.push_back(msg); }
 
     bool parseParameters(const glz::generic& json);
     bool parseNodes(const glz::generic& json);
@@ -314,6 +319,7 @@ private:
     const VideoDecoderFactory& mVideoFactory;
     const wgpu::Device& mDevice;
     std::vector<std::string>& mErrors;
+    std::vector<std::string>& mWarnings;
 
     std::vector<Param> mParams;
     std::map<std::string, int> mParamIndex;
@@ -395,6 +401,23 @@ bool Loader::parseParameters(const glz::generic& json)
             !bound("max", param.max, param.hasMax)) {
             return false;
         }
+        if (auto it = obj.find("step"); it != obj.end() && it->second.is_number()) {
+            param.step = (float)it->second.get_number();
+        }
+        if (auto it = obj.find("label"); it != obj.end() && it->second.is_string()) {
+            param.label = it->second.get_string();
+        }
+        if (auto it = obj.find("hint"); it != obj.end() && it->second.is_string()) {
+            param.hint = it->second.get_string();
+            const bool color = param.hint == "color" &&
+                               (param.type == ValueType::Vec3 ||
+                                param.type == ValueType::Vec4);
+            if (!color) {
+                warn("parameter '" + name + "': unknown hint '" + param.hint +
+                     "' ignored");
+                param.hint.clear();
+            }
+        }
         mParamIndex[name] = (int)mParams.size();
         mParams.push_back(std::move(param));
     }
@@ -436,6 +459,34 @@ bool Loader::parseNodes(const glz::generic& json)
         if (mRawIndex.count(raw.id)) {
             fail("duplicate node id '" + raw.id + "'");
             return false;
+        }
+
+        // Unknown properties are a warning, not an error (§13) — but a
+        // typo'd property silently changing behavior is the worst authoring
+        // footgun, so say something.
+        static const std::map<std::string, std::vector<std::string>> kProps = {
+            { "wave", { "shape" } },
+            { "remap", { "clamp" } },
+            { "combine", {} },
+            { "split", {} },
+            { "shader", { "shader", "size" } },
+            { "image", { "src" } },
+            { "video", { "src", "loop" } },
+            { "transform", {} },
+            { "compositor", {} },
+            { "output", {} },
+        };
+        if (auto propsIt = kProps.find(raw.type); propsIt != kProps.end()) {
+            for (const auto& [key, value] : obj) {
+                if (key == "id" || key == "type" || key == "inputs") {
+                    continue;
+                }
+                const auto& known = propsIt->second;
+                if (std::find(known.begin(), known.end(), key) == known.end()) {
+                    warn("node '" + raw.id + "': unknown property '" + key +
+                         "' ignored");
+                }
+            }
         }
 
         if (auto inputsIt = obj.find("inputs"); inputsIt != obj.end()) {
@@ -1045,6 +1096,13 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         return nullptr;
     }
 
+    for (const auto& [key, value] : top) {
+        if (key != "version" && key != "name" && key != "author" &&
+            key != "description" && key != "parameters" && key != "nodes") {
+            warn("unknown top-level field '" + key + "' ignored");
+        }
+    }
+
     if (auto paramsIt = top.find("parameters"); paramsIt != top.end()) {
         if (!parseParameters(paramsIt->second)) {
             return nullptr;
@@ -1086,6 +1144,34 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         return nullptr;
     }
 
+    // Nodes unreachable from the output (via any edge, feedback included)
+    // are a warning and are never executed (§8).
+    std::map<const Node*, bool> reachable;
+    std::vector<Node*> stack = { mOutput };
+    while (!stack.empty()) {
+        Node* node = stack.back();
+        stack.pop_back();
+        if (reachable[node]) {
+            continue;
+        }
+        reachable[node] = true;
+        for (const auto& in : node->inputs) {
+            if (in.srcNode && !reachable[in.srcNode]) {
+                stack.push_back(in.srcNode);
+            }
+        }
+    }
+    std::vector<std::unique_ptr<Node>> kept;
+    for (auto& node : mNodes) {
+        if (reachable[node.get()]) {
+            kept.push_back(std::move(node));
+        } else if (!isImplicitNode(node->id)) {
+            warn("node '" + node->id + "' is not reachable from the output "
+                 "node and will never run");
+        }
+    }
+    mNodes = std::move(kept);
+
     std::vector<SceneParam> params;
     for (const auto& p : mParams) {
         SceneParam sp;
@@ -1096,6 +1182,9 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         sp.max = p.max;
         sp.hasMin = p.hasMin;
         sp.hasMax = p.hasMax;
+        sp.step = p.step;
+        sp.label = p.label;
+        sp.hint = p.hint;
         params.push_back(std::move(sp));
     }
     return SceneBuilder::make(nameIt->second.get_string(), std::move(mNodes),
@@ -1108,9 +1197,10 @@ std::unique_ptr<Scene> Scene::load(const std::string& sceneJson,
                                    const AssetReader& readAsset,
                                    const VideoDecoderFactory& videoFactory,
                                    const wgpu::Device& device,
-                                   std::vector<std::string>& errors)
+                                   std::vector<std::string>& errors,
+                                   std::vector<std::string>& warnings)
 {
-    Loader loader(readAsset, videoFactory, device, errors);
+    Loader loader(readAsset, videoFactory, device, errors, warnings);
     auto scene = loader.load(sceneJson);
     if (!scene && errors.empty()) {
         errors.push_back("scene load failed");
