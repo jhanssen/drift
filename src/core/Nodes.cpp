@@ -584,6 +584,63 @@ void ImageNode::evaluate(FrameContext& ctx)
 
 // ---- VideoNode ----
 
+namespace {
+
+// NV12 -> linear RGB: y from the R8 plane, cb/cr from the RG88 plane
+// (bilinear chroma upsampling via the sampler), matrix + range offsets in
+// the uniforms, then sRGB decode to land in the linear texture contract.
+const char* kYuvShader = R"(
+struct YuvParams {
+    rowR: vec4f,
+    rowG: vec4f,
+    rowB: vec4f,
+}
+@group(0) @binding(0) var<uniform> params: YuvParams;
+@group(0) @binding(1) var planeY: texture_2d<f32>;
+@group(0) @binding(2) var planeUV: texture_2d<f32>;
+@group(0) @binding(3) var planeSampler: sampler;
+
+fn srgbToLinear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn yuv_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let y = textureSample(planeY, planeSampler, uv).r;
+    let c = textureSample(planeUV, planeSampler, uv).rg;
+    let yuv1 = vec4f(y, c.r, c.g, 1.0);
+    let rgb = clamp(vec3f(dot(params.rowR, yuv1), dot(params.rowG, yuv1),
+                          dot(params.rowB, yuv1)),
+                    vec3f(0.0), vec3f(1.0));
+    return vec4f(srgbToLinear(rgb.r), srgbToLinear(rgb.g),
+                 srgbToLinear(rgb.b), 1.0);
+}
+)";
+
+// rgb = M * (y, cb, cr, 1): rows with range scaling and offsets baked in.
+void yuvMatrix(bool bt709, bool fullRange, float rows[12])
+{
+    const float ys = fullRange ? 1.0f : 255.0f / 219.0f;
+    const float y0 = fullRange ? 0.0f : 16.0f / 255.0f;
+    const float cs = fullRange ? 1.0f : 255.0f / 224.0f;
+    const float a = bt709 ? 1.5748f : 1.402f;     // Cr -> R
+    const float b = bt709 ? -0.1873f : -0.344136f; // Cb -> G
+    const float c = bt709 ? -0.4681f : -0.714136f; // Cr -> G
+    const float d = bt709 ? 1.8556f : 1.772f;      // Cb -> B
+    const float base = -ys * y0;
+    const float r0[4] = { ys, 0.0f, a * cs, base - a * cs * 0.5f };
+    const float r1[4] = { ys, b * cs, c * cs, base - (b + c) * cs * 0.5f };
+    const float r2[4] = { ys, d * cs, 0.0f, base - d * cs * 0.5f };
+    std::memcpy(rows + 0, r0, sizeof(r0));
+    std::memcpy(rows + 4, r1, sizeof(r1));
+    std::memcpy(rows + 8, r2, sizeof(r2));
+}
+
+} // namespace
+
 VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
     : mDecoder(std::move(decoder))
 {
@@ -591,11 +648,189 @@ VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
     outputs[0].value.type = ValueType::Texture;
 }
 
+bool VideoNode::ensureConvertPipeline(FrameContext& ctx)
+{
+    if (mConvertPipeline) {
+        return true;
+    }
+    const std::string source = std::string(kVertexPrelude) + kYuvShader;
+    wgpu::ShaderModule module = makeModule(ctx.device, source);
+    if (!module) {
+        return false;
+    }
+    mConvertPipeline = makeFullscreenPipeline(ctx.device, module, "yuv_fs",
+                                              wgpu::TextureFormat::RGBA16Float);
+    if (!mConvertPipeline) {
+        return false;
+    }
+    wgpu::BufferDescriptor bd{};
+    bd.size = 48; // three vec4 rows
+    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mConvertUniforms = ctx.device.CreateBuffer(&bd);
+    mConvertSampler = makeLinearClampSampler(ctx.device);
+    return true;
+}
+
+bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
+{
+    if (!ctx.device.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf)) {
+        return false; // this device can't import; fall back quietly
+    }
+    auto it = mSurfaces.find(frame.surfaceId);
+    if (it == mSurfaces.end()) {
+        // Capture import rejections (e.g. an unimportable modifier) in an
+        // error scope: a failed probe means "fall back", not a GPU error.
+        ctx.device.PushErrorScope(wgpu::ErrorFilter::Validation);
+        ImportedSurface imported;
+        bool ok = true;
+        for (int i = 0; ok && i < 2; ++i) {
+            const VideoPlane& plane = frame.planes[i];
+            wgpu::SharedTextureMemoryDmaBufPlane dmaPlane{};
+            dmaPlane.fd = plane.fd;
+            dmaPlane.offset = plane.offset;
+            dmaPlane.stride = plane.stride;
+            wgpu::SharedTextureMemoryDmaBufDescriptor dma{};
+            dma.size = { plane.width, plane.height, 1 };
+            dma.drmFormat = plane.drmFormat;
+            dma.drmModifier = plane.modifier;
+            dma.planeCount = 1;
+            dma.planes = &dmaPlane;
+            wgpu::SharedTextureMemoryDescriptor desc{};
+            desc.nextInChain = &dma;
+            imported.memory[i] = ctx.device.ImportSharedTextureMemory(&desc);
+            wgpu::SharedTextureMemoryProperties props{};
+            imported.memory[i].GetProperties(&props);
+            if (props.size.width == 0) {
+                ok = false;
+                break;
+            }
+            imported.texture[i] = imported.memory[i].CreateTexture();
+        }
+        // Validation is synchronous in Dawn native; a spontaneous callback
+        // resolves during the Pop call. If it somehow doesn't, treat the
+        // probe as failed rather than blocking the render thread.
+        bool scopeDone = false;
+        ctx.device.PopErrorScope(
+            wgpu::CallbackMode::AllowSpontaneous,
+            [&](wgpu::PopErrorScopeStatus, wgpu::ErrorType type,
+                wgpu::StringView) {
+                ok = ok && type == wgpu::ErrorType::NoError;
+                scopeDone = true;
+            });
+        if (!scopeDone || !ok) {
+            return false; // caller falls back to CPU frames
+        }
+        it = mSurfaces.emplace(frame.surfaceId, std::move(imported)).first;
+    }
+    ImportedSurface& surface = it->second;
+
+    if (!ensureConvertPipeline(ctx)) {
+        return false;
+    }
+    if (!mConverted || mConvertedWidth != frame.width ||
+        mConvertedHeight != frame.height) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { frame.width, frame.height, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
+        mConverted = ctx.device.CreateTexture(&desc);
+        mConvertedWidth = frame.width;
+        mConvertedHeight = frame.height;
+    }
+
+    float rows[12];
+    yuvMatrix(frame.bt709, frame.fullRange, rows);
+    ctx.device.GetQueue().WriteBuffer(mConvertUniforms, 0, rows, sizeof(rows));
+
+    // Access-scope the external planes around the conversion pass. The
+    // decoder synced the surface before export, so contents are ready.
+    for (int i = 0; i < 2; ++i) {
+        wgpu::SharedTextureMemoryVkImageLayoutBeginState vkBegin{};
+        vkBegin.oldLayout = 1; // VK_IMAGE_LAYOUT_GENERAL
+        vkBegin.newLayout = 1;
+        wgpu::SharedTextureMemoryBeginAccessDescriptor ba{};
+        ba.nextInChain = &vkBegin;
+        ba.initialized = true;
+        ba.concurrentRead = false;
+        if (surface.memory[i].BeginAccess(surface.texture[i], &ba) !=
+            wgpu::Status::Success) {
+            return false;
+        }
+    }
+
+    wgpu::BindGroupEntry entries[4] = {};
+    entries[0].binding = 0;
+    entries[0].buffer = mConvertUniforms;
+    entries[0].size = 48;
+    entries[1].binding = 1;
+    entries[1].textureView = surface.texture[0].CreateView();
+    entries[2].binding = 2;
+    entries[2].textureView = surface.texture[1].CreateView();
+    entries[3].binding = 3;
+    entries[3].sampler = mConvertSampler;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = mConvertPipeline.GetBindGroupLayout(0);
+    bgDesc.entryCount = 4;
+    bgDesc.entries = entries;
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgDesc);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mConverted.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 1.0 };
+    wgpu::RenderPassDescriptor desc{};
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
+    pass.SetPipeline(mConvertPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(3);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    for (int i = 0; i < 2; ++i) {
+        wgpu::SharedTextureMemoryVkImageLayoutEndState vkEnd{};
+        wgpu::SharedTextureMemoryEndAccessState end{};
+        end.nextInChain = &vkEnd;
+        surface.memory[i].EndAccess(surface.texture[i], &end);
+    }
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mConverted;
+    out.texWidth = mConvertedWidth;
+    out.texHeight = mConvertedHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+    return true;
+}
+
 void VideoNode::evaluate(FrameContext& ctx)
 {
     const VideoFrame* frame = mDecoder->frameAt(ctx.seconds);
     if (!frame) {
         return; // decode error; hold the previous frame
+    }
+
+    if (frame->planes.size() == 2) {
+        if (frame->index == mLastIndex) {
+            return;
+        }
+        if (evaluateZeroCopy(ctx, *frame)) {
+            mLastIndex = frame->index;
+        } else {
+            // Import failed (or a stale zero-copy frame after fallback):
+            // switch the decoder to CPU frames and drop this one.
+            mSurfaces.clear();
+            mDecoder->disableZeroCopy();
+        }
+        return;
     }
 
     if (!mTexture || frame->width != mWidth || frame->height != mHeight) {
@@ -983,6 +1218,14 @@ void ShaderNode::evaluate(FrameContext& ctx)
 {
     if (!ensurePipeline(ctx)) {
         return;
+    }
+
+    // A texture input may not have produced yet (e.g. a video source whose
+    // first frame fell back); run once it exists.
+    for (size_t i = textureInputStart(); i < inputs.size(); ++i) {
+        if (!inputValue(i).texture) {
+            return;
+        }
     }
 
     // Size: explicit, else first texture input, else the output target

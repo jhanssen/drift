@@ -8,22 +8,24 @@ Status: v1 feature-complete. Full node set — image (PNG/JPEG/WebP/KTX2;
 Basis-supercompressed KTX2 transcodes to BC7 and stays compressed in
 VRAM, with stored mip chains — author UASTC or ETC1S, premultiplied or
 opaque), video
-(ffmpeg software decode; AV1/H.264/anything your ffmpeg has), shader,
+(AV1/H.264/anything your ffmpeg has), shader,
 transform, compositor, wave, remap, combine, split, the implicit
 time/mouse inputs, and previous-frame feedback edges (`"previous": true`)
 for trails and iterative effects. Wallpaper mode covers every output with
 runtime hotplug; the dirty-driven graph skips GPU work and commits when
 nothing changed (a static scene idles at zero GPU cost, and scene time
 freezes while occluded); presentation uses sync-fd fences, not CPU waits.
-Wayland (wlr-layer-shell compositors) only. Next: hardware video decode
-(VAAPI/NVDEC zero-copy).
+Video decodes in hardware where available (`DRIFT_HWDEC=auto|vaapi|cuda|off`),
+with zero-copy dmabuf import of VAAPI surfaces (per-plane, falling back to a
+single frame transfer, then to software decode). Wayland (wlr-layer-shell
+compositors) only.
 
 ## Build
 
 Requires: CMake ≥ 3.24, a C++23 compiler, and dev packages for
-`wayland-client`, `gbm`, `libdrm`, and ffmpeg (`libavformat`, `libavcodec`,
-`libavutil`, `libswscale`). Dawn is downloaded as a prebuilt tarball on
-first configure.
+`wayland-client`, `gbm`, `libdrm`, `libva`, and ffmpeg (`libavformat`,
+`libavcodec`, `libavutil`, `libswscale`). Dawn is downloaded as a prebuilt
+tarball on first configure.
 
 ```
 cmake -B build -G Ninja

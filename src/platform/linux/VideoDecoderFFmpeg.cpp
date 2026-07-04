@@ -9,12 +9,19 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
+#include <va/va.h>
+#include <va/va_drmcommon.h>
+
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+
+#include <unistd.h>
 
 namespace drift::platform {
 
@@ -45,6 +52,10 @@ public:
         if (mThread.joinable()) {
             mThread.join();
         }
+        for (auto& item : mQueue) {
+            releaseItem(item);
+        }
+        releaseItem(mCurrent);
         if (mSws) {
             sws_freeContext(mSws);
         }
@@ -200,8 +211,13 @@ public:
             }
             mHwDevice = device;
             mHwFormat = hwFormat;
-            printf("drift: video decode: %s (%s)\n", backend.name,
-                   found->name);
+            // Zero-copy is a VAAPI concept (dmabuf surface export); CUDA
+            // frames have no dmabuf route and always transfer.
+            const char* zc = getenv("DRIFT_ZEROCOPY");
+            mZeroCopy = backend.type == AV_HWDEVICE_TYPE_VAAPI &&
+                        !(zc && !strcmp(zc, "off"));
+            printf("drift: video decode: %s (%s)%s\n", backend.name,
+                   found->name, mZeroCopy ? " zero-copy" : "");
             return found;
         }
         printf("drift: video decode: software\n");
@@ -213,18 +229,27 @@ public:
         std::unique_lock lock(mMutex);
         for (;;) {
             while (!mQueue.empty() && mQueue.front().pts <= seconds) {
-                mCurrent = std::move(mQueue.front().frame);
+                releaseItem(mCurrent);
+                mCurrent = std::move(mQueue.front());
                 mHaveCurrent = true;
                 mQueue.pop_front();
                 mConsumed.notify_all();
             }
             if (mHaveCurrent && !mQueue.empty()) {
-                return &mCurrent; // next queued frame is in the future
+                return &mCurrent.frame; // next queued frame is in the future
             }
             if (mEof || mError) {
-                return mHaveCurrent ? &mCurrent : nullptr;
+                return mHaveCurrent ? &mCurrent.frame : nullptr;
             }
             mProduced.wait(lock); // decoder is behind; wait for it
+        }
+    }
+
+    void disableZeroCopy() override
+    {
+        if (mZeroCopy.exchange(false)) {
+            printf("drift: video decode: zero-copy import failed; "
+                   "transferring frames instead\n");
         }
     }
 
@@ -234,7 +259,21 @@ private:
     struct Item {
         VideoFrame frame;
         double pts = 0.0;
+        AVFrame* hwFrame = nullptr; // keeps the decode surface alive
     };
+
+    static void releaseItem(Item& item)
+    {
+        for (auto& plane : item.frame.planes) {
+            if (plane.fd >= 0) {
+                close(plane.fd);
+            }
+        }
+        item.frame.planes.clear();
+        if (item.hwFrame) {
+            av_frame_free(&item.hwFrame);
+        }
+    }
 
     void decodeLoop()
     {
@@ -296,6 +335,82 @@ private:
         av_packet_free(&packet);
     }
 
+    // Exports a decoded VAAPI frame as dmabuf planes and queues it. The
+    // AVFrame is cloned so the surface isn't recycled while the consumer may
+    // still sample it.
+    bool exportFrame(AVFrame* frame)
+    {
+        auto* deviceCtx = (AVHWDeviceContext*)mHwDevice->data;
+        auto* vaCtx = (AVVAAPIDeviceContext*)deviceCtx->hwctx;
+        const VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
+
+        if (vaSyncSurface(vaCtx->display, surface) != VA_STATUS_SUCCESS) {
+            return false;
+        }
+        VADRMPRIMESurfaceDescriptor desc{};
+        if (vaExportSurfaceHandle(vaCtx->display, surface,
+                                  VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                                  VA_EXPORT_SURFACE_READ_ONLY |
+                                      VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                                  &desc) != VA_STATUS_SUCCESS) {
+            return false;
+        }
+        if (desc.fourcc != VA_FOURCC_NV12 || desc.num_layers != 2) {
+            for (unsigned i = 0; i < desc.num_objects; ++i) {
+                close(desc.objects[i].fd);
+            }
+            return false;
+        }
+
+        // Every exported object fd is ours to close. A layer's plane takes
+        // ownership of its object's fd the first time; further layers on the
+        // same object get a dup, and unreferenced objects close immediately,
+        // so releaseItem can close every plane fd unconditionally.
+        Item item;
+        int claims[4] = {};
+        for (unsigned i = 0; i < 2; ++i) {
+            const auto& layer = desc.layers[i];
+            const uint32_t objIdx = layer.object_index[0];
+            const auto& object = desc.objects[objIdx];
+            drift::core::VideoPlane plane;
+            plane.fd = claims[objIdx]++ ? dup(object.fd) : object.fd;
+            plane.offset = layer.offset[0];
+            plane.stride = layer.pitch[0];
+            plane.drmFormat = layer.drm_format;
+            plane.modifier = object.drm_format_modifier;
+            plane.width = (uint32_t)frame->width >> (i ? 1 : 0);
+            plane.height = (uint32_t)frame->height >> (i ? 1 : 0);
+            item.frame.planes.push_back(plane);
+        }
+        for (unsigned o = 0; o < desc.num_objects && o < 4; ++o) {
+            if (!claims[o]) {
+                close(desc.objects[o].fd);
+            }
+        }
+
+        item.frame.surfaceId = surface;
+        item.frame.width = (uint32_t)frame->width;
+        item.frame.height = (uint32_t)frame->height;
+        item.frame.index = mNextIndex++;
+        item.frame.bt709 = frame->colorspace == AVCOL_SPC_BT709 ||
+                           (frame->colorspace == AVCOL_SPC_UNSPECIFIED &&
+                            frame->height >= 720);
+        item.frame.fullRange = frame->color_range == AVCOL_RANGE_JPEG;
+        item.hwFrame = av_frame_clone(frame);
+
+        const int64_t ts = frame->best_effort_timestamp;
+        const double pts = ts != AV_NOPTS_VALUE ? ts * mTimeBase + mLoopOffset
+                                                : mMaxPts + mFrameSeconds;
+        item.pts = pts;
+        mMaxPts = std::max(mMaxPts, pts);
+        av_frame_unref(frame);
+
+        std::unique_lock lock(mMutex);
+        mQueue.push_back(std::move(item));
+        mProduced.notify_all();
+        return true;
+    }
+
     bool receiveFrames(AVFrame* frame)
     {
         for (;;) {
@@ -305,6 +420,18 @@ private:
             }
             if (ret < 0) {
                 return false;
+            }
+
+            // Zero-copy: export the VAAPI surface as per-plane dmabufs (the
+            // portable route: single-plane R8+RG88 imports work even where
+            // tiled multiplanar NV12 does not, e.g. NVIDIA). The consumer
+            // imports them; a failed import flips mZeroCopy off and we fall
+            // back to transferring.
+            if (mZeroCopy && frame->format == AV_PIX_FMT_VAAPI) {
+                if (exportFrame(frame)) {
+                    continue;
+                }
+                disableZeroCopy();
             }
 
             // Hardware frames come back to system memory once (usually as
@@ -385,8 +512,9 @@ private:
     std::deque<Item> mQueue;
     bool mEof = false, mError = false, mStop = false;
 
-    VideoFrame mCurrent; // render thread only
+    Item mCurrent; // render thread only (released under the lock)
     bool mHaveCurrent = false;
+    std::atomic<bool> mZeroCopy{ false };
 };
 
 } // namespace

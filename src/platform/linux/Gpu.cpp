@@ -134,13 +134,23 @@ bool Gpu::init(bool needPresent)
     std::vector<wgpu::FeatureName> features = {
         wgpu::FeatureName::TextureCompressionBC,
     };
-    if (needPresent) {
-        features.push_back(wgpu::FeatureName::SharedTextureMemoryDmaBuf);
-        features.push_back(wgpu::FeatureName::SharedFenceSyncFD);
-        features.push_back(wgpu::FeatureName::DawnDrmFormatCapabilities);
-    }
     for (auto f : features) {
         if (!mAdapter.HasFeature(f)) {
+            fprintf(stderr, "drift: adapter missing required feature %d\n", (int)f);
+            return false;
+        }
+    }
+    // dmabuf interop: required for presentation, opportunistic otherwise
+    // (zero-copy video import also uses it in headless runs).
+    const wgpu::FeatureName dmabufFeatures[] = {
+        wgpu::FeatureName::SharedTextureMemoryDmaBuf,
+        wgpu::FeatureName::SharedFenceSyncFD,
+        wgpu::FeatureName::DawnDrmFormatCapabilities,
+    };
+    for (auto f : dmabufFeatures) {
+        if (mAdapter.HasFeature(f)) {
+            features.push_back(f);
+        } else if (needPresent) {
             fprintf(stderr, "drift: adapter missing required feature %d\n", (int)f);
             return false;
         }

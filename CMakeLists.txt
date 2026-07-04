@@ -26,6 +26,7 @@ pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
+pkg_check_modules(LIBVA REQUIRED libva libva-drm)
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
@@ -65,6 +66,7 @@ target_include_directories(drift PRIVATE
     ${GBM_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS}
     ${FFMPEG_INCLUDE_DIRS}
+    ${LIBVA_INCLUDE_DIRS}
     3rdparty/stb
 )
 target_link_libraries(drift PRIVATE
@@ -73,6 +75,7 @@ target_link_libraries(drift PRIVATE
     ${GBM_LIBRARIES}
     ${LIBDRM_LIBRARIES}
     ${FFMPEG_LIBRARIES}
+    ${LIBVA_LIBRARIES}
     Threads::Threads
     dl
 )

@@ -12,8 +12,28 @@
 
 namespace drift::core {
 
+// One dmabuf plane of a zero-copy frame (Y or UV for NV12), described with
+// plain handles so core stays free of platform video headers.
+struct VideoPlane {
+    int fd = -1;         // owned by the decoder; import must duplicate
+    uint32_t offset = 0;
+    uint32_t stride = 0;
+    uint32_t drmFormat = 0; // fourcc
+    uint64_t modifier = 0;
+    uint32_t width = 0, height = 0;
+};
+
 struct VideoFrame {
-    std::vector<uint8_t> rgba; // tightly packed, width*4 stride, sRGB, opaque
+    // CPU path: tightly packed RGBA, width*4 stride, sRGB, opaque.
+    std::vector<uint8_t> rgba;
+    // Zero-copy path (rgba empty): dmabuf planes (Y then UV) of a decoder
+    // surface. surfaceId is stable across the decoder's surface pool, so
+    // consumers can cache their imports; the fds stay valid until the next
+    // frameAt call.
+    std::vector<VideoPlane> planes;
+    uint64_t surfaceId = 0;
+    bool bt709 = false;     // YUV matrix (else BT.601)
+    bool fullRange = false; // YUV range (else limited/video)
     uint32_t width = 0, height = 0;
     int64_t index = -1; // increases with every newly decoded frame, loop-aware
 };
@@ -29,6 +49,10 @@ public:
     // returned forever. Returns nullptr on decode error. The pointer stays
     // valid until the next frameAt call.
     virtual const VideoFrame* frameAt(double seconds) = 0;
+
+    // The consumer failed to import this decoder's zero-copy planes (e.g.
+    // the GPU can't take the dmabuf): produce CPU frames from now on.
+    virtual void disableZeroCopy() {}
 };
 
 // Opens path (project-relative; the platform resolves and confines it).

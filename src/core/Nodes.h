@@ -2,6 +2,7 @@
 
 // Built-in node types (SCENE_FORMAT.md §9). Instantiated by the loader.
 
+#include <map>
 #include <string>
 
 #include "Scene.h"
@@ -97,7 +98,10 @@ private:
 
 // §9.2 video: streaming texture source, dirty on each new decoded frame.
 // Decoding runs on the platform-provided decoder's thread; evaluate pulls
-// the frame due at scene time and uploads it only when it changed.
+// the frame due at scene time. CPU frames upload once per new frame;
+// zero-copy frames import the decoder surface's dmabuf planes (cached per
+// surface — decoders recycle a small pool) and convert YUV to linear RGB in
+// a render pass. A failed import tells the decoder to fall back.
 class VideoNode : public Node {
 public:
     explicit VideoNode(std::unique_ptr<VideoDecoder> decoder);
@@ -107,10 +111,24 @@ public:
     bool drivesFrames() const override { return true; }
 
 private:
+    bool evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame);
+    bool ensureConvertPipeline(FrameContext& ctx);
+
     std::unique_ptr<VideoDecoder> mDecoder;
-    wgpu::Texture mTexture;
+    wgpu::Texture mTexture; // CPU path upload target
     uint32_t mWidth = 0, mHeight = 0;
     int64_t mLastIndex = -1;
+
+    struct ImportedSurface {
+        wgpu::SharedTextureMemory memory[2];
+        wgpu::Texture texture[2]; // Y, UV
+    };
+    std::map<uint64_t, ImportedSurface> mSurfaces;
+    wgpu::RenderPipeline mConvertPipeline;
+    wgpu::Buffer mConvertUniforms;
+    wgpu::Sampler mConvertSampler;
+    wgpu::Texture mConverted; // rgba16float conversion target
+    uint32_t mConvertedWidth = 0, mConvertedHeight = 0;
 };
 
 // §9.4 transform: renders source into a scene-output-sized transparent
