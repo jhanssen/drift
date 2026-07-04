@@ -63,6 +63,7 @@ target_link_libraries(drift PRIVATE
     drift_core
     ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES}
+    ${LIBDRM_LIBRARIES}
     ${FFMPEG_LIBRARIES}
     Threads::Threads
     dl

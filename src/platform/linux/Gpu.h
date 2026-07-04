@@ -57,10 +57,11 @@ public:
     void destroyTarget(DmabufTarget& target);
 
     void beginFrame(DmabufTarget& target);
-    // EndAccess + CPU-wait for queue completion before the buffer is handed
-    // to the compositor. TODO: replace the CPU wait with sync-fd export
-    // (implicit sync / linux-drm-syncobj).
-    void endFrame(DmabufTarget& target);
+    // EndAccess; when synchronize is set (the buffer will be committed),
+    // attaches the GPU-completion fences to the dmabuf as implicit-sync
+    // fences (sync-fd export + DMA_BUF_IOCTL_IMPORT_SYNC_FILE), falling
+    // back to a CPU wait if the kernel or driver can't.
+    void endFrame(DmabufTarget& target, bool synchronize);
 
     // Pump Dawn callbacks until the queue is idle.
     void waitForQueue();
@@ -73,6 +74,7 @@ private:
     int mDrmFd = -1;
     gbm_device* mGbm = nullptr;
     bool mHasError = false;
+    bool mSyncFdBroken = false; // sync-fd path failed once; stay on CPU sync
 };
 
 } // namespace drift::platform

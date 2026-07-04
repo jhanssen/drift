@@ -1,11 +1,14 @@
 #include "WaylandApp.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 
 #include <poll.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <wayland-client.h>
 #include <drm_fourcc.h>
@@ -41,6 +44,31 @@ void dmabufModifier(void* data, zwp_linux_dmabuf_v1*, uint32_t format,
         format, ((uint64_t)modifierHi << 32) | modifierLo);
 }
 const zwp_linux_dmabuf_v1_listener kDmabufListener = { dmabufFormat, dmabufModifier };
+
+void feedbackDone(void* data, zwp_linux_dmabuf_feedback_v1*)
+{
+    static_cast<WaylandApp*>(data)->onFeedbackDone();
+}
+void feedbackFormatTable(void* data, zwp_linux_dmabuf_feedback_v1*, int32_t fd,
+                         uint32_t size)
+{
+    static_cast<WaylandApp*>(data)->onFeedbackFormatTable(fd, size);
+}
+void feedbackMainDevice(void*, zwp_linux_dmabuf_feedback_v1*, wl_array*) {}
+void feedbackTrancheDone(void*, zwp_linux_dmabuf_feedback_v1*) {}
+void feedbackTrancheTargetDevice(void*, zwp_linux_dmabuf_feedback_v1*, wl_array*) {}
+void feedbackTrancheFormats(void* data, zwp_linux_dmabuf_feedback_v1*,
+                            wl_array* indices)
+{
+    static_cast<WaylandApp*>(data)->onFeedbackTrancheFormats(
+        (const uint16_t*)indices->data, indices->size / sizeof(uint16_t));
+}
+void feedbackTrancheFlags(void*, zwp_linux_dmabuf_feedback_v1*, uint32_t) {}
+const zwp_linux_dmabuf_feedback_v1_listener kFeedbackListener = {
+    feedbackDone,        feedbackFormatTable,          feedbackMainDevice,
+    feedbackTrancheDone, feedbackTrancheTargetDevice,  feedbackTrancheFormats,
+    feedbackTrancheFlags
+};
 
 void seatCapabilities(void* data, wl_seat*, uint32_t capabilities)
 {
@@ -152,6 +180,8 @@ WaylandApp::~WaylandApp()
     }
     if (mPointer) wl_pointer_destroy(mPointer);
     if (mSeat) wl_seat_destroy(mSeat);
+    if (mFeedback) zwp_linux_dmabuf_feedback_v1_destroy(mFeedback);
+    if (mFormatTable) munmap(const_cast<void*>(mFormatTable), mFormatTableSize);
     if (mDmabuf) zwp_linux_dmabuf_v1_destroy(mDmabuf);
     if (mLayerShell) zwlr_layer_shell_v1_destroy(mLayerShell);
     if (mWmBase) xdg_wm_base_destroy(mWmBase);
@@ -173,11 +203,20 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         mLayerShell = (zwlr_layer_shell_v1*)wl_registry_bind(
             mRegistry, name, &zwlr_layer_shell_v1_interface, 1);
     } else if (!strcmp(interface, zwp_linux_dmabuf_v1_interface.name)) {
-        // Bind v3 for the flat (format, modifier) event list. TODO: v4
-        // feedback for per-surface format preferences.
+        // v4: format+modifier table via the default feedback object. v3
+        // fallback: the flat modifier event list. (Per-surface feedback and
+        // scanout tranche preferences are a future optimization — the
+        // default tranches are what we can honor with one ring per output.)
+        const uint32_t bound = std::min(version, 4u);
         mDmabuf = (zwp_linux_dmabuf_v1*)wl_registry_bind(
-            mRegistry, name, &zwp_linux_dmabuf_v1_interface, std::min(version, 3u));
-        zwp_linux_dmabuf_v1_add_listener(mDmabuf, &kDmabufListener, this);
+            mRegistry, name, &zwp_linux_dmabuf_v1_interface, bound);
+        if (bound >= 4) {
+            mFeedback = zwp_linux_dmabuf_v1_get_default_feedback(mDmabuf);
+            zwp_linux_dmabuf_feedback_v1_add_listener(mFeedback,
+                                                      &kFeedbackListener, this);
+        } else {
+            zwp_linux_dmabuf_v1_add_listener(mDmabuf, &kDmabufListener, this);
+        }
     } else if (!strcmp(interface, wl_seat_interface.name)) {
         mSeat = (wl_seat*)wl_registry_bind(mRegistry, name, &wl_seat_interface,
                                            std::min(version, 2u));
@@ -212,6 +251,59 @@ void WaylandApp::onGlobalRemove(uint32_t name)
 void WaylandApp::onDmabufModifier(uint32_t fourcc, uint64_t modifier)
 {
     mCompositorModifiers[fourcc].push_back(modifier);
+}
+
+void WaylandApp::onFeedbackFormatTable(int32_t fd, uint32_t size)
+{
+    if (mFormatTable) {
+        munmap(const_cast<void*>(mFormatTable), mFormatTableSize);
+        mFormatTable = nullptr;
+        mFormatTableSize = 0;
+    }
+    void* table = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (table == MAP_FAILED) {
+        fprintf(stderr, "drift: cannot map dmabuf format table\n");
+        return;
+    }
+    mFormatTable = table;
+    mFormatTableSize = size;
+}
+
+void WaylandApp::onFeedbackTrancheFormats(const uint16_t* indices, size_t count)
+{
+    if (!mFormatTable) {
+        return;
+    }
+    // Feedback parameters arrive as a full set ending in done: the first
+    // tranche of a new set replaces the previous table-derived state.
+    if (!mFeedbackAccumulating) {
+        mCompositorModifiers.clear();
+        mFeedbackAccumulating = true;
+    }
+    struct Entry {
+        uint32_t format;
+        uint32_t pad;
+        uint64_t modifier;
+    };
+    static_assert(sizeof(Entry) == 16);
+    const auto* entries = (const Entry*)mFormatTable;
+    const size_t total = mFormatTableSize / sizeof(Entry);
+    for (size_t i = 0; i < count; ++i) {
+        if (indices[i] >= total) {
+            continue;
+        }
+        const Entry& e = entries[indices[i]];
+        auto& mods = mCompositorModifiers[e.format];
+        if (std::find(mods.begin(), mods.end(), e.modifier) == mods.end()) {
+            mods.push_back(e.modifier);
+        }
+    }
+}
+
+void WaylandApp::onFeedbackDone()
+{
+    mFeedbackAccumulating = false;
 }
 
 void WaylandApp::onSeatCapabilities(uint32_t capabilities)
@@ -636,7 +728,7 @@ void WaylandApp::drawFrame(OutputSurface& surf)
 
     mGpu->beginFrame(buf->target);
     const bool presented = mRenderFrame(request);
-    mGpu->endFrame(buf->target);
+    mGpu->endFrame(buf->target, presented);
 
     if (!presented) {
         // Nothing changed: no commit, the compositor keeps showing the

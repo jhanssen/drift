@@ -1,14 +1,18 @@
 #include "Gpu.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <gbm.h>
+#include <linux/dma-buf.h>
+#include <xf86drm.h>
 
 namespace drift::platform {
 
@@ -30,6 +34,39 @@ std::string adapterName(const wgpu::Adapter& adapter)
     return std::string(info.device.data, info.device.length);
 }
 
+// The DRM render node backing the chosen adapter (matched by PCI ids), so
+// GBM allocates on the GPU Dawn renders with. Falls back to the first
+// render node (e.g. software rasterizers have no PCI identity).
+std::string renderNodeForAdapter(const wgpu::Adapter& adapter)
+{
+    wgpu::AdapterInfo info{};
+    adapter.GetInfo(&info);
+
+    std::string fallback;
+    drmDevicePtr devices[16] = {};
+    const int count = drmGetDevices2(0, devices, 16);
+    for (int i = 0; i < count; ++i) {
+        const drmDevicePtr dev = devices[i];
+        if (!(dev->available_nodes & (1 << DRM_NODE_RENDER))) {
+            continue;
+        }
+        if (fallback.empty()) {
+            fallback = dev->nodes[DRM_NODE_RENDER];
+        }
+        if (dev->bustype == DRM_BUS_PCI &&
+            dev->deviceinfo.pci->vendor_id == info.vendorID &&
+            dev->deviceinfo.pci->device_id == info.deviceID) {
+            std::string node = dev->nodes[DRM_NODE_RENDER];
+            drmFreeDevices(devices, count);
+            return node;
+        }
+    }
+    if (count > 0) {
+        drmFreeDevices(devices, count);
+    }
+    return fallback.empty() ? "/dev/dri/renderD128" : fallback;
+}
+
 } // namespace
 
 Gpu::~Gpu()
@@ -46,21 +83,6 @@ Gpu::~Gpu()
 
 bool Gpu::init(bool needPresent)
 {
-    if (needPresent) {
-        // TODO: enumerate render nodes / pick the node matching the adapter.
-        const char* node = "/dev/dri/renderD128";
-        mDrmFd = open(node, O_RDWR | O_CLOEXEC);
-        if (mDrmFd < 0) {
-            fprintf(stderr, "drift: cannot open %s\n", node);
-            return false;
-        }
-        mGbm = gbm_create_device(mDrmFd);
-        if (!mGbm) {
-            fprintf(stderr, "drift: gbm_create_device failed\n");
-            return false;
-        }
-    }
-
     wgpu::RequestAdapterOptions opts{};
     opts.backendType = wgpu::BackendType::Vulkan;
     opts.featureLevel = wgpu::FeatureLevel::Core;
@@ -91,6 +113,21 @@ bool Gpu::init(bool needPresent)
         mAdapter = wgpu::Adapter(adapters[0].Get());
     }
     printf("drift: adapter: %s\n", adapterName(mAdapter).c_str());
+
+    if (needPresent) {
+        const std::string node = renderNodeForAdapter(mAdapter);
+        mDrmFd = open(node.c_str(), O_RDWR | O_CLOEXEC);
+        if (mDrmFd < 0) {
+            fprintf(stderr, "drift: cannot open %s\n", node.c_str());
+            return false;
+        }
+        mGbm = gbm_create_device(mDrmFd);
+        if (!mGbm) {
+            fprintf(stderr, "drift: gbm_create_device failed\n");
+            return false;
+        }
+        printf("drift: render node: %s\n", node.c_str());
+    }
 
     std::vector<wgpu::FeatureName> features;
     if (needPresent) {
@@ -254,7 +291,7 @@ void Gpu::beginFrame(DmabufTarget& target)
     target.memory.BeginAccess(target.texture, &ba);
 }
 
-void Gpu::endFrame(DmabufTarget& target)
+void Gpu::endFrame(DmabufTarget& target, bool synchronize)
 {
     wgpu::SharedTextureMemoryVkImageLayoutEndState vkEnd{};
     wgpu::SharedTextureMemoryEndAccessState end{};
@@ -262,9 +299,49 @@ void Gpu::endFrame(DmabufTarget& target)
     target.memory.EndAccess(target.texture, &end);
     target.everInitialized = true;
 
-    // Scaffold sync: block until the GPU is done before the compositor sees
-    // the buffer. TODO sync-fd export instead.
-    waitForQueue();
+    // The buffer is only handed to the compositor when something was
+    // rendered into it; otherwise no synchronization is needed at all
+    // (this is also why zero fences below isn't a capability failure).
+    if (!synchronize) {
+        return;
+    }
+
+    // Export EndAccess fences as sync files and attach them to the dmabuf's
+    // reservation, so the compositor's implicit sync waits on the GPU
+    // instead of us blocking the render thread.
+    bool synced = !mSyncFdBroken && end.fenceCount > 0;
+    const char* why = "";
+    for (size_t i = 0; synced && i < end.fenceCount; ++i) {
+        // The exported handle stays owned by the SharedFence (freed with the
+        // EndAccessState); the import ioctl only reads the fence from it.
+        wgpu::SharedFenceSyncFDExportInfo syncFd{};
+        wgpu::SharedFenceExportInfo info{};
+        info.nextInChain = &syncFd;
+        end.fences[i].ExportInfo(&info);
+        if (info.type != wgpu::SharedFenceType::SyncFD || syncFd.handle < 0) {
+            synced = false;
+            why = "fence is not a sync file";
+            break;
+        }
+        dma_buf_import_sync_file arg{};
+        arg.flags = DMA_BUF_SYNC_WRITE;
+        arg.fd = syncFd.handle;
+        if (ioctl(target.fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &arg) != 0) {
+            synced = false;
+            why = strerror(errno);
+        }
+    }
+    if (!synced) {
+        // Zero fences with work submitted shouldn't happen; wait but don't
+        // write the capability off. Export/import failures are permanent.
+        if (*why && !mSyncFdBroken) {
+            mSyncFdBroken = true;
+            fprintf(stderr,
+                    "drift: sync-fd export unavailable (%s); falling back to "
+                    "CPU sync\n", why);
+        }
+        waitForQueue();
+    }
 }
 
 void Gpu::waitForQueue()

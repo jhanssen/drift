@@ -31,6 +31,7 @@ struct xdg_toplevel;
 struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
 struct zwp_linux_dmabuf_v1;
+struct zwp_linux_dmabuf_feedback_v1;
 
 namespace drift::platform {
 
@@ -110,6 +111,9 @@ public:
     void onGlobal(uint32_t name, const char* interface, uint32_t version);
     void onGlobalRemove(uint32_t name);
     void onDmabufModifier(uint32_t fourcc, uint64_t modifier);
+    void onFeedbackFormatTable(int32_t fd, uint32_t size);
+    void onFeedbackTrancheFormats(const uint16_t* indices, size_t count);
+    void onFeedbackDone();
     void onSeatCapabilities(uint32_t capabilities);
     void onPointerEnter(wl_surface* surface, double x, double y);
     void onPointerLeave(wl_surface* surface);
@@ -143,6 +147,13 @@ private:
     xdg_wm_base* mWmBase = nullptr;
     zwlr_layer_shell_v1* mLayerShell = nullptr;
     zwp_linux_dmabuf_v1* mDmabuf = nullptr;
+
+    // dmabuf v4 default feedback: mmap'd format+modifier table. On v3 the
+    // flat modifier event list fills mCompositorModifiers directly.
+    zwp_linux_dmabuf_feedback_v1* mFeedback = nullptr;
+    const void* mFormatTable = nullptr;
+    uint32_t mFormatTableSize = 0;
+    bool mFeedbackAccumulating = false;
 
     wl_seat* mSeat = nullptr;
     wl_pointer* mPointer = nullptr;
