@@ -26,6 +26,14 @@
   #timeline { border-top: 1px solid var(--edge); background: var(--panel);
               max-height: 280px; overflow-y: auto; padding: 8px 12px; }
   #timeline canvas { cursor: crosshair; }
+  #keyEdit { position: fixed; z-index: 10; display: flex; gap: 6px;
+             background: var(--panel); border: 1px solid var(--accent);
+             border-radius: 5px; padding: 6px 8px; font-size: 12px;
+             box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #keyEdit[hidden] { display: none; }
+  #keyEdit label { display: flex; align-items: center; gap: 4px;
+                   color: var(--dim); }
+  #keyEdit input { width: 72px; }
   #timeline .dim { color: var(--dim); }
   #timeline h3 { font-size: 11px; margin: 6px 0 4px; color: var(--dim);
                  font-weight: normal; letter-spacing: .04em; }
@@ -63,10 +71,15 @@
   <div id="transport">
     <button id="playBtn" title="pause/resume both runtimes">⏸</button>
     <span id="timeText">—</span>
-    <span class="dim" style="color:var(--dim)">click to seek · drag keys
-      (shift = fine) · wheel zooms a lane's scale · double-click re-fits</span>
+    <span class="dim" style="color:var(--dim)">click to seek · keys: drag
+      (shift = fine) or click to type · wheel zooms a lane · double-click
+      re-fits</span>
   </div>
   <div id="timeline"><span class="dim">no scene yet</span></div>
+  <div id="keyEdit" hidden>
+    <label>t <input id="keyEditT" type="number" step="0.01"></label>
+    <label>v <input id="keyEditV" type="number" step="0.01"></label>
+  </div>
   <div id="statusbar">
     <span id="wasmStatus">preview: starting…</span>
     <span id="liveStatus">live: not connected</span>
@@ -555,12 +568,82 @@ window.addEventListener('mousemove', (e) => {
   dragState.moved = true;
 });
 
-window.addEventListener('mouseup', () => {
+window.addEventListener('mouseup', (e) => {
   if (dragState) {
     if (dragState.moved) {
       pushDocument();
+    } else {
+      // A click on a key (no movement): type the values instead.
+      const { tl, lane, keyIdx, comp } = dragState;
+      openKeyEditor(tl, lane, keyIdx, comp, e.clientX, e.clientY);
     }
     dragState = null;
+  }
+});
+
+// ---- numeric key editor (click a key) -------------------------------------
+
+const keyEdit = document.getElementById('keyEdit');
+let keyEditState = null;
+
+function openKeyEditor(tl, lane, keyIdx, comp, screenX, screenY) {
+  const key = tl.seq.tracks[lane].keys[keyIdx];
+  keyEditState = { tl, lane, keyIdx, comp };
+  document.getElementById('keyEditT').value = +key.t.toFixed(3);
+  document.getElementById('keyEditV').value =
+      +[].concat(key.value)[comp].toFixed(4);
+  keyEdit.hidden = false;
+  keyEdit.style.left =
+      Math.min(screenX + 10, innerWidth - 200) + 'px';
+  keyEdit.style.top = Math.max(screenY - 44, 4) + 'px';
+  const valueInput = document.getElementById('keyEditV');
+  valueInput.focus();
+  valueInput.select();
+}
+
+function closeKeyEditor(apply) {
+  if (keyEditState && apply) {
+    const { tl, lane, keyIdx, comp } = keyEditState;
+    const keys = tl.seq.tracks[lane].keys;
+    const key = keys[keyIdx];
+    const t = parseFloat(document.getElementById('keyEditT').value);
+    const v = parseFloat(document.getElementById('keyEditV').value);
+    if (!Number.isNaN(t)) {
+      const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
+      const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
+                                          : tl.seq.duration;
+      key.t = Math.min(Math.max(t, lo), Math.max(lo, hi));
+    }
+    if (!Number.isNaN(v)) {
+      if (Array.isArray(key.value)) {
+        key.value[comp] = v;
+      } else {
+        key.value = v;
+      }
+    }
+    pushDocument();
+  }
+  keyEditState = null;
+  keyEdit.hidden = true;
+}
+
+keyEdit.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    closeKeyEditor(true);
+  } else if (e.key === 'Escape') {
+    closeKeyEditor(false);
+  }
+});
+// Clicking anywhere else dismisses (capture: fires before canvas handlers,
+// so clicking another key closes this editor and opens that one).
+window.addEventListener('mousedown', (e) => {
+  if (keyEditState && !keyEdit.contains(e.target)) {
+    closeKeyEditor(false);
+  }
+}, true);
+document.getElementById('timeline').addEventListener('scroll', () => {
+  if (keyEditState) {
+    closeKeyEditor(false);
   }
 });
 
