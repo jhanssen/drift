@@ -19,3 +19,8 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(libwebp)
+
+# libwebp's targets don't export their public-header dir; without this,
+# #include <webp/decode.h> silently resolves to /usr/include where system
+# webp headers exist (and doesn't resolve at all under Emscripten).
+target_include_directories(webpdecoder INTERFACE $<BUILD_INTERFACE:${libwebp_SOURCE_DIR}/src>)

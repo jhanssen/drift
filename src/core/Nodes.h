@@ -111,13 +111,18 @@ public:
     bool drivesFrames() const override { return true; }
 
 private:
-    bool evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame);
-    bool ensureConvertPipeline(FrameContext& ctx);
-
     std::unique_ptr<VideoDecoder> mDecoder;
     wgpu::Texture mTexture; // CPU path upload target
     uint32_t mWidth = 0, mHeight = 0;
     int64_t mLastIndex = -1;
+
+#ifndef __EMSCRIPTEN__
+    // The zero-copy path is the one sanctioned exception to the portable-API
+    // rule: dmabuf import uses Dawn's SharedTextureMemory extension surface,
+    // which the browser's webgpu.h does not declare. Compiled out for the
+    // web, whose decoder (WebCodecs, §9.2) won't produce dmabuf planes.
+    bool evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame);
+    bool ensureConvertPipeline(FrameContext& ctx);
 
     struct ImportedSurface {
         wgpu::SharedTextureMemory memory[2];
@@ -129,6 +134,7 @@ private:
     wgpu::Sampler mConvertSampler;
     wgpu::Texture mConverted; // rgba16float conversion target
     uint32_t mConvertedWidth = 0, mConvertedHeight = 0;
+#endif
 };
 
 // §9.4 transform: renders source into a scene-output-sized transparent

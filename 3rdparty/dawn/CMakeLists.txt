@@ -1,7 +1,12 @@
-# Prebuilt Dawn bundle (jhanssen/dawn): Vulkan backend, DAWN_USE_WAYLAND=ON.
-# Ships libwebgpu_dawn.a (+ wire, unused here) and the Dawn CMake config.
-# Sets Dawn_DIR for find_package(Dawn); downloads/extracts on first configure.
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# Prebuilt Dawn (jhanssen/dawn), one pinned release for both targets:
+#  - native: Vulkan/Wayland bundle with libwebgpu_dawn.a and the Dawn CMake
+#    config; sets Dawn_DIR for find_package(Dawn).
+#  - Emscripten: the emdawnwebgpu port package (text-only) built from the
+#    same commit, so webgpu_cpp.h matches the native bundle exactly; sets
+#    DRIFT_EMDAWNWEBGPU_PORT for --use-port.
+# Downloads/extracts on first configure. Both assets are produced by
+# scripts/build-wire-release.sh in the Dawn fork.
+if(NOT EMSCRIPTEN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
 endif()
 
@@ -11,9 +16,15 @@ set(DAWN_REPO "jhanssen/dawn")
 set(DAWN_PLATFORM "linux-x86_64-wayland")
 set(DAWN_BUILD_TYPE "Release")
 
-set(DAWN_TARBALL_NAME "Dawn-${DAWN_COMMIT}-${DAWN_PLATFORM}-${DAWN_BUILD_TYPE}.tar.gz")
+if(EMSCRIPTEN)
+    set(DAWN_ARCHIVE_STEM "emdawnwebgpu_pkg-${DAWN_COMMIT}")
+else()
+    set(DAWN_ARCHIVE_STEM "Dawn-${DAWN_COMMIT}-${DAWN_PLATFORM}-${DAWN_BUILD_TYPE}")
+endif()
+
+set(DAWN_TARBALL_NAME "${DAWN_ARCHIVE_STEM}.tar.gz")
 set(DAWN_URL "https://github.com/${DAWN_REPO}/releases/download/${DAWN_VERSION}/${DAWN_TARBALL_NAME}")
-set(DAWN_EXTRACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/Dawn-${DAWN_COMMIT}-${DAWN_PLATFORM}-${DAWN_BUILD_TYPE}")
+set(DAWN_EXTRACT_DIR "${CMAKE_CURRENT_BINARY_DIR}/${DAWN_ARCHIVE_STEM}")
 
 if(NOT EXISTS "${DAWN_EXTRACT_DIR}")
     set(DAWN_TARBALL_PATH "${CMAKE_CURRENT_BINARY_DIR}/${DAWN_TARBALL_NAME}")
@@ -36,4 +47,12 @@ if(NOT EXISTS "${DAWN_EXTRACT_DIR}")
     file(ARCHIVE_EXTRACT INPUT "${DAWN_TARBALL_PATH}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
-set(Dawn_DIR "${DAWN_EXTRACT_DIR}/lib/cmake/Dawn" CACHE PATH "Dawn CMake config directory" FORCE)
+if(EMSCRIPTEN)
+    set(DRIFT_EMDAWNWEBGPU_PORT "${DAWN_EXTRACT_DIR}/emdawnwebgpu.port.py"
+        CACHE FILEPATH "emdawnwebgpu.port.py for --use-port")
+    if(NOT EXISTS "${DRIFT_EMDAWNWEBGPU_PORT}")
+        message(FATAL_ERROR "emdawnwebgpu port not found at ${DRIFT_EMDAWNWEBGPU_PORT}")
+    endif()
+else()
+    set(Dawn_DIR "${DAWN_EXTRACT_DIR}/lib/cmake/Dawn" CACHE PATH "Dawn CMake config directory" FORCE)
+endif()

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drift</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+  // ?scene=<name> picks a bundled scene (default: plasma).
+  var Module = {
+    canvas: document.getElementById('canvas'),
+    arguments: (function () {
+      var scene = new URLSearchParams(location.search).get('scene');
+      return scene ? [scene] : [];
+    })(),
+  };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

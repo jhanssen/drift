@@ -10,7 +10,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Sets Dawn_DIR (downloads/extracts the prebuilt bundle on first configure).
+# webgpu.h implementation, one pinned jhanssen/dawn release for both targets:
+# sets Dawn_DIR (native) or DRIFT_EMDAWNWEBGPU_PORT (Emscripten); downloads
+# and extracts the matching release asset on first configure.
 add_subdirectory(3rdparty/dawn)
 # glaze (FetchContent, header-only). Provides glaze::glaze target.
 add_subdirectory(3rdparty/glaze)
@@ -19,14 +21,16 @@ add_subdirectory(3rdparty/libwebp)
 # libktx (FetchContent). Provides ktx.
 add_subdirectory(3rdparty/libktx)
 
-find_package(Dawn REQUIRED)
-find_package(PkgConfig REQUIRED)
-find_package(Threads REQUIRED)
-pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-pkg_check_modules(GBM REQUIRED gbm)
-pkg_check_modules(LIBDRM REQUIRED libdrm)
-pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
-pkg_check_modules(LIBVA REQUIRED libva libva-drm)
+if(NOT EMSCRIPTEN)
+    find_package(Dawn REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    find_package(Threads REQUIRED)
+    pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+    pkg_check_modules(GBM REQUIRED gbm)
+    pkg_check_modules(LIBDRM REQUIRED libdrm)
+    pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
+    pkg_check_modules(LIBVA REQUIRED libva libva-drm)
+endif()
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
@@ -43,9 +47,41 @@ add_library(drift_core STATIC
     src/core/WgslInterface.cpp
 )
 target_include_directories(drift_core PUBLIC src PRIVATE 3rdparty/stb)
-target_link_libraries(drift_core
-    PUBLIC dawn::webgpu_dawn
-    PRIVATE glaze::glaze webpdecoder ktx)
+if(EMSCRIPTEN)
+    # The port supplies <webgpu/webgpu*.h> at compile time and the JS
+    # bindings at link time, so both stages need the flag.
+    target_compile_options(drift_core PUBLIC "--use-port=${DRIFT_EMDAWNWEBGPU_PORT}")
+    target_link_options(drift_core PUBLIC "--use-port=${DRIFT_EMDAWNWEBGPU_PORT}")
+else()
+    target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn)
+endif()
+target_link_libraries(drift_core PRIVATE glaze::glaze webpdecoder ktx)
+
+# ---- drift_web: browser runtime (Emscripten) ----
+# Ships the video-free example scenes in the bundle's MEMFS; there is no
+# WebCodecs decoder yet, so scenes with video nodes fail to load (§9.2).
+if(EMSCRIPTEN)
+    add_executable(drift_web src/platform/web/main.cpp)
+    target_link_libraries(drift_web PRIVATE drift_core)
+    set_target_properties(drift_web PROPERTIES
+        OUTPUT_NAME drift
+        SUFFIX ".html"
+        LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
+    set(DRIFT_WEB_SCENES plasma buoy follow trail)
+    set(DRIFT_WEB_PRELOADS)
+    foreach(scene IN LISTS DRIFT_WEB_SCENES)
+        list(APPEND DRIFT_WEB_PRELOADS
+            "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/examples/${scene}.sceneproject@/scenes/${scene}")
+    endforeach()
+    target_link_options(drift_web PRIVATE
+        "-sALLOW_MEMORY_GROWTH=1"
+        "-sSTACK_SIZE=1048576"
+        "-sENVIRONMENT=web"
+        "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/src/platform/web/shell.html"
+        ${DRIFT_WEB_PRELOADS}
+    )
+    return()
+endif()
 
 # ---- drift: native Linux/Wayland runtime ----
 set(WLGEN src/platform/linux/wayland-generated)

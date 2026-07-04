@@ -1,0 +1,327 @@
+// Browser runtime: the same drift_core, driven by a canvas surface and a
+// requestAnimationFrame loop (DESIGN.md §3: WebGPU calls forward to the
+// browser via the emdawnwebgpu bindings; Dawn is not part of this build).
+//
+// The scene renders into an intermediate texture, which is copied to the
+// canvas only on frames the scene actually presented. A WebGPU canvas is
+// recomposited (starting from cleared) whenever its current texture is
+// acquired, so the native "skip the commit when nothing changed" contract
+// (§11) maps to: don't touch the canvas at all — it then keeps showing the
+// last presented image.
+
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <emscripten/emscripten.h>
+#include <emscripten/html5.h>
+
+#include "core/Scene.h"
+
+namespace {
+
+constexpr const char* kCanvas = "#canvas";
+
+struct App {
+    wgpu::Instance instance;
+    wgpu::Adapter adapter;
+    wgpu::Device device;
+    wgpu::Surface surface;
+    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+    wgpu::CompositeAlphaMode alphaMode = wgpu::CompositeAlphaMode::Auto;
+    wgpu::Texture sceneTarget; // scene renders here; copied to canvas on present
+    uint32_t width = 0, height = 0;
+    double cssWidth = 0.0, cssHeight = 0.0;
+
+    std::string scenePath;
+    std::unique_ptr<drift::core::Scene> scene;
+
+    double startMs = -1.0;
+    float mouseX = 0.5f, mouseY = 0.5f;
+    bool mouseActive = false;
+    bool warnedNotPresenting = false;
+};
+
+App gApp;
+
+// Mirrors the native loader (src/main.cpp) minus video: assets come from the
+// bundle's MEMFS under /scenes/<name>, with the same project-root confinement.
+std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
+                                              const wgpu::Device& device)
+{
+    namespace fs = std::filesystem;
+
+    auto confined = [root](const std::string& relPath, fs::path& out) -> bool {
+        for (const auto& part : fs::path(relPath)) {
+            if (part == "..") {
+                return false;
+            }
+        }
+        if (fs::path(relPath).is_absolute()) {
+            return false;
+        }
+        out = fs::path(root) / relPath;
+        return true;
+    };
+
+    auto readAsset = [confined](const std::string& relPath, std::string& out) -> bool {
+        fs::path path;
+        if (!confined(relPath, path)) {
+            return false;
+        }
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        out = ss.str();
+        return true;
+    };
+
+    auto videoFactory = [](const std::string&, bool, std::string& error)
+        -> std::unique_ptr<drift::core::VideoDecoder> {
+        error = "video nodes are not supported in the browser build yet";
+        return nullptr;
+    };
+
+    std::string sceneJson;
+    if (!readAsset("scene.json", sceneJson)) {
+        fprintf(stderr, "drift: cannot read %s/scene.json\n", root.c_str());
+        return nullptr;
+    }
+
+    std::vector<std::string> errors, warnings;
+    auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
+                                          device, errors, warnings);
+    for (const auto& w : warnings) {
+        fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
+    }
+    for (const auto& e : errors) {
+        fprintf(stderr, "drift: scene: %s\n", e.c_str());
+    }
+    if (scene) {
+        printf("drift: loaded scene '%s'\n", scene->name().c_str());
+    }
+    return scene;
+}
+
+// (Re)configures the surface and the intermediate target to the canvas's
+// current device-pixel size. Returns false while the canvas has no size.
+bool syncSurfaceSize()
+{
+    double cssW = 0.0, cssH = 0.0;
+    emscripten_get_element_css_size(kCanvas, &cssW, &cssH);
+    const double dpr = emscripten_get_device_pixel_ratio();
+    const uint32_t w = (uint32_t)(cssW * dpr + 0.5);
+    const uint32_t h = (uint32_t)(cssH * dpr + 0.5);
+    if (w == 0 || h == 0) {
+        return false;
+    }
+    gApp.cssWidth = cssW;
+    gApp.cssHeight = cssH;
+    if (w == gApp.width && h == gApp.height) {
+        return true;
+    }
+    gApp.width = w;
+    gApp.height = h;
+
+    wgpu::SurfaceConfiguration cfg{};
+    cfg.device = gApp.device;
+    cfg.format = gApp.format;
+    cfg.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopyDst;
+    cfg.alphaMode = gApp.alphaMode;
+    cfg.width = w;
+    cfg.height = h;
+    gApp.surface.Configure(&cfg);
+
+    wgpu::TextureDescriptor td{};
+    td.format = gApp.format;
+    td.size = { w, h, 1 };
+    td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+    gApp.sceneTarget = gApp.device.CreateTexture(&td);
+    return true;
+}
+
+bool onFrame(double nowMs, void*)
+{
+    if (!syncSurfaceSize()) {
+        return true; // canvas not laid out yet; try again next frame
+    }
+    if (gApp.startMs < 0.0) {
+        gApp.startMs = nowMs;
+    }
+
+    drift::core::FrameContext ctx{};
+    ctx.device = gApp.device;
+    ctx.seconds = (nowMs - gApp.startMs) / 1000.0;
+    ctx.mouseX = gApp.mouseX;
+    ctx.mouseY = gApp.mouseY;
+    ctx.mouseActive = gApp.mouseActive;
+    ctx.target = gApp.sceneTarget.CreateView();
+    ctx.targetWidth = gApp.width;
+    ctx.targetHeight = gApp.height;
+    ctx.targetFormat = gApp.format;
+    if (!gApp.scene->render(ctx)) {
+        return true; // nothing changed; leave the canvas untouched (§11)
+    }
+
+    wgpu::SurfaceTexture st{};
+    gApp.surface.GetCurrentTexture(&st);
+    if (st.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
+        st.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
+        if (!gApp.warnedNotPresenting) {
+            gApp.warnedNotPresenting = true;
+            fprintf(stderr, "drift: GetCurrentTexture failed (%d)\n", (int)st.status);
+        }
+        return true;
+    }
+
+    wgpu::CommandEncoder encoder = gApp.device.CreateCommandEncoder();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = gApp.sceneTarget;
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = st.texture;
+    wgpu::Extent3D extent = { gApp.width, gApp.height, 1 };
+    encoder.CopyTextureToTexture(&src, &dst, &extent);
+    wgpu::CommandBuffer commands = encoder.Finish();
+    gApp.device.GetQueue().Submit(1, &commands);
+    return true;
+}
+
+bool onMouseMove(int, const EmscriptenMouseEvent* e, void*)
+{
+    if (gApp.cssWidth > 0.0 && gApp.cssHeight > 0.0) {
+        gApp.mouseX = (float)(e->targetX / gApp.cssWidth);
+        gApp.mouseY = (float)(e->targetY / gApp.cssHeight);
+        gApp.mouseActive = true;
+    }
+    return true;
+}
+
+bool onMouseEnterLeave(int eventType, const EmscriptenMouseEvent*, void*)
+{
+    // position holds its last value across leave (§9.8)
+    gApp.mouseActive = (eventType == EMSCRIPTEN_EVENT_MOUSEENTER);
+    return true;
+}
+
+void onDeviceReady()
+{
+    wgpu::SurfaceCapabilities caps{};
+    gApp.surface.GetCapabilities(gApp.adapter, &caps);
+    if (caps.formatCount == 0) {
+        fprintf(stderr, "drift: surface reports no formats\n");
+        return;
+    }
+    gApp.format = caps.formats[0];
+    gApp.alphaMode = caps.alphaModeCount ? caps.alphaModes[0]
+                                         : wgpu::CompositeAlphaMode::Auto;
+
+    gApp.scene = loadScene(gApp.scenePath, gApp.device);
+    if (!gApp.scene) {
+        return;
+    }
+
+    emscripten_set_mousemove_callback(kCanvas, nullptr, false, onMouseMove);
+    emscripten_set_mouseenter_callback(kCanvas, nullptr, false, onMouseEnterLeave);
+    emscripten_set_mouseleave_callback(kCanvas, nullptr, false, onMouseEnterLeave);
+    emscripten_request_animation_frame_loop(onFrame, nullptr);
+}
+
+void requestDevice()
+{
+    // BC compression carries the KTX2 path natively (Gpu.cpp); on the web it
+    // is optional — without it, scenes using Basis-compressed textures fail
+    // with a validation error when core creates the BC7 texture.
+    std::vector<wgpu::FeatureName> features;
+    if (gApp.adapter.HasFeature(wgpu::FeatureName::TextureCompressionBC)) {
+        features.push_back(wgpu::FeatureName::TextureCompressionBC);
+    } else {
+        fprintf(stderr, "drift: no BC texture compression; KTX2 scenes will fail\n");
+    }
+
+    wgpu::DeviceDescriptor dd{};
+    dd.requiredFeatures = features.data();
+    dd.requiredFeatureCount = features.size();
+    dd.SetUncapturedErrorCallback(
+        [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView msg) {
+            fprintf(stderr, "drift: [webgpu error %d] %.*s\n",
+                    (int)type, (int)msg.length, msg.data);
+        });
+    dd.SetDeviceLostCallback(
+        wgpu::CallbackMode::AllowSpontaneous,
+        [](const wgpu::Device&, wgpu::DeviceLostReason reason,
+           wgpu::StringView msg) {
+            if (reason != wgpu::DeviceLostReason::Destroyed) {
+                fprintf(stderr, "drift: [webgpu device lost %d] %.*s\n",
+                        (int)reason, (int)msg.length, msg.data);
+            }
+        });
+
+    gApp.adapter.RequestDevice(
+        &dd, wgpu::CallbackMode::AllowSpontaneous,
+        [](wgpu::RequestDeviceStatus status, wgpu::Device device,
+           wgpu::StringView msg) {
+            if (status != wgpu::RequestDeviceStatus::Success) {
+                fprintf(stderr, "drift: RequestDevice failed: %.*s\n",
+                        (int)msg.length, msg.data);
+                return;
+            }
+            gApp.device = std::move(device);
+            onDeviceReady();
+        });
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    std::string name = argc > 1 ? argv[1] : "plasma";
+    if (name.find('/') != std::string::npos ||
+        !std::filesystem::exists("/scenes/" + name)) {
+        fprintf(stderr, "drift: no bundled scene '%s'; have:\n", name.c_str());
+        for (const auto& entry : std::filesystem::directory_iterator("/scenes")) {
+            fprintf(stderr, "  %s\n", entry.path().filename().c_str());
+        }
+        return 1;
+    }
+    gApp.scenePath = "/scenes/" + name;
+
+    gApp.instance = wgpu::CreateInstance(nullptr);
+    if (!gApp.instance) {
+        fprintf(stderr, "drift: WebGPU is not available in this browser\n");
+        return 1;
+    }
+
+    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvas{};
+    canvas.selector = kCanvas;
+    wgpu::SurfaceDescriptor sd{};
+    sd.nextInChain = &canvas;
+    gApp.surface = gApp.instance.CreateSurface(&sd);
+
+    wgpu::RequestAdapterOptions opts{};
+    opts.featureLevel = wgpu::FeatureLevel::Core;
+    opts.compatibleSurface = gApp.surface;
+    gApp.instance.RequestAdapter(
+        &opts, wgpu::CallbackMode::AllowSpontaneous,
+        [](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter,
+           wgpu::StringView msg) {
+            if (status != wgpu::RequestAdapterStatus::Success) {
+                fprintf(stderr, "drift: RequestAdapter failed: %.*s\n",
+                        (int)msg.length, msg.data);
+                return;
+            }
+            gApp.adapter = std::move(adapter);
+            requestDevice();
+        });
+
+    // The runtime stays alive after main returns (EXIT_RUNTIME=0); rendering
+    // continues from the adapter/device callbacks and the rAF loop.
+    return 0;
+}

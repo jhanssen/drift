@@ -587,6 +587,7 @@ void ImageNode::evaluate(FrameContext& ctx)
 
 // ---- VideoNode ----
 
+#ifndef __EMSCRIPTEN__
 namespace {
 
 // NV12 -> linear RGB: y from the R8 plane, cb/cr from the RG88 plane
@@ -643,6 +644,7 @@ void yuvMatrix(bool bt709, bool fullRange, float rows[12])
 }
 
 } // namespace
+#endif // !__EMSCRIPTEN__
 
 VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
     : mDecoder(std::move(decoder))
@@ -650,6 +652,8 @@ VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
     outputs.resize(1);
     outputs[0].value.type = ValueType::Texture;
 }
+
+#ifndef __EMSCRIPTEN__ // zero-copy import (see Nodes.h on the exception)
 
 bool VideoNode::ensureConvertPipeline(FrameContext& ctx)
 {
@@ -814,6 +818,8 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
     return true;
 }
 
+#endif // !__EMSCRIPTEN__
+
 void VideoNode::evaluate(FrameContext& ctx)
 {
     const VideoFrame* frame = mDecoder->frameAt(ctx.seconds);
@@ -821,6 +827,7 @@ void VideoNode::evaluate(FrameContext& ctx)
         return; // decode error; hold the previous frame
     }
 
+#ifndef __EMSCRIPTEN__
     if (frame->planes.size() == 2) {
         if (frame->index == mLastIndex) {
             return;
@@ -835,6 +842,7 @@ void VideoNode::evaluate(FrameContext& ctx)
         }
         return;
     }
+#endif
 
     if (!mTexture || frame->width != mWidth || frame->height != mHeight) {
         wgpu::TextureDescriptor desc{};
