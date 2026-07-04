@@ -63,7 +63,7 @@ public:
         uint32_t outputId = 0;
         wgpu::TextureView target;
         uint32_t width = 0, height = 0;
-        float seconds = 0.0f;
+        double seconds = 0.0;
         float mouseX = 0.5f, mouseY = 0.5f;
         bool mouseActive = false;
     };

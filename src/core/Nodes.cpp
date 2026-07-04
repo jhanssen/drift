@@ -142,9 +142,9 @@ TimeNode::TimeNode()
 void TimeNode::evaluate(FrameContext& ctx)
 {
     Value seconds{};
-    seconds.v[0] = ctx.seconds;
+    seconds.v[0] = (float)ctx.seconds;
     Value delta{};
-    delta.v[0] = firstEvaluate ? 0.0f : ctx.seconds - mLast;
+    delta.v[0] = firstEvaluate ? 0.0f : (float)(ctx.seconds - mLast);
     mLast = ctx.seconds;
     writeOutput(outputs[0], seconds);
     writeOutput(outputs[1], delta);

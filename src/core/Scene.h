@@ -16,7 +16,12 @@ namespace drift::core {
 
 struct FrameContext {
     wgpu::Device device;
-    float seconds = 0.0f; // scene time; does not advance while paused
+    // Scene time; does not advance while paused. Double so long runs (a
+    // wallpaper is up for weeks) keep sub-frame precision — video frame
+    // selection consumes this directly. Value ports are f32, so
+    // @time.seconds itself quantizes at large magnitudes; that is a
+    // documented limit of the f32 value graph.
+    double seconds = 0.0;
     // Pointer state in output space (§9.8). x/y hold the last known
     // position; the platform keeps them across leave events.
     float mouseX = 0.5f, mouseY = 0.5f;

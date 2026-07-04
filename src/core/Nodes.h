@@ -19,7 +19,7 @@ public:
     bool drivesFrames() const override { return true; }
 
 private:
-    float mLast = 0.0f;
+    double mLast = 0.0;
 };
 
 // §9.8 mouse (implicit): outputs position (last-known, output space),

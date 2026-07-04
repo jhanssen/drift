@@ -717,7 +717,7 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     request.target = buf->target.texture.CreateView();
     request.width = surf.width;
     request.height = surf.height;
-    request.seconds = (float)surf.sceneTime;
+    request.seconds = surf.sceneTime;
     request.mouseX = surf.pointerSeen && surf.width
                          ? (float)(surf.pointerX / surf.width)
                          : 0.5f;

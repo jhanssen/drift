@@ -212,7 +212,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
 
     int presentedCount = 0;
     for (int i = 0; i < frames; ++i) {
-        const float t = (float)i / 60.0f;
+        const double t = i / 60.0;
         if (scene) {
             drift::core::FrameContext ctx{};
             ctx.device = device;
@@ -228,7 +228,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
                 ++presentedCount;
             }
         } else {
-            placeholder.render(texture.CreateView(), t);
+            placeholder.render(texture.CreateView(), (float)t);
             ++presentedCount;
         }
 
@@ -327,7 +327,7 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     return app.run(
         [&](const drift::platform::WaylandApp::FrameRequest& req) -> bool {
             if (scenePath.empty()) {
-                placeholder.render(req.target, req.seconds);
+                placeholder.render(req.target, (float)req.seconds);
                 return true;
             }
             auto it = scenes.find(req.outputId);
