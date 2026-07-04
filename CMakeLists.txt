@@ -21,6 +21,7 @@ find_package(Threads REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(GBM REQUIRED gbm)
 pkg_check_modules(LIBDRM REQUIRED libdrm)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
@@ -45,6 +46,7 @@ add_executable(drift
     src/main.cpp
     src/platform/linux/Gpu.cpp
     src/platform/linux/WaylandApp.cpp
+    src/platform/linux/VideoDecoderFFmpeg.cpp
     ${WLGEN}/xdg-shell-protocol.c
     ${WLGEN}/wlr-layer-shell-unstable-v1-protocol.c
     ${WLGEN}/linux-dmabuf-v1-protocol.c
@@ -54,12 +56,14 @@ target_include_directories(drift PRIVATE
     ${WAYLAND_CLIENT_INCLUDE_DIRS}
     ${GBM_INCLUDE_DIRS}
     ${LIBDRM_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
     3rdparty/stb
 )
 target_link_libraries(drift PRIVATE
     drift_core
     ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES}
+    ${FFMPEG_LIBRARIES}
     Threads::Threads
     dl
 )
@@ -94,4 +98,5 @@ if(BUILD_TESTING)
     drift_golden_test(buoy)
     drift_golden_test(follow)
     drift_golden_test(trail)
+    drift_golden_test(nebula)
 endif()

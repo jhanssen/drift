@@ -4,17 +4,19 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: early. Loads and renders `.sceneproject` scenes with the core node
-set: image (PNG/JPEG), shader, transform, compositor, wave, remap, combine,
-split, the implicit time/mouse inputs, and previous-frame feedback edges
-(`"previous": true`) for trails and iterative effects. Video is next.
-Wayland (wlr-layer-shell compositors) only.
+Status: the full v1 node set works: image (PNG/JPEG), video (ffmpeg
+software decode; AV1/H.264/anything your ffmpeg has), shader, transform,
+compositor, wave, remap, combine, split, the implicit time/mouse inputs,
+and previous-frame feedback edges (`"previous": true`) for trails and
+iterative effects. Wayland (wlr-layer-shell compositors) only. Next:
+multi-monitor, VAAPI zero-copy decode, runtime parameter changes.
 
 ## Build
 
 Requires: CMake ≥ 3.24, a C++23 compiler, and dev packages for
-`wayland-client`, `gbm`, and `libdrm`. Dawn is downloaded as a prebuilt
-tarball on first configure.
+`wayland-client`, `gbm`, `libdrm`, and ffmpeg (`libavformat`, `libavcodec`,
+`libavutil`, `libswscale`). Dawn is downloaded as a prebuilt tarball on
+first configure.
 
 ```
 cmake -B build -G Ninja

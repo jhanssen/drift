@@ -267,9 +267,10 @@ bool isImplicitNode(const std::string& id)
 
 class Loader {
 public:
-    Loader(const AssetReader& readAsset, const wgpu::Device& device,
-           std::vector<std::string>& errors)
-        : mReadAsset(readAsset), mDevice(device), mErrors(errors)
+    Loader(const AssetReader& readAsset, const VideoDecoderFactory& videoFactory,
+           const wgpu::Device& device, std::vector<std::string>& errors)
+        : mReadAsset(readAsset), mVideoFactory(videoFactory), mDevice(device),
+          mErrors(errors)
     {
     }
 
@@ -300,6 +301,7 @@ private:
     std::vector<DeferredBind> mDeferredBinds;
 
     const AssetReader& mReadAsset;
+    const VideoDecoderFactory& mVideoFactory;
     const wgpu::Device& mDevice;
     std::vector<std::string>& mErrors;
 
@@ -712,6 +714,40 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         return node;
     }
 
+    if (raw.type == "video") {
+        const auto& obj = raw.json->get_object();
+        auto srcIt = obj.find("src");
+        if (srcIt == obj.end() || !srcIt->second.is_string()) {
+            fail("node '" + raw.id + "': video node needs a string 'src' path");
+            return nullptr;
+        }
+        const std::string& path = srcIt->second.get_string();
+        if (path.find("..") != std::string::npos || path.starts_with("/")) {
+            fail("node '" + raw.id + "': video path escapes the project");
+            return nullptr;
+        }
+        bool loop = true;
+        if (auto loopIt = obj.find("loop"); loopIt != obj.end()) {
+            if (!loopIt->second.is_boolean()) {
+                fail("node '" + raw.id + "': 'loop' must be a boolean");
+                return nullptr;
+            }
+            loop = loopIt->second.get_boolean();
+        }
+        if (!mVideoFactory) {
+            fail("node '" + raw.id + "': video nodes are not supported by this runtime");
+            return nullptr;
+        }
+        std::string err;
+        auto decoder = mVideoFactory(path, loop, err);
+        if (!decoder) {
+            fail("node '" + raw.id + "': cannot open video '" + path + "': " + err);
+            return nullptr;
+        }
+        portsOut.clear();
+        return new VideoNode(std::move(decoder));
+    }
+
     if (raw.type == "transform") {
         portsOut.assign(std::begin(kTransformInputs), std::end(kTransformInputs));
         return new TransformNode();
@@ -1024,10 +1060,11 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
 
 std::unique_ptr<Scene> Scene::load(const std::string& sceneJson,
                                    const AssetReader& readAsset,
+                                   const VideoDecoderFactory& videoFactory,
                                    const wgpu::Device& device,
                                    std::vector<std::string>& errors)
 {
-    Loader loader(readAsset, device, errors);
+    Loader loader(readAsset, videoFactory, device, errors);
     auto scene = loader.load(sceneJson);
     if (!scene && errors.empty()) {
         errors.push_back("scene load failed");

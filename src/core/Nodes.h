@@ -5,6 +5,7 @@
 #include <string>
 
 #include "Scene.h"
+#include "Video.h"
 #include "WgslInterface.h"
 
 namespace drift::core {
@@ -81,6 +82,23 @@ private:
     std::vector<uint16_t> mPixels; // released after upload
     uint32_t mWidth = 0, mHeight = 0;
     wgpu::Texture mTexture;
+};
+
+// §9.2 video: streaming texture source, dirty on each new decoded frame.
+// Decoding runs on the platform-provided decoder's thread; evaluate pulls
+// the frame due at scene time and uploads it only when it changed.
+class VideoNode : public Node {
+public:
+    explicit VideoNode(std::unique_ptr<VideoDecoder> decoder);
+    void evaluate(FrameContext& ctx) override;
+    // Frame advance is driven by scene time, not graph inputs.
+    bool alwaysEvaluate() const override { return true; }
+
+private:
+    std::unique_ptr<VideoDecoder> mDecoder;
+    wgpu::Texture mTexture;
+    uint32_t mWidth = 0, mHeight = 0;
+    int64_t mLastIndex = -1;
 };
 
 // §9.4 transform: renders source into a scene-output-sized transparent

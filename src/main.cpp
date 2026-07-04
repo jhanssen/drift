@@ -15,6 +15,7 @@
 #include "core/Renderer.h"
 #include "core/Scene.h"
 #include "platform/linux/Gpu.h"
+#include "platform/linux/VideoDecoderFFmpeg.h"
 #include "platform/linux/WaylandApp.h"
 
 namespace {
@@ -54,7 +55,7 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
     }
     const fs::path sceneFile = root / "scene.json";
 
-    auto readAsset = [root](const std::string& relPath, std::string& out) -> bool {
+    auto confined = [root](const std::string& relPath, fs::path& out) -> bool {
         for (const auto& part : fs::path(relPath)) {
             if (part == "..") {
                 return false;
@@ -63,7 +64,16 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
         if (fs::path(relPath).is_absolute()) {
             return false;
         }
-        std::ifstream in(root / relPath, std::ios::binary);
+        out = root / relPath;
+        return true;
+    };
+
+    auto readAsset = [confined](const std::string& relPath, std::string& out) -> bool {
+        fs::path path;
+        if (!confined(relPath, path)) {
+            return false;
+        }
+        std::ifstream in(path, std::ios::binary);
         if (!in) {
             return false;
         }
@@ -73,6 +83,18 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
         return true;
     };
 
+    auto videoFactory = [confined](const std::string& relPath, bool loop,
+                                   std::string& error)
+        -> std::unique_ptr<drift::core::VideoDecoder> {
+        fs::path path;
+        if (!confined(relPath, path)) {
+            error = "path escapes the project";
+            return nullptr;
+        }
+        return drift::platform::createFFmpegVideoDecoder(path.string(), loop,
+                                                         error);
+    };
+
     std::string sceneJson;
     if (!readAsset("scene.json", sceneJson)) {
         fprintf(stderr, "drift: cannot read %s\n", sceneFile.c_str());
@@ -80,7 +102,8 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
     }
 
     std::vector<std::string> errors;
-    auto scene = drift::core::Scene::load(sceneJson, readAsset, device, errors);
+    auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
+                                          device, errors);
     for (const auto& e : errors) {
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
     }

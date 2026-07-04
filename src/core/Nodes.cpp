@@ -341,6 +341,58 @@ void ImageNode::evaluate(FrameContext& ctx)
     writeOutput(outputs[0], out); // dirty on first evaluate only
 }
 
+// ---- VideoNode ----
+
+VideoNode::VideoNode(std::unique_ptr<VideoDecoder> decoder)
+    : mDecoder(std::move(decoder))
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Texture;
+}
+
+void VideoNode::evaluate(FrameContext& ctx)
+{
+    const VideoFrame* frame = mDecoder->frameAt(ctx.seconds);
+    if (!frame) {
+        return; // decode error; hold the previous frame
+    }
+
+    if (!mTexture || frame->width != mWidth || frame->height != mHeight) {
+        wgpu::TextureDescriptor desc{};
+        // sRGB view: sampling converts to linear in hardware, so the CPU
+        // side stays a cheap byte copy per frame. Opaque, so premultiplied
+        // trivially (§12).
+        desc.format = wgpu::TextureFormat::RGBA8UnormSrgb;
+        desc.size = { frame->width, frame->height, 1 };
+        desc.usage = wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
+        mTexture = ctx.device.CreateTexture(&desc);
+        mWidth = frame->width;
+        mHeight = frame->height;
+        mLastIndex = -1;
+    }
+
+    if (frame->index != mLastIndex) {
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = mTexture;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.bytesPerRow = mWidth * 4;
+        layout.rowsPerImage = mHeight;
+        wgpu::Extent3D extent = { mWidth, mHeight, 1 };
+        ctx.device.GetQueue().WriteTexture(&dst, frame->rgba.data(),
+                                           frame->rgba.size(), &layout, &extent);
+        mLastIndex = frame->index;
+
+        Value out{};
+        out.type = ValueType::Texture;
+        out.texture = mTexture;
+        out.texWidth = mWidth;
+        out.texHeight = mHeight;
+        outputs[0].value = out;
+        outputs[0].dirty = true; // same texture object, new contents
+    }
+}
+
 // ---- TransformNode ----
 
 namespace {

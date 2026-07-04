@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "Value.h"
+#include "Video.h"
 
 namespace drift::core {
 
@@ -77,9 +78,11 @@ using AssetReader = std::function<bool(const std::string& path, std::string& out
 class Scene {
 public:
     // Parses and validates scene.json. Returns nullptr on failure with
-    // human-readable messages appended to errors.
+    // human-readable messages appended to errors. videoFactory may be null:
+    // scenes with video nodes then fail to load.
     static std::unique_ptr<Scene> load(const std::string& sceneJson,
                                        const AssetReader& readAsset,
+                                       const VideoDecoderFactory& videoFactory,
                                        const wgpu::Device& device,
                                        std::vector<std::string>& errors);
 

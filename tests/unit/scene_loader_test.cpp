@@ -40,6 +40,31 @@ const unsigned char kTinyPng[] = {
     174, 66, 96, 130,
 };
 
+// Canned decoder so video-node wiring is testable without ffmpeg or a GPU.
+struct StubVideoDecoder : drift::core::VideoDecoder {
+    drift::core::VideoFrame frame;
+    StubVideoDecoder()
+    {
+        frame.width = 2;
+        frame.height = 2;
+        frame.index = 0;
+        frame.rgba.assign(2 * 2 * 4, 255);
+    }
+    const drift::core::VideoFrame* frameAt(double) override { return &frame; }
+};
+
+drift::core::VideoDecoderFactory stubVideoFactory()
+{
+    return [](const std::string& path, bool,
+              std::string& error) -> std::unique_ptr<drift::core::VideoDecoder> {
+        if (path != "assets/clip.mp4") {
+            error = "no such file";
+            return nullptr;
+        }
+        return std::make_unique<StubVideoDecoder>();
+    };
+}
+
 struct LoadResult {
     std::unique_ptr<Scene> scene;
     std::vector<std::string> errors;
@@ -63,7 +88,8 @@ struct LoadResult {
     }
 };
 
-LoadResult load(const std::string& json)
+LoadResult load(const std::string& json,
+                const drift::core::VideoDecoderFactory& videoFactory = nullptr)
 {
     const std::map<std::string, std::string> assets = {
         { "shaders/minimal.wgsl", kMinimalWgsl },
@@ -83,7 +109,7 @@ LoadResult load(const std::string& json)
             out = it->second;
             return true;
         },
-        wgpu::Device(), r.errors);
+        videoFactory, wgpu::Device(), r.errors);
     return r;
 }
 
@@ -436,6 +462,52 @@ TEST_CASE("image validation: missing src, missing file, corrupt file, escaping p
     })");
     CHECK(escape.scene == nullptr);
     CHECK(escape.hasError("escapes the project"));
+}
+
+TEST_CASE("video node loads through the decoder factory")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "bg", "type": "video", "src": "assets/clip.mp4", "loop": false },
+            { "id": "out", "type": "output", "inputs": { "color": "@bg" } }
+        ]
+    })", stubVideoFactory());
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+}
+
+TEST_CASE("video validation: factory errors, missing factory, bad loop")
+{
+    auto missing = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [ { "id": "v", "type": "video", "src": "assets/nope.mp4" } ]
+    })", stubVideoFactory());
+    CHECK(missing.scene == nullptr);
+    CHECK(missing.hasError("cannot open video"));
+
+    auto noFactory = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [ { "id": "v", "type": "video", "src": "assets/clip.mp4" } ]
+    })");
+    CHECK(noFactory.scene == nullptr);
+    CHECK(noFactory.hasError("not supported"));
+
+    auto badLoop = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [ { "id": "v", "type": "video", "src": "assets/clip.mp4",
+                     "loop": "yes" } ]
+    })", stubVideoFactory());
+    CHECK(badLoop.scene == nullptr);
+    CHECK(badLoop.hasError("'loop' must be a boolean"));
+
+    auto noSrc = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [ { "id": "v", "type": "video" } ]
+    })", stubVideoFactory());
+    CHECK(noSrc.scene == nullptr);
+    CHECK(noSrc.hasError("needs a string 'src'"));
 }
 
 TEST_CASE("compositor layers must be a non-empty array of texture connections")
