@@ -63,3 +63,29 @@ target_link_libraries(drift PRIVATE
     Threads::Threads
     dl
 )
+
+# ---- tests ----
+# Unit tests (doctest) for core logic, plus golden-image tests that render
+# example scenes headless (on lavapipe for determinism) and fuzzy-compare
+# against checked-in PNGs. Run with: ctest --test-dir build
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(3rdparty/doctest)
+
+    add_executable(imgcmp tools/imgcmp.cpp)
+    target_include_directories(imgcmp PRIVATE 3rdparty/stb)
+
+    add_executable(drift_tests
+        tests/unit/wgsl_interface_test.cpp
+        tests/unit/scene_loader_test.cpp
+    )
+    target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest)
+    add_test(NAME unit COMMAND drift_tests)
+
+    add_test(NAME golden_plasma COMMAND
+        ${CMAKE_SOURCE_DIR}/tests/golden.sh
+        $<TARGET_FILE:drift> $<TARGET_FILE:imgcmp>
+        ${CMAKE_SOURCE_DIR}/examples/plasma.sceneproject
+        ${CMAKE_SOURCE_DIR}/tests/golden/plasma
+    )
+endif()

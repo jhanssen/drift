@@ -37,9 +37,17 @@ public:
 
     // needPresent: require the GBM/dmabuf import path (presenting to a
     // compositor). Headless rendering works without it.
+    //
+    // Adapter selection honors DRIFT_ADAPTER: a case-insensitive substring
+    // matched against each adapter's device name (e.g. "llvmpipe" for the
+    // deterministic software rasterizer the golden tests use).
     bool init(bool needPresent);
 
     const wgpu::Device& device() const { return mDevice; }
+
+    // True once any uncaptured device error or unexpected device loss has
+    // occurred. Headless/test runs turn this into a failing exit code.
+    bool hasError() const { return mHasError; }
 
     // DRM format modifiers Dawn can import for the given WebGPU format.
     std::vector<uint64_t> importableModifiers(wgpu::TextureFormat format);
@@ -64,6 +72,7 @@ private:
     wgpu::Device mDevice;
     int mDrmFd = -1;
     gbm_device* mGbm = nullptr;
+    bool mHasError = false;
 };
 
 } // namespace drift::platform

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -25,12 +26,17 @@ void usage(const char* argv0)
             "  (default)          run as wallpaper (wlr-layer-shell background)\n"
             "  -w, --windowed     run in a regular window (dev mode)\n"
             "      --headless N   render N frames offscreen and write PNGs\n"
+            "      --frames LIST  only write the comma-separated frame indices\n"
+            "                     (still evaluates every frame up to the last;\n"
+            "                     implies --headless if N is omitted)\n"
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
             "      --out DIR      output directory for --headless (default .)\n"
             "  -h, --help         show this help\n"
             "\n"
-            "Without a scene, renders a builtin placeholder gradient.\n",
+            "Without a scene, renders a builtin placeholder gradient.\n"
+            "Frames advance scene time at a fixed 1/60s step; headless exits\n"
+            "nonzero if any GPU error occurred.\n",
             argv0);
 }
 
@@ -82,8 +88,12 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
     return scene;
 }
 
+// writeFrames: frame indices to write as PNGs; empty = all. Every frame up
+// to the last is evaluated regardless, since dirty state (and later,
+// feedback loops) depends on frame history.
 int runHeadless(const std::string& scenePath, int frames, uint32_t width,
-                uint32_t height, const std::string& outDir)
+                uint32_t height, const std::string& outDir,
+                const std::set<int>& writeFrames)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/false)) {
@@ -132,6 +142,10 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
             placeholder.render(texture.CreateView(), t);
         }
 
+        if (!writeFrames.empty() && !writeFrames.contains(i)) {
+            continue;
+        }
+
         wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
         wgpu::TexelCopyTextureInfo src{};
         src.texture = texture;
@@ -170,6 +184,11 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
         }
         readback.Unmap();
         printf("drift: wrote %s\n", path);
+    }
+    gpu.waitForQueue();
+    if (gpu.hasError()) {
+        fprintf(stderr, "drift: GPU errors occurred during headless render\n");
+        return 1;
     }
     return 0;
 }
@@ -227,6 +246,7 @@ int main(int argc, char** argv)
     uint32_t width = 0, height = 0;
     std::string outDir = ".";
     std::string scenePath;
+    std::set<int> writeFrames;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -234,6 +254,22 @@ int main(int argc, char** argv)
             windowed = true;
         } else if (!strcmp(arg, "--headless") && i + 1 < argc) {
             headlessFrames = atoi(argv[++i]);
+        } else if (!strcmp(arg, "--frames") && i + 1 < argc) {
+            std::stringstream ss(argv[++i]);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                char* end = nullptr;
+                const long v = strtol(item.c_str(), &end, 10);
+                if (end == item.c_str() || *end != '\0' || v < 0) {
+                    fprintf(stderr, "drift: bad --frames entry '%s'\n", item.c_str());
+                    return 2;
+                }
+                writeFrames.insert((int)v);
+            }
+            if (writeFrames.empty()) {
+                usage(argv[0]);
+                return 2;
+            }
         } else if (!strcmp(arg, "--size") && i + 1 < argc) {
             if (sscanf(argv[++i], "%ux%u", &width, &height) != 2) {
                 usage(argv[0]);
@@ -252,9 +288,13 @@ int main(int argc, char** argv)
         }
     }
 
+    if (!writeFrames.empty() && headlessFrames < 0) {
+        headlessFrames = *writeFrames.rbegin() + 1;
+    }
     if (headlessFrames >= 0) {
         if (width == 0) { width = 1920; height = 1080; }
-        return runHeadless(scenePath, headlessFrames, width, height, outDir);
+        return runHeadless(scenePath, headlessFrames, width, height, outDir,
+                           writeFrames);
     }
     if (width == 0) { width = 1280; height = 720; }
     return runWayland(scenePath,

@@ -28,6 +28,26 @@ build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 ```
 
 Without a scene argument, a builtin placeholder gradient is rendered.
+`DRIFT_ADAPTER=<substring>` selects a specific GPU adapter by device name.
+
+## Test
+
+```
+ctest --test-dir build
+```
+
+Two kinds of tests: doctest unit tests (`tests/unit/`, scene-loader
+validation and WGSL interface reflection) and golden-image tests
+(`tests/golden/`) that render example scenes headless and fuzzy-compare
+against checked-in PNGs. Goldens render on the lavapipe software rasterizer
+(`DRIFT_ADAPTER=llvmpipe`) for reproducibility; `tools/imgcmp.cpp`'s
+tolerances absorb real-GPU least-significant-bit differences. To regenerate
+after an intentional rendering change:
+
+```
+DRIFT_ADAPTER=llvmpipe build/drift examples/plasma.sceneproject \
+    --frames 0,30,120 --size 320x180 --out tests/golden/plasma
+```
 
 ## Layout
 

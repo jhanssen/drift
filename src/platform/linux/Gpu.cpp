@@ -1,7 +1,9 @@
 #include "Gpu.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -9,6 +11,26 @@
 #include <gbm.h>
 
 namespace drift::platform {
+
+namespace {
+
+std::string lowered(const char* s, size_t len)
+{
+    std::string out(s, len);
+    for (char& c : out) {
+        c = (char)tolower((unsigned char)c);
+    }
+    return out;
+}
+
+std::string adapterName(const wgpu::Adapter& adapter)
+{
+    wgpu::AdapterInfo info{};
+    adapter.GetInfo(&info);
+    return std::string(info.device.data, info.device.length);
+}
+
+} // namespace
 
 Gpu::~Gpu()
 {
@@ -48,7 +70,27 @@ bool Gpu::init(bool needPresent)
         fprintf(stderr, "drift: no Vulkan adapter\n");
         return false;
     }
-    mAdapter = wgpu::Adapter(adapters[0].Get());
+    if (const char* want = getenv("DRIFT_ADAPTER"); want && *want) {
+        const std::string needle = lowered(want, strlen(want));
+        for (const auto& a : adapters) {
+            wgpu::Adapter candidate(a.Get());
+            const std::string name = adapterName(candidate);
+            if (lowered(name.data(), name.size()).find(needle) != std::string::npos) {
+                mAdapter = candidate;
+                break;
+            }
+        }
+        if (!mAdapter) {
+            fprintf(stderr, "drift: no adapter matching DRIFT_ADAPTER='%s'; have:\n", want);
+            for (const auto& a : adapters) {
+                fprintf(stderr, "  %s\n", adapterName(wgpu::Adapter(a.Get())).c_str());
+            }
+            return false;
+        }
+    } else {
+        mAdapter = wgpu::Adapter(adapters[0].Get());
+    }
+    printf("drift: adapter: %s\n", adapterName(mAdapter).c_str());
 
     std::vector<wgpu::FeatureName> features;
     if (needPresent) {
@@ -69,18 +111,24 @@ bool Gpu::init(bool needPresent)
     dd.requiredFeatures = features.data();
     dd.requiredFeatureCount = features.size();
     dd.SetUncapturedErrorCallback(
-        [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView msg) {
+        [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView msg,
+           Gpu* self) {
+            self->mHasError = true;
             fprintf(stderr, "drift: [dawn error %d] %.*s\n",
                     (int)type, (int)msg.length, msg.data);
-        });
+        },
+        this);
     dd.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
-        [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg) {
+        [](const wgpu::Device&, wgpu::DeviceLostReason reason,
+           wgpu::StringView msg, Gpu* self) {
             if (reason != wgpu::DeviceLostReason::Destroyed) {
+                self->mHasError = true;
                 fprintf(stderr, "drift: [dawn device lost %d] %.*s\n",
                         (int)reason, (int)msg.length, msg.data);
             }
-        });
+        },
+        this);
     mDevice = mAdapter.CreateDevice(&dd);
     if (!mDevice) {
         fprintf(stderr, "drift: CreateDevice failed\n");
