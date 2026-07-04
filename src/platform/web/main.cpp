@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+// Last loader failure, readable from JS (drift_errors) so the editor can
+// show why an edited document or shader was rejected.
+static std::string gLastLoadErrors;
+
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 
@@ -113,8 +117,13 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
     for (const auto& w : warnings) {
         fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
     }
+    gLastLoadErrors.clear();
     for (const auto& e : errors) {
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
+        if (!gLastLoadErrors.empty()) {
+            gLastLoadErrors += "\n";
+        }
+        gLastLoadErrors += e;
     }
     if (scene) {
         if (jsonInOut) {
@@ -384,6 +393,70 @@ EMSCRIPTEN_KEEPALIVE int drift_reload()
 EMSCRIPTEN_KEEPALIVE const char* drift_source()
 {
     return gApp.sceneJson.c_str();
+}
+
+// Loader errors from the most recent (failed) load, one per line.
+EMSCRIPTEN_KEEPALIVE const char* drift_errors()
+{
+    return gLastLoadErrors.c_str();
+}
+
+// Writes a project file (creating directories) under the given root —
+// how the editor materializes a from-scratch scene in MEMFS. The page is
+// same-origin trusted; the ".." check just keeps paths tidy.
+EMSCRIPTEN_KEEPALIVE int drift_write_asset(const char* root, const char* path,
+                                           const char* contents)
+{
+    const std::string rel(path);
+    if (rel.empty() || rel.find("..") != std::string::npos || rel[0] == '/') {
+        return 0;
+    }
+    std::error_code ec;
+    const std::filesystem::path full = std::filesystem::path(root) / rel;
+    std::filesystem::create_directories(full.parent_path(), ec);
+    std::ofstream out(full, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return 0;
+    }
+    out << contents;
+    return out.good() ? 1 : 0;
+}
+
+// Reads a project-relative text file (e.g. a shader into the editor pane).
+EMSCRIPTEN_KEEPALIVE const char* drift_read_asset(const char* path)
+{
+    static std::string contents;
+    contents.clear();
+    const std::string rel(path);
+    if (rel.find("..") != std::string::npos ||
+        (!rel.empty() && rel[0] == '/')) {
+        return contents.c_str();
+    }
+    std::ifstream in(std::filesystem::path(gApp.scenePath) / rel,
+                     std::ios::binary);
+    if (in) {
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        contents = ss.str();
+    }
+    return contents.c_str();
+}
+
+// Switches the preview to another project root (e.g. the editor's scratch
+// scene). The clock keeps running; the caller re-applies parameters.
+EMSCRIPTEN_KEEPALIVE int drift_open(const char* root)
+{
+    std::string json;
+    std::string previousPath = gApp.scenePath;
+    gApp.scenePath = root;
+    auto fresh = loadScene(gApp.scenePath, gApp.device, &json);
+    if (!fresh) {
+        gApp.scenePath = std::move(previousPath);
+        return 0;
+    }
+    gApp.sceneJson = std::move(json);
+    gApp.scene = std::move(fresh);
+    return 1;
 }
 
 // Swaps to an edited document (assets still resolve from the bundled

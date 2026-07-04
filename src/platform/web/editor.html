@@ -58,6 +58,11 @@
   input[type=range] { flex: 1; padding: 0; }
   input[type=number] { width: 64px; }
   input[type=color] { padding: 0; width: 44px; height: 24px; }
+  textarea { width: 100%; font: 11px/1.4 ui-monospace, monospace;
+             color: var(--text); background: var(--bg);
+             border: 1px solid var(--edge); border-radius: 4px;
+             padding: 6px; resize: vertical; }
+  #wgslStatus { font-size: 11px; white-space: pre-wrap; }
   button { cursor: pointer; }
   button:hover { border-color: var(--accent); }
   .ok { color: #7fd490; } .bad { color: #e0787d; } .warn { color: #e3c56d; }
@@ -92,6 +97,8 @@
     <h2>Preview scene</h2>
     <div class="row">
       <select id="sceneSelect"></select>
+      <button id="newBtn" title="start a scratch scene (preview-only until saved)" disabled>New</button>
+      <button id="saveBtn" title="write the scene into a folder on disk" disabled>Save…</button>
     </div>
   </section>
 
@@ -108,6 +115,15 @@
     <h2>Parameters</h2>
     <div id="mismatch" class="mismatch" hidden></div>
     <div id="params"><span style="color:var(--dim)">none yet</span></div>
+  </section>
+
+  <section id="shaderSection" hidden>
+    <h2>Shader — shaders/main.wgsl</h2>
+    <textarea id="wgsl" rows="16" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="applyShaderBtn">Apply (Ctrl-Enter)</button>
+      <span id="wgslStatus"></span>
+    </div>
   </section>
 </aside>
 
@@ -129,7 +145,16 @@ for (const name of SCENES) {
   sceneSelect.appendChild(option);
 }
 sceneSelect.onchange = () => {
+  if (sceneSelect.value === '_scratch') {
+    return;
+  }
+  if (scratchActive &&
+      !confirm('Discard the scratch scene? (Save… first to keep it)')) {
+    sceneSelect.value = '_scratch';
+    return;
+  }
   query.set('scene', sceneSelect.value);
+  query.delete('scratch');
   location.search = query.toString(); // runtime scene switch = reload
 };
 
@@ -149,6 +174,11 @@ var Module = {
     const reload = Module.cwrap('drift_reload', 'number', []);
     const source = Module.cwrap('drift_source', 'string', []);
     const load = Module.cwrap('drift_load', 'number', ['string']);
+    const errors = Module.cwrap('drift_errors', 'string', []);
+    const writeAsset = Module.cwrap('drift_write_asset', 'number',
+        ['string', 'string', 'string']);
+    const readAsset = Module.cwrap('drift_read_asset', 'string', ['string']);
+    const open = Module.cwrap('drift_open', 'number', ['string']);
     wasm = {
       describe,
       time,
@@ -157,6 +187,10 @@ var Module = {
       reload,
       source,
       load,
+      errors,
+      writeAsset,
+      readAsset,
+      open,
       set(name, v) {
         return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
       },
@@ -170,11 +204,16 @@ var Module = {
         wasmManifest = info;
         setStatus('wasmStatus', `preview: ${info.scene}`, 'ok');
         console.log(`editor: wasm scene '${info.scene}'`);
+        document.getElementById('newBtn').disabled = false;
+        document.getElementById('saveBtn').disabled = false;
         refreshPanel();
         fetchSource();
         // The live connection may have won the race; sync now rather than
         // waiting for the periodic check.
         syncClock(/*force=*/true);
+        if (query.get('scratch')) {
+          newScene();
+        }
       } else if (Date.now() - started > 8000) {
         clearInterval(timer);
         setStatus('wasmStatus', 'preview: unavailable (WebGPU?)', 'bad');
@@ -377,6 +416,138 @@ async function pushDocument() {
   }
   console.log('editor: document pushed');
 }
+
+// ---- scene from scratch ----------------------------------------------------
+
+const SCRATCH_ROOT = '/scenes/_scratch';
+let scratchActive = false;
+
+const TEMPLATE_SCENE = JSON.stringify({
+  version: 1,
+  name: 'Untitled',
+  parameters: {
+    tint: { type: 'vec3', default: [0.4, 0.6, 1.0], hint: 'color',
+            label: 'Tint' },
+  },
+  nodes: [
+    { id: 'seq', type: 'sequence', duration: 8, loop: true,
+      tracks: [
+        { name: 'level', kind: 'value', type: 'scalar',
+          interpolate: 'smooth',
+          keys: [{ t: 0, value: 0.2 }, { t: 4, value: 1 },
+                 { t: 8, value: 0.2 }] },
+      ],
+      inputs: { time: '@time.seconds' } },
+    { id: 'main', type: 'shader', shader: 'shaders/main.wgsl',
+      inputs: { level: '@seq.level', tint: '$tint' } },
+    { id: 'out', type: 'output', inputs: { color: '@main' } },
+  ],
+}, null, 2);
+
+const TEMPLATE_WGSL = `struct Params {
+    level: f32,
+    tint: vec3<f32>,
+}
+@group(0) @binding(0) var<uniform> params: Params;
+
+@fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let d = distance(uv, vec2f(0.5, 0.5));
+    let glow = params.level * exp(-d * d * 8.0);
+    return vec4f(params.tint * glow, 1.0);
+}
+`;
+
+function newScene() {
+  if (!wasm) {
+    return;
+  }
+  if (live) {
+    live.close(); // scratch is preview-only; a live app can't run it
+  }
+  wasm.writeAsset(SCRATCH_ROOT, 'scene.json', TEMPLATE_SCENE);
+  wasm.writeAsset(SCRATCH_ROOT, 'shaders/main.wgsl', TEMPLATE_WGSL);
+  if (!wasm.open(SCRATCH_ROOT)) {
+    console.log(`editor: scratch open failed: ${wasm.errors()}`);
+    return;
+  }
+  scratchActive = true;
+  currentValues.clear();
+  wasmManifest = JSON.parse(wasm.describe());
+  sceneSource = JSON.parse(wasm.source());
+  setStatus('wasmStatus', `preview: ${wasmManifest.scene} (scratch)`, 'ok');
+  console.log('editor: scratch scene created');
+
+  const select = document.getElementById('sceneSelect');
+  if (!select.querySelector('option[value="_scratch"]')) {
+    const option = document.createElement('option');
+    option.value = '_scratch';
+    option.textContent = '(scratch)';
+    select.appendChild(option);
+  }
+  select.value = '_scratch';
+
+  const shaderSection = document.getElementById('shaderSection');
+  shaderSection.hidden = false;
+  document.getElementById('wgsl').value =
+      wasm.readAsset('shaders/main.wgsl');
+  refreshPanel();
+}
+
+function applyShader() {
+  if (!scratchActive || !wasm) {
+    return;
+  }
+  wasm.writeAsset(SCRATCH_ROOT, 'shaders/main.wgsl',
+                  document.getElementById('wgsl').value);
+  // Reload the document so the shader re-reflects; ports may have changed.
+  if (!wasm.load(JSON.stringify(sceneSource))) {
+    setStatus('wgslStatus', wasm.errors() || 'load failed', 'bad');
+    return;
+  }
+  for (const [name, values] of currentValues) {
+    wasm.set(name, values);
+  }
+  wasmManifest = JSON.parse(wasm.describe());
+  setStatus('wgslStatus', 'applied', 'ok');
+  refreshPanel();
+}
+
+async function saveToFolder() {
+  if (!sceneSource) {
+    return;
+  }
+  try {
+    const dir = await showDirectoryPicker({ mode: 'readwrite' });
+    const sceneFile = await dir.getFileHandle('scene.json', { create: true });
+    const writable = await sceneFile.createWritable();
+    await writable.write(JSON.stringify(sceneSource, null, 2) + '\n');
+    await writable.close();
+    if (scratchActive) {
+      const shaders = await dir.getDirectoryHandle('shaders', { create: true });
+      const wgslFile = await shaders.getFileHandle('main.wgsl', { create: true });
+      const wgslWritable = await wgslFile.createWritable();
+      await wgslWritable.write(document.getElementById('wgsl').value);
+      await wgslWritable.close();
+    }
+    console.log(`editor: saved to '${dir.name}'`);
+    setStatus('wasmStatus',
+              `preview: ${wasmManifest?.scene} — saved to ${dir.name}/`, 'ok');
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.log(`editor: save: ${err}`);
+    }
+  }
+}
+
+document.getElementById('newBtn').onclick = newScene;
+document.getElementById('saveBtn').onclick = saveToFolder;
+document.getElementById('applyShaderBtn').onclick = applyShader;
+document.getElementById('wgsl').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    applyShader();
+  }
+});
 
 // ---- transport ------------------------------------------------------------
 
