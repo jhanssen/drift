@@ -137,6 +137,9 @@ var Module = {
         setStatus('wasmStatus', `preview: ${info.scene}`, 'ok');
         console.log(`editor: wasm scene '${info.scene}'`);
         refreshPanel();
+        // The live connection may have won the race; sync now rather than
+        // waiting for the periodic check.
+        syncClock(/*force=*/true);
       } else if (Date.now() - started > 8000) {
         clearInterval(timer);
         setStatus('wasmStatus', 'preview: unavailable (WebGPU?)', 'bad');
