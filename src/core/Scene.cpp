@@ -1,5 +1,7 @@
 #include "Scene.h"
 
+#include <algorithm>
+
 namespace drift::core {
 
 Value Node::inputValue(size_t index) const
@@ -32,6 +34,47 @@ bool Node::inputsDirty() const
         if (in.previous ? src.prevDirty : src.dirty) {
             return true;
         }
+    }
+    return false;
+}
+
+bool Scene::setParameter(const std::string& name, Value value)
+{
+    for (size_t i = 0; i < mParams.size(); ++i) {
+        SceneParam& param = mParams[i];
+        if (param.name != name) {
+            continue;
+        }
+        if (value.type == ValueType::Scalar && param.type != ValueType::Scalar) {
+            const float s = value.v[0];
+            value.type = param.type;
+            value.v = { s, s, s, s };
+        }
+        if (value.type != param.type) {
+            return false;
+        }
+        const int n = componentCount(param.type);
+        for (int c = 0; c < n; ++c) {
+            if (param.hasMin) {
+                value.v[c] = std::max(value.v[c], param.min.v[c]);
+            }
+            if (param.hasMax) {
+                value.v[c] = std::min(value.v[c], param.max.v[c]);
+            }
+        }
+        if (param.value.sameValueAs(value)) {
+            return true;
+        }
+        param.value = value;
+        for (auto& node : mNodes) {
+            for (auto& in : node->inputs) {
+                if (in.paramIndex == (int)i) {
+                    in.constant = value;
+                    node->paramsChanged = true;
+                }
+            }
+        }
+        return true;
     }
     return false;
 }
@@ -116,11 +159,11 @@ bool Scene::render(FrameContext& ctx)
     }
 
     for (auto& node : mNodes) {
-        const bool isOutput = node.get() == mOutput;
-        if (node->alwaysEvaluate() || node->firstEvaluate || node->inputsDirty() ||
-            (isOutput && ctx.forcePresent)) {
+        if (node->alwaysEvaluate() || node->firstEvaluate ||
+            node->paramsChanged || node->inputsDirty()) {
             node->evaluate(ctx);
             node->firstEvaluate = false;
+            node->paramsChanged = false;
         }
     }
     return ctx.presented;

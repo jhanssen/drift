@@ -595,6 +595,47 @@ TEST_CASE("transform requires source and rejects unknown ports")
     CHECK(badPort.hasError("unknown input port 'skew'"));
 }
 
+TEST_CASE("setParameter validates, clamps, and splats")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "parameters": {
+            "intensity": { "type": "scalar", "default": 0.6, "min": 0, "max": 1 },
+            "offset": { "type": "vec2", "default": [0.5, 0.5] }
+        },
+        "nodes": [
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": "$intensity" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+
+    drift::core::Value v{};
+    v.type = drift::core::ValueType::Scalar;
+    v.v[0] = 0.25f;
+    CHECK(r.scene->setParameter("intensity", v));
+    CHECK(r.scene->parameters()[0].value.v[0] == 0.25f);
+
+    v.v[0] = 7.0f; // clamped to declared max
+    CHECK(r.scene->setParameter("intensity", v));
+    CHECK(r.scene->parameters()[0].value.v[0] == 1.0f);
+
+    CHECK_FALSE(r.scene->setParameter("nope", v));
+
+    // scalar splats to a vec2 parameter
+    v.v[0] = 0.3f;
+    CHECK(r.scene->setParameter("offset", v));
+    CHECK(r.scene->parameters()[1].value.type == drift::core::ValueType::Vec2);
+    CHECK(r.scene->parameters()[1].value.v[1] == 0.3f);
+
+    // vec2 into a scalar parameter is a type mismatch
+    drift::core::Value v2{};
+    v2.type = drift::core::ValueType::Vec2;
+    CHECK_FALSE(r.scene->setParameter("intensity", v2));
+}
+
 TEST_CASE("combine with only x bound is rejected")
 {
     auto r = load(R"({

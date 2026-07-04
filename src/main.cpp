@@ -3,6 +3,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -32,6 +33,8 @@ void usage(const char* argv0)
             "                     implies --headless if N is omitted)\n"
             "      --mouse X,Y    headless: fixed pointer position in [0,1]\n"
             "                     output space, active (default: inactive)\n"
+            "      --set NAME=V   override a scene parameter (V: number or\n"
+            "                     comma-separated components); repeatable\n"
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
             "      --out DIR      output directory for --headless (default .)\n"
@@ -43,10 +46,49 @@ void usage(const char* argv0)
             argv0);
 }
 
+using ParamOverride = std::pair<std::string, drift::core::Value>;
+
+// NAME=V where V is a number or 2-4 comma-separated components.
+bool parseParamOverride(const char* arg, ParamOverride& out)
+{
+    const char* eq = strchr(arg, '=');
+    if (!eq || eq == arg) {
+        return false;
+    }
+    out.first.assign(arg, eq - arg);
+    drift::core::Value& v = out.second;
+    int n = 0;
+    const char* p = eq + 1;
+    while (n < 4) {
+        char* end = nullptr;
+        v.v[n] = strtof(p, &end);
+        if (end == p) {
+            return false;
+        }
+        ++n;
+        if (*end == '\0') {
+            break;
+        }
+        if (*end != ',') {
+            return false;
+        }
+        p = end + 1;
+    }
+    switch (n) {
+    case 1: v.type = drift::core::ValueType::Scalar; break;
+    case 2: v.type = drift::core::ValueType::Vec2; break;
+    case 3: v.type = drift::core::ValueType::Vec3; break;
+    case 4: v.type = drift::core::ValueType::Vec4; break;
+    default: return false;
+    }
+    return true;
+}
+
 // Loads a .sceneproject directory (or a scene.json path) with project-root
 // confinement for asset reads.
 std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
-                                              const wgpu::Device& device)
+                                              const wgpu::Device& device,
+                                              const std::vector<ParamOverride>& overrides)
 {
     namespace fs = std::filesystem;
     fs::path root(scenePath);
@@ -108,6 +150,13 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
     }
     if (scene) {
+        for (const auto& [name, value] : overrides) {
+            if (!scene->setParameter(name, value)) {
+                fprintf(stderr, "drift: --set: no parameter '%s' of that type\n",
+                        name.c_str());
+                return nullptr;
+            }
+        }
         printf("drift: loaded scene '%s'\n", scene->name().c_str());
     }
     return scene;
@@ -123,7 +172,8 @@ struct MouseArg {
 
 int runHeadless(const std::string& scenePath, int frames, uint32_t width,
                 uint32_t height, const std::string& outDir,
-                const std::set<int>& writeFrames, const MouseArg& mouse)
+                const std::set<int>& writeFrames, const MouseArg& mouse,
+                const std::vector<ParamOverride>& overrides)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/false)) {
@@ -136,7 +186,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
     std::unique_ptr<drift::core::Scene> scene;
     drift::core::Renderer placeholder;
     if (!scenePath.empty()) {
-        scene = loadScene(scenePath, device);
+        scene = loadScene(scenePath, device, overrides);
         if (!scene) {
             return 1;
         }
@@ -157,6 +207,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
     bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
     wgpu::Buffer readback = device.CreateBuffer(&bd);
 
+    int presentedCount = 0;
     for (int i = 0; i < frames; ++i) {
         const float t = (float)i / 60.0f;
         if (scene) {
@@ -170,9 +221,12 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
             ctx.targetWidth = width;
             ctx.targetHeight = height;
             ctx.targetFormat = format;
-            scene->render(ctx);
+            if (scene->render(ctx)) {
+                ++presentedCount;
+            }
         } else {
             placeholder.render(texture.CreateView(), t);
+            ++presentedCount;
         }
 
         if (!writeFrames.empty() && !writeFrames.contains(i)) {
@@ -223,11 +277,15 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
         fprintf(stderr, "drift: GPU errors occurred during headless render\n");
         return 1;
     }
+    // Skipped frames left the target untouched, which is the efficiency
+    // contract working (§11) — golden.sh can assert on this line.
+    printf("drift: presented %d of %d frames\n", presentedCount, frames);
     return 0;
 }
 
 int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
-               uint32_t width, uint32_t height)
+               uint32_t width, uint32_t height,
+               const std::vector<ParamOverride>& overrides)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/true)) {
@@ -239,11 +297,14 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
         return 1;
     }
 
-    std::unique_ptr<drift::core::Scene> scene;
+    // Outputs can differ in size, so each gets its own scene instance (with
+    // its own graph state and clock); the first one reuses this validation
+    // load. nullptr in the map = a load that failed; don't retry per frame.
+    std::unique_ptr<drift::core::Scene> firstScene;
     drift::core::Renderer placeholder;
     if (!scenePath.empty()) {
-        scene = loadScene(scenePath, gpu.device());
-        if (!scene) {
+        firstScene = loadScene(scenePath, gpu.device(), overrides);
+        if (!firstScene) {
             return 1;
         }
     } else if (!placeholder.init(gpu.device(), app.targetFormat())) {
@@ -253,24 +314,44 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
 
     const wgpu::Device device = gpu.device();
     const wgpu::TextureFormat format = app.targetFormat();
-    return app.run([&](const wgpu::TextureView& target, uint32_t w, uint32_t h,
-                       float t) {
-        if (scene) {
+    const bool animated = !firstScene || firstScene->animated();
+
+    std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
+    app.setOutputRemoved([&scenes](uint32_t outputId) {
+        scenes.erase(outputId);
+    });
+
+    return app.run(
+        [&](const drift::platform::WaylandApp::FrameRequest& req) -> bool {
+            if (scenePath.empty()) {
+                placeholder.render(req.target, req.seconds);
+                return true;
+            }
+            auto it = scenes.find(req.outputId);
+            if (it == scenes.end()) {
+                it = scenes
+                         .emplace(req.outputId,
+                                  firstScene ? std::move(firstScene)
+                                             : loadScene(scenePath, device,
+                                                         overrides))
+                         .first;
+            }
+            if (!it->second) {
+                return false;
+            }
             drift::core::FrameContext ctx{};
             ctx.device = device;
-            ctx.seconds = t;
-            ctx.mouseX = app.mouseX();
-            ctx.mouseY = app.mouseY();
-            ctx.mouseActive = app.mouseActive();
-            ctx.target = target;
-            ctx.targetWidth = w;
-            ctx.targetHeight = h;
+            ctx.seconds = req.seconds;
+            ctx.mouseX = req.mouseX;
+            ctx.mouseY = req.mouseY;
+            ctx.mouseActive = req.mouseActive;
+            ctx.target = req.target;
+            ctx.targetWidth = req.width;
+            ctx.targetHeight = req.height;
             ctx.targetFormat = format;
-            scene->render(ctx);
-        } else {
-            placeholder.render(target, t);
-        }
-    });
+            return it->second->render(ctx);
+        },
+        animated);
 }
 
 } // namespace
@@ -284,6 +365,7 @@ int main(int argc, char** argv)
     std::string scenePath;
     std::set<int> writeFrames;
     MouseArg mouse;
+    std::vector<ParamOverride> overrides;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -307,6 +389,13 @@ int main(int argc, char** argv)
                 usage(argv[0]);
                 return 2;
             }
+        } else if (!strcmp(arg, "--set") && i + 1 < argc) {
+            ParamOverride override;
+            if (!parseParamOverride(argv[++i], override)) {
+                fprintf(stderr, "drift: bad --set '%s' (want NAME=V)\n", argv[i]);
+                return 2;
+            }
+            overrides.push_back(std::move(override));
         } else if (!strcmp(arg, "--mouse") && i + 1 < argc) {
             if (sscanf(argv[++i], "%f,%f", &mouse.x, &mouse.y) != 2) {
                 usage(argv[0]);
@@ -337,11 +426,11 @@ int main(int argc, char** argv)
     if (headlessFrames >= 0) {
         if (width == 0) { width = 1920; height = 1080; }
         return runHeadless(scenePath, headlessFrames, width, height, outDir,
-                           writeFrames, mouse);
+                           writeFrames, mouse, overrides);
     }
     if (width == 0) { width = 1280; height = 720; }
     return runWayland(scenePath,
                       windowed ? drift::platform::SurfaceMode::Windowed
                                : drift::platform::SurfaceMode::Wallpaper,
-                      width, height);
+                      width, height, overrides);
 }

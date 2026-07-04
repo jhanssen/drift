@@ -25,11 +25,10 @@ struct FrameContext {
     wgpu::TextureView target;
     uint32_t targetWidth = 0, targetHeight = 0;
     wgpu::TextureFormat targetFormat = wgpu::TextureFormat::Undefined;
-    // Scaffold: the platform double-buffers, so the output blit must run
-    // every frame even when nothing upstream changed. TODO: per-buffer
-    // content tracking so unchanged frames skip the blit and the commit.
-    bool forcePresent = true;
-    bool presented = false; // out: output node wrote ctx.target
+    // Out: the output node wrote ctx.target this frame. When false, the
+    // platform must not commit — the previously committed buffer already
+    // shows the current content (§11: present only when dirty).
+    bool presented = false;
 };
 
 class Node {
@@ -58,9 +57,13 @@ public:
 
     virtual ~Node() = default;
     virtual void evaluate(FrameContext& ctx) = 0;
-    // Input-source nodes (time) evaluate every frame and decide dirtiness
-    // themselves; everything else evaluates only when an input is dirty.
+    // Input-source nodes (time, mouse) evaluate every frame and decide
+    // dirtiness themselves; everything else evaluates only when an input is
+    // dirty.
     virtual bool alwaysEvaluate() const { return false; }
+    // True for nodes whose output advances with scene time (time, video):
+    // scenes containing one need frames even without external events.
+    virtual bool drivesFrames() const { return false; }
 
     Value inputValue(size_t index) const;
     bool inputsDirty() const;
@@ -69,6 +72,17 @@ public:
     std::vector<Input> inputs;
     std::vector<Output> outputs;
     bool firstEvaluate = true;
+    bool paramsChanged = false; // a bound scene parameter changed (§11)
+};
+
+// A user-tweakable scene parameter (§6): declaration metadata plus the
+// current value.
+struct SceneParam {
+    std::string name;
+    ValueType type = ValueType::Scalar;
+    Value value; // current (starts at the declared default)
+    Value min, max;
+    bool hasMin = false, hasMax = false;
 };
 
 // Reads a project-relative file (text or binary) into out. The platform
@@ -91,13 +105,27 @@ public:
 
     const std::string& name() const { return mName; }
 
+    // True if the scene needs a steady frame supply (contains time/video
+    // nodes). A non-animated scene only needs frames on external events
+    // (input, resize, parameter changes).
+    bool animated() const { return mAnimated; }
+
+    // Sets a user parameter (§6). Ports bound to it become dirty and their
+    // nodes re-execute on the next frame (§11). A scalar splats to vector
+    // parameters; values clamp to the declared min/max. Returns false for
+    // an unknown name or a type mismatch.
+    bool setParameter(const std::string& name, Value value);
+    const std::vector<SceneParam>& parameters() const { return mParams; }
+
 private:
     Scene() = default;
     friend struct SceneBuilder;
 
     std::string mName;
     std::vector<std::unique_ptr<Node>> mNodes; // topological order
+    std::vector<SceneParam> mParams;
     Node* mOutput = nullptr;
+    bool mAnimated = false;
     uint64_t mFrame = 0;
     uint32_t mLastWidth = 0, mLastHeight = 0;
     wgpu::TextureFormat mLastFormat = wgpu::TextureFormat::Undefined;

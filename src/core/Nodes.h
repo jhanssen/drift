@@ -16,6 +16,7 @@ public:
     TimeNode();
     void evaluate(FrameContext& ctx) override;
     bool alwaysEvaluate() const override { return true; }
+    bool drivesFrames() const override { return true; }
 
 private:
     float mLast = 0.0f;
@@ -93,6 +94,7 @@ public:
     void evaluate(FrameContext& ctx) override;
     // Frame advance is driven by scene time, not graph inputs.
     bool alwaysEvaluate() const override { return true; }
+    bool drivesFrames() const override { return true; }
 
 private:
     std::unique_ptr<VideoDecoder> mDecoder;

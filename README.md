@@ -4,12 +4,15 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: the full v1 node set works: image (PNG/JPEG), video (ffmpeg
-software decode; AV1/H.264/anything your ffmpeg has), shader, transform,
-compositor, wave, remap, combine, split, the implicit time/mouse inputs,
-and previous-frame feedback edges (`"previous": true`) for trails and
-iterative effects. Wayland (wlr-layer-shell compositors) only. Next:
-multi-monitor, VAAPI zero-copy decode, runtime parameter changes.
+Status: v1 feature-complete. Full node set — image (PNG/JPEG), video
+(ffmpeg software decode; AV1/H.264/anything your ffmpeg has), shader,
+transform, compositor, wave, remap, combine, split, the implicit
+time/mouse inputs, and previous-frame feedback edges (`"previous": true`)
+for trails and iterative effects. Wallpaper mode covers every output with
+runtime hotplug; the dirty-driven graph skips GPU work and commits when
+nothing changed (a static scene idles at zero GPU cost, and scene time
+freezes while occluded). Wayland (wlr-layer-shell compositors) only.
+Next: VAAPI zero-copy video, KTX2/WebP images, sync-fd presentation.
 
 ## Build
 
@@ -33,8 +36,9 @@ build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 
 Without a scene argument, a builtin placeholder gradient is rendered.
 `DRIFT_ADAPTER=<substring>` selects a specific GPU adapter by device name.
-Headless runs take `--mouse X,Y` to inject a fixed pointer position
-(scenes using `@mouse` stay deterministic and golden-testable).
+`--set name=value` overrides scene parameters (repeatable). Headless runs
+take `--mouse X,Y` to inject a fixed pointer position (scenes using
+`@mouse` stay deterministic and golden-testable).
 
 ## Test
 

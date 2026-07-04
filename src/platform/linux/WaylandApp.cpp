@@ -1,8 +1,11 @@
 #include "WaylandApp.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+
+#include <poll.h>
 
 #include <wayland-client.h>
 #include <drm_fourcc.h>
@@ -15,6 +18,8 @@ namespace drift::platform {
 
 namespace {
 
+using OutputSurface = WaylandApp::OutputSurface;
+
 // ---- C listener trampolines ----
 
 void registryGlobal(void* data, wl_registry*, uint32_t name,
@@ -22,7 +27,10 @@ void registryGlobal(void* data, wl_registry*, uint32_t name,
 {
     static_cast<WaylandApp*>(data)->onGlobal(name, interface, version);
 }
-void registryGlobalRemove(void*, wl_registry*, uint32_t) {}
+void registryGlobalRemove(void* data, wl_registry*, uint32_t name)
+{
+    static_cast<WaylandApp*>(data)->onGlobalRemove(name);
+}
 const wl_registry_listener kRegistryListener = { registryGlobal, registryGlobalRemove };
 
 void dmabufFormat(void*, zwp_linux_dmabuf_v1*, uint32_t) {} // deprecated, ignore
@@ -70,18 +78,21 @@ const xdg_wm_base_listener kWmBaseListener = { wmBasePing };
 
 void xdgSurfaceConfigure(void* data, xdg_surface*, uint32_t serial)
 {
-    static_cast<WaylandApp*>(data)->onXdgSurfaceConfigure(serial);
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onXdgSurfaceConfigure(surf, serial);
 }
 const xdg_surface_listener kXdgSurfaceListener = { xdgSurfaceConfigure };
 
 void toplevelConfigure(void* data, xdg_toplevel*, int32_t width, int32_t height,
                        wl_array*)
 {
-    static_cast<WaylandApp*>(data)->onToplevelConfigure(width, height);
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onToplevelConfigure(surf, width, height);
 }
 void toplevelClose(void* data, xdg_toplevel*)
 {
-    static_cast<WaylandApp*>(data)->onClosed();
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onSurfaceClosed(surf);
 }
 void toplevelConfigureBounds(void*, xdg_toplevel*, int32_t, int32_t) {}
 void toplevelWmCapabilities(void*, xdg_toplevel*, wl_array*) {}
@@ -92,18 +103,21 @@ const xdg_toplevel_listener kToplevelListener = {
 void layerConfigure(void* data, zwlr_layer_surface_v1*, uint32_t serial,
                     uint32_t width, uint32_t height)
 {
-    static_cast<WaylandApp*>(data)->onLayerConfigure(serial, width, height);
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onLayerConfigure(surf, serial, width, height);
 }
 void layerClosed(void* data, zwlr_layer_surface_v1*)
 {
-    static_cast<WaylandApp*>(data)->onClosed();
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onSurfaceClosed(surf);
 }
 const zwlr_layer_surface_v1_listener kLayerListener = { layerConfigure, layerClosed };
 
 void frameDone(void* data, wl_callback* callback, uint32_t)
 {
     wl_callback_destroy(callback);
-    static_cast<WaylandApp*>(data)->onFrameDone();
+    auto* surf = static_cast<OutputSurface*>(data);
+    surf->app->onFrameDone(surf);
 }
 const wl_callback_listener kFrameListener = { frameDone };
 
@@ -133,13 +147,11 @@ constexpr int kBufferCount = 2;
 
 WaylandApp::~WaylandApp()
 {
-    destroyRing();
+    while (!mSurfaces.empty()) {
+        destroyOutputSurface(mSurfaces.back().get());
+    }
     if (mPointer) wl_pointer_destroy(mPointer);
     if (mSeat) wl_seat_destroy(mSeat);
-    if (mLayerSurface) zwlr_layer_surface_v1_destroy(mLayerSurface);
-    if (mToplevel) xdg_toplevel_destroy(mToplevel);
-    if (mXdgSurface) xdg_surface_destroy(mXdgSurface);
-    if (mSurface) wl_surface_destroy(mSurface);
     if (mDmabuf) zwp_linux_dmabuf_v1_destroy(mDmabuf);
     if (mLayerShell) zwlr_layer_shell_v1_destroy(mLayerShell);
     if (mWmBase) xdg_wm_base_destroy(mWmBase);
@@ -170,7 +182,36 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         mSeat = (wl_seat*)wl_registry_bind(mRegistry, name, &wl_seat_interface,
                                            std::min(version, 2u));
         wl_seat_add_listener(mSeat, &kSeatListener, this);
+    } else if (!strcmp(interface, wl_output_interface.name)) {
+        if (mMode != SurfaceMode::Wallpaper) {
+            return;
+        }
+        auto* output = (wl_output*)wl_registry_bind(
+            mRegistry, name, &wl_output_interface, std::min(version, 2u));
+        if (mSetupDone) {
+            createOutputSurface(output, name); // hotplug
+        } else {
+            // The initial registry burst may announce outputs before
+            // wl_compositor / layer shell; setup() creates the surfaces
+            // after the roundtrips.
+            mPendingOutputs.emplace_back(output, name);
+        }
     }
+}
+
+void WaylandApp::onGlobalRemove(uint32_t name)
+{
+    for (auto& surf : mSurfaces) {
+        if (surf->id == name) {
+            destroyOutputSurface(surf.get());
+            return;
+        }
+    }
+}
+
+void WaylandApp::onDmabufModifier(uint32_t fourcc, uint64_t modifier)
+{
+    mCompositorModifiers[fourcc].push_back(modifier);
 }
 
 void WaylandApp::onSeatCapabilities(uint32_t capabilities)
@@ -182,85 +223,184 @@ void WaylandApp::onSeatCapabilities(uint32_t capabilities)
     } else if (!hasPointer && mPointer) {
         wl_pointer_destroy(mPointer);
         mPointer = nullptr;
-        mPointerOver = false;
+        mPointerSurface = nullptr;
+        for (auto& surf : mSurfaces) {
+            surf->pointerOver = false;
+        }
     }
+}
+
+WaylandApp::OutputSurface* WaylandApp::surfaceFor(wl_surface* surface)
+{
+    for (auto& surf : mSurfaces) {
+        if (surf->surface == surface) {
+            return surf.get();
+        }
+    }
+    return nullptr;
 }
 
 void WaylandApp::onPointerEnter(wl_surface* surface, double x, double y)
 {
-    if (surface != mSurface) {
+    OutputSurface* surf = surfaceFor(surface);
+    if (!surf) {
         return;
     }
-    mPointerOver = true;
-    mPointerSeen = true;
-    mPointerX = x;
-    mPointerY = y;
+    mPointerSurface = surface;
+    surf->pointerOver = true;
+    surf->pointerSeen = true;
+    surf->pointerX = x;
+    surf->pointerY = y;
+    surf->wantRedraw = true;
 }
 
 void WaylandApp::onPointerLeave(wl_surface* surface)
 {
-    if (surface == mSurface) {
-        mPointerOver = false;
+    OutputSurface* surf = surfaceFor(surface);
+    if (surf) {
+        surf->pointerOver = false;
+        surf->wantRedraw = true;
+    }
+    if (mPointerSurface == surface) {
+        mPointerSurface = nullptr;
     }
 }
 
 void WaylandApp::onPointerMotion(double x, double y)
 {
-    if (mPointerOver) {
-        mPointerX = x;
-        mPointerY = y;
+    OutputSurface* surf = mPointerSurface ? surfaceFor(mPointerSurface) : nullptr;
+    if (surf && surf->pointerOver) {
+        surf->pointerX = x;
+        surf->pointerY = y;
+        surf->wantRedraw = true;
     }
 }
 
-void WaylandApp::onDmabufModifier(uint32_t fourcc, uint64_t modifier)
+void WaylandApp::onXdgSurfaceConfigure(OutputSurface* surf, uint32_t serial)
 {
-    mCompositorModifiers[fourcc].push_back(modifier);
+    xdg_surface_ack_configure(surf->xdgSurface, serial);
+    surf->configured = true;
+    surf->wantRedraw = true;
 }
 
-void WaylandApp::onXdgSurfaceConfigure(uint32_t serial)
-{
-    xdg_surface_ack_configure(mXdgSurface, serial);
-    mConfigured = true;
-}
-
-void WaylandApp::onToplevelConfigure(int32_t width, int32_t height)
+void WaylandApp::onToplevelConfigure(OutputSurface* surf, int32_t width,
+                                     int32_t height)
 {
     if (width > 0 && height > 0) {
-        mPendingWidth = (uint32_t)width;
-        mPendingHeight = (uint32_t)height;
+        surf->pendingWidth = (uint32_t)width;
+        surf->pendingHeight = (uint32_t)height;
+        surf->wantRedraw = true;
     }
 }
 
-void WaylandApp::onLayerConfigure(uint32_t serial, uint32_t width, uint32_t height)
+void WaylandApp::onLayerConfigure(OutputSurface* surf, uint32_t serial,
+                                  uint32_t width, uint32_t height)
 {
-    zwlr_layer_surface_v1_ack_configure(mLayerSurface, serial);
+    zwlr_layer_surface_v1_ack_configure(surf->layerSurface, serial);
     if (width > 0 && height > 0) {
-        mPendingWidth = width;
-        mPendingHeight = height;
+        surf->pendingWidth = width;
+        surf->pendingHeight = height;
     }
-    mConfigured = true;
+    surf->configured = true;
+    surf->wantRedraw = true;
 }
 
-void WaylandApp::onClosed()
+void WaylandApp::onSurfaceClosed(OutputSurface* surf)
 {
-    mRunning = false;
+    if (mMode == SurfaceMode::Windowed) {
+        mRunning = false;
+        return;
+    }
+    destroyOutputSurface(surf);
+    // Keep running with zero surfaces: outputs may come back.
 }
 
-void WaylandApp::onFrameDone()
+void WaylandApp::onFrameDone(OutputSurface* surf)
 {
-    drawFrame();
+    surf->framePending = false;
+    drawFrame(*surf);
 }
 
 void WaylandApp::onBufferRelease(wl_buffer* buffer)
 {
-    for (auto& buf : mBuffers) {
-        if (buf.buffer == buffer) {
-            buf.busy = false;
+    for (auto& surf : mSurfaces) {
+        for (auto& buf : surf->buffers) {
+            if (buf.buffer == buffer) {
+                buf.busy = false;
+                if (surf->needRedraw) {
+                    surf->needRedraw = false;
+                    drawFrame(*surf);
+                }
+                return;
+            }
         }
     }
-    if (mNeedRedraw) {
-        mNeedRedraw = false;
-        drawFrame();
+}
+
+bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
+{
+    auto surf = std::make_unique<OutputSurface>();
+    surf->app = this;
+    surf->id = id;
+    surf->output = output;
+    surf->surface = wl_compositor_create_surface(mCompositor);
+
+    if (mMode == SurfaceMode::Wallpaper) {
+        surf->layerSurface = zwlr_layer_shell_v1_get_layer_surface(
+            mLayerShell, surf->surface, output,
+            ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "wallpaper");
+        zwlr_layer_surface_v1_add_listener(surf->layerSurface, &kLayerListener,
+                                           surf.get());
+        zwlr_layer_surface_v1_set_size(surf->layerSurface, 0, 0);
+        zwlr_layer_surface_v1_set_anchor(
+            surf->layerSurface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+        zwlr_layer_surface_v1_set_exclusive_zone(surf->layerSurface, -1);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(
+            surf->layerSurface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        printf("drift: output %u added\n", id);
+    } else {
+        surf->xdgSurface = xdg_wm_base_get_xdg_surface(mWmBase, surf->surface);
+        xdg_surface_add_listener(surf->xdgSurface, &kXdgSurfaceListener,
+                                 surf.get());
+        surf->toplevel = xdg_surface_get_toplevel(surf->xdgSurface);
+        xdg_toplevel_add_listener(surf->toplevel, &kToplevelListener, surf.get());
+        xdg_toplevel_set_title(surf->toplevel, "drift");
+        xdg_toplevel_set_app_id(surf->toplevel, "drift");
+        surf->pendingWidth = mInitialWidth;
+        surf->pendingHeight = mInitialHeight;
+    }
+
+    wl_surface_commit(surf->surface);
+    mSurfaces.push_back(std::move(surf));
+    return true;
+}
+
+void WaylandApp::destroyOutputSurface(OutputSurface* surf)
+{
+    destroyRing(*surf);
+    if (surf->layerSurface) zwlr_layer_surface_v1_destroy(surf->layerSurface);
+    if (surf->toplevel) xdg_toplevel_destroy(surf->toplevel);
+    if (surf->xdgSurface) xdg_surface_destroy(surf->xdgSurface);
+    if (surf->surface) wl_surface_destroy(surf->surface);
+    if (surf->output) wl_output_destroy(surf->output);
+    if (mPointerSurface == surf->surface) {
+        mPointerSurface = nullptr;
+    }
+
+    const uint32_t id = surf->id;
+    for (size_t i = 0; i < mSurfaces.size(); ++i) {
+        if (mSurfaces[i].get() == surf) {
+            mSurfaces.erase(mSurfaces.begin() + i);
+            break;
+        }
+    }
+    if (mMode == SurfaceMode::Wallpaper) {
+        printf("drift: output %u removed\n", id);
+    }
+    if (mOutputRemoved) {
+        mOutputRemoved(id);
     }
 }
 
@@ -268,8 +408,8 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
 {
     mGpu = &gpu;
     mMode = mode;
-    mPendingWidth = width;
-    mPendingHeight = height;
+    mInitialWidth = width;
+    mInitialHeight = height;
 
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -282,15 +422,13 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
     }
     mRegistry = wl_display_get_registry(mDisplay);
     wl_registry_add_listener(mRegistry, &kRegistryListener, this);
-    wl_display_roundtrip(mDisplay); // globals
-    wl_display_roundtrip(mDisplay); // dmabuf modifier events
+    wl_display_roundtrip(mDisplay); // globals (outputs may fail surface creation)
+    wl_display_roundtrip(mDisplay); // dmabuf modifier + output events
 
     if (!mCompositor || !mDmabuf) {
         fprintf(stderr, "drift: compositor lacks wl_compositor or zwp_linux_dmabuf_v1\n");
         return false;
     }
-
-    mSurface = wl_compositor_create_surface(mCompositor);
 
     if (mMode == SurfaceMode::Wallpaper) {
         if (!mLayerShell) {
@@ -299,33 +437,34 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
                     "(required for wallpaper mode; try --windowed)\n");
             return false;
         }
-        mLayerSurface = zwlr_layer_shell_v1_get_layer_surface(
-            mLayerShell, mSurface, nullptr /* compositor picks output */,
-            ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "wallpaper");
-        zwlr_layer_surface_v1_add_listener(mLayerSurface, &kLayerListener, this);
-        zwlr_layer_surface_v1_set_size(mLayerSurface, 0, 0);
-        zwlr_layer_surface_v1_set_anchor(
-            mLayerSurface,
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-        zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
-        zwlr_layer_surface_v1_set_keyboard_interactivity(
-            mLayerSurface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        for (auto& [output, name] : mPendingOutputs) {
+            createOutputSurface(output, name);
+        }
+        mPendingOutputs.clear();
+        if (mSurfaces.empty()) {
+            fprintf(stderr, "drift: no wl_output advertised\n");
+            return false;
+        }
     } else {
         if (!mWmBase) {
             fprintf(stderr, "drift: compositor lacks xdg_wm_base\n");
             return false;
         }
-        mXdgSurface = xdg_wm_base_get_xdg_surface(mWmBase, mSurface);
-        xdg_surface_add_listener(mXdgSurface, &kXdgSurfaceListener, this);
-        mToplevel = xdg_surface_get_toplevel(mXdgSurface);
-        xdg_toplevel_add_listener(mToplevel, &kToplevelListener, this);
-        xdg_toplevel_set_title(mToplevel, "drift");
-        xdg_toplevel_set_app_id(mToplevel, "drift");
+        if (!createOutputSurface(nullptr, 0)) {
+            return false;
+        }
     }
 
-    wl_surface_commit(mSurface);
-    while (!mConfigured && mRunning) {
+    // Wait for the initial configure of every surface created so far.
+    auto allConfigured = [this] {
+        for (const auto& surf : mSurfaces) {
+            if (!surf->configured) {
+                return false;
+            }
+        }
+        return !mSurfaces.empty();
+    };
+    while (!allConfigured() && mRunning) {
         if (wl_display_dispatch(mDisplay) == -1) {
             return false;
         }
@@ -334,18 +473,16 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
         return false;
     }
 
-    if (!chooseFormatAndCreateRing()) {
+    if (!chooseFormat()) {
         fprintf(stderr, "drift: no dmabuf format supported by both compositor and GPU\n");
         return false;
     }
+    mSetupDone = true;
     return true;
 }
 
-bool WaylandApp::chooseFormatAndCreateRing()
+bool WaylandApp::chooseFormat()
 {
-    mWidth = mPendingWidth;
-    mHeight = mPendingHeight;
-
     for (const auto& cand : kFormatCandidates) {
         auto it = mCompositorModifiers.find(cand.fourcc);
         if (it == mCompositorModifiers.end()) {
@@ -365,39 +502,45 @@ bool WaylandApp::chooseFormatAndCreateRing()
         if (mods.empty()) {
             continue;
         }
-
-        std::vector<Buffer> buffers(kBufferCount);
-        bool ok = true;
-        for (auto& buf : buffers) {
-            if (!mGpu->createTarget(mWidth, mHeight, cand.fourcc, mods, buf.target) ||
-                !createWlBuffer(buf)) {
-                ok = false;
-                break;
-            }
-        }
-        if (!ok) {
-            for (auto& buf : buffers) {
-                if (buf.buffer) wl_buffer_destroy(buf.buffer);
-                mGpu->destroyTarget(buf.target);
-            }
-            continue;
-        }
-
-        mBuffers = std::move(buffers);
+        mRingModifiers = std::move(mods);
         mFourcc = cand.fourcc;
         mFormat = cand.wgpu;
-
-        // The whole surface is opaque (background wallpaper).
-        wl_region* region = wl_compositor_create_region(mCompositor);
-        wl_region_add(region, 0, 0, (int32_t)mWidth, (int32_t)mHeight);
-        wl_surface_set_opaque_region(mSurface, region);
-        wl_region_destroy(region);
         return true;
     }
     return false;
 }
 
-bool WaylandApp::createWlBuffer(Buffer& buf)
+bool WaylandApp::createRing(OutputSurface& surf)
+{
+    surf.width = surf.pendingWidth;
+    surf.height = surf.pendingHeight;
+    if (surf.width == 0 || surf.height == 0) {
+        return false;
+    }
+
+    std::vector<Buffer> buffers(kBufferCount);
+    for (auto& buf : buffers) {
+        if (!mGpu->createTarget(surf.width, surf.height, mFourcc, mRingModifiers,
+                                buf.target) ||
+            !createWlBuffer(surf, buf)) {
+            for (auto& b : buffers) {
+                if (b.buffer) wl_buffer_destroy(b.buffer);
+                mGpu->destroyTarget(b.target);
+            }
+            return false;
+        }
+    }
+    surf.buffers = std::move(buffers);
+
+    // The whole surface is opaque (background wallpaper / dev window).
+    wl_region* region = wl_compositor_create_region(mCompositor);
+    wl_region_add(region, 0, 0, (int32_t)surf.width, (int32_t)surf.height);
+    wl_surface_set_opaque_region(surf.surface, region);
+    wl_region_destroy(region);
+    return true;
+}
+
+bool WaylandApp::createWlBuffer(OutputSurface&, Buffer& buf)
 {
     zwp_linux_buffer_params_v1* params = zwp_linux_dmabuf_v1_create_params(mDmabuf);
     for (size_t i = 0; i < buf.target.planes.size(); ++i) {
@@ -418,9 +561,9 @@ bool WaylandApp::createWlBuffer(Buffer& buf)
     return true;
 }
 
-void WaylandApp::destroyRing()
+void WaylandApp::destroyRing(OutputSurface& surf)
 {
-    for (auto& buf : mBuffers) {
+    for (auto& buf : surf.buffers) {
         if (buf.buffer) {
             wl_buffer_destroy(buf.buffer);
         }
@@ -428,7 +571,7 @@ void WaylandApp::destroyRing()
             mGpu->destroyTarget(buf.target);
         }
     }
-    mBuffers.clear();
+    surf.buffers.clear();
 }
 
 double WaylandApp::now() const
@@ -438,24 +581,25 @@ double WaylandApp::now() const
     return (ts.tv_sec + ts.tv_nsec * 1e-9) - mStartTime;
 }
 
-void WaylandApp::drawFrame()
+void WaylandApp::drawFrame(OutputSurface& surf)
 {
-    if (!mRunning) {
+    if (!mRunning || !surf.configured || !mSetupDone) {
         return;
     }
 
-    // Resize: reallocate the ring at the new size.
-    if (mPendingWidth != mWidth || mPendingHeight != mHeight) {
-        destroyRing();
-        if (!chooseFormatAndCreateRing()) {
-            fprintf(stderr, "drift: buffer reallocation after resize failed\n");
-            mRunning = false;
+    // First frame / resize: (re)allocate the ring at the pending size.
+    if (surf.buffers.empty() || surf.pendingWidth != surf.width ||
+        surf.pendingHeight != surf.height) {
+        destroyRing(surf);
+        if (!createRing(surf)) {
+            fprintf(stderr, "drift: buffer allocation failed for output %u\n",
+                    surf.id);
             return;
         }
     }
 
     Buffer* buf = nullptr;
-    for (auto& b : mBuffers) {
+    for (auto& b : surf.buffers) {
         if (!b.busy) {
             buf = &b;
             break;
@@ -463,27 +607,116 @@ void WaylandApp::drawFrame()
     }
     if (!buf) {
         // All buffers held by the compositor; redraw on next release.
-        mNeedRedraw = true;
+        surf.needRedraw = true;
         return;
     }
 
+    // Scene time advances by capped wall-clock deltas: across a pause
+    // (occlusion, lock — no frames drawn) it stays put, so scenes resume
+    // where they left off (SCENE_FORMAT.md §9.7).
+    const double t = now();
+    if (surf.lastDrawTime >= 0.0) {
+        surf.sceneTime += std::min(t - surf.lastDrawTime, 0.1);
+    }
+    surf.lastDrawTime = t;
+
+    FrameRequest request;
+    request.outputId = surf.id;
+    request.target = buf->target.texture.CreateView();
+    request.width = surf.width;
+    request.height = surf.height;
+    request.seconds = (float)surf.sceneTime;
+    request.mouseX = surf.pointerSeen && surf.width
+                         ? (float)(surf.pointerX / surf.width)
+                         : 0.5f;
+    request.mouseY = surf.pointerSeen && surf.height
+                         ? (float)(surf.pointerY / surf.height)
+                         : 0.5f;
+    request.mouseActive = surf.pointerOver;
+
     mGpu->beginFrame(buf->target);
-    mRenderFrame(buf->target.texture.CreateView(), mWidth, mHeight, (float)now());
+    const bool presented = mRenderFrame(request);
     mGpu->endFrame(buf->target);
 
-    wl_surface_attach(mSurface, buf->buffer, 0, 0);
-    wl_surface_damage_buffer(mSurface, 0, 0, INT32_MAX, INT32_MAX);
-    wl_callback* cb = wl_surface_frame(mSurface);
-    wl_callback_add_listener(cb, &kFrameListener, this);
-    wl_surface_commit(mSurface);
+    if (!presented) {
+        // Nothing changed: no commit, the compositor keeps showing the
+        // previously attached buffer. Animated scenes are re-ticked by the
+        // run loop's timer; everything else waits for events.
+        return;
+    }
+
+    wl_surface_attach(surf.surface, buf->buffer, 0, 0);
+    wl_surface_damage_buffer(surf.surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_callback* cb = wl_surface_frame(surf.surface);
+    wl_callback_add_listener(cb, &kFrameListener, &surf);
+    wl_surface_commit(surf.surface);
     buf->busy = true;
+    surf.framePending = true;
 }
 
-int WaylandApp::run(RenderFrame renderFrame)
+int WaylandApp::run(RenderFrame renderFrame, bool animated)
 {
     mRenderFrame = std::move(renderFrame);
-    drawFrame();
-    while (mRunning && wl_display_dispatch(mDisplay) != -1) {
+    mAnimated = animated;
+    for (auto& surf : mSurfaces) {
+        drawFrame(*surf);
+    }
+
+    const int fd = wl_display_get_fd(mDisplay);
+    while (mRunning) {
+        if (wl_display_dispatch_pending(mDisplay) < 0) {
+            return 1;
+        }
+        if (!mRunning) {
+            break;
+        }
+        for (size_t i = 0; i < mSurfaces.size(); ++i) {
+            OutputSurface* surf = mSurfaces[i].get();
+            if (!surf->framePending && surf->wantRedraw) {
+                surf->wantRedraw = false;
+                drawFrame(*surf);
+            }
+        }
+
+        while (wl_display_prepare_read(mDisplay) != 0) {
+            if (wl_display_dispatch_pending(mDisplay) < 0) {
+                return 1;
+            }
+        }
+        wl_display_flush(mDisplay);
+
+        // Animated scene with at least one surface not mid-commit: tick at
+        // ~60Hz so time keeps flowing — the ticks are CPU-side value-graph
+        // evaluations only unless something dirties. Otherwise sleep until
+        // an event or frame callback.
+        bool tick = false;
+        if (mAnimated) {
+            for (const auto& surf : mSurfaces) {
+                if (surf->configured && !surf->framePending) {
+                    tick = true;
+                    break;
+                }
+            }
+        }
+        const int timeout = tick ? 16 : -1;
+        pollfd pfd{ fd, POLLIN, 0 };
+        const int ready = poll(&pfd, 1, timeout);
+        if (ready > 0 && (pfd.revents & POLLIN)) {
+            wl_display_read_events(mDisplay);
+        } else {
+            wl_display_cancel_read(mDisplay);
+            if (ready < 0 && errno != EINTR) {
+                return 1;
+            }
+            if (ready == 0) {
+                for (size_t i = 0; i < mSurfaces.size(); ++i) {
+                    OutputSurface* surf = mSurfaces[i].get();
+                    if (!surf->framePending) {
+                        drawFrame(*surf);
+                    }
+                }
+            }
+        }
     }
     return 0;
 }

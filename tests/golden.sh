@@ -6,8 +6,10 @@
 #
 # The golden dir contains frame_NNNN.png files (which frames to render is
 # derived from their names) and optionally:
-#   size   - render resolution as WxH (default 320x180)
-#   mouse  - fixed pointer position as X,Y (passed as --mouse)
+#   size     - render resolution as WxH (default 320x180)
+#   mouse    - fixed pointer position as X,Y (passed as --mouse)
+#   presents - expected "presented N of M frames" count (efficiency
+#              contract: a static scene must present exactly once)
 #
 # Renders on the lavapipe software rasterizer by default so results are
 # reproducible across machines; set DRIFT_ADAPTER to override (imgcmp's
@@ -40,9 +42,17 @@ done
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
-"$drift" "$scene" --frames "$frames" --size "$size" --out "$out" "${mouse_args[@]}"
+log=$("$drift" "$scene" --frames "$frames" --size "$size" --out "$out" "${mouse_args[@]}")
+echo "$log"
 
 rc=0
+if [ -f "$golden/presents" ]; then
+    want="presented $(cat "$golden/presents") frames"
+    case "$log" in
+        *"$want"*) ;;
+        *) echo "golden.sh: FAIL: expected '$want' in output" >&2; rc=1 ;;
+    esac
+fi
 for f in "$golden"/frame_*.png; do
     "$imgcmp" "$out/$(basename "$f")" "$f" || rc=1
 done

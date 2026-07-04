@@ -15,12 +15,20 @@ namespace drift::core {
 struct SceneBuilder {
     static std::unique_ptr<Scene> make(std::string name,
                                        std::vector<std::unique_ptr<Node>> nodes,
+                                       std::vector<SceneParam> params,
                                        Node* output)
     {
         auto scene = std::unique_ptr<Scene>(new Scene());
         scene->mName = std::move(name);
         scene->mNodes = std::move(nodes);
+        scene->mParams = std::move(params);
         scene->mOutput = output;
+        for (const auto& node : scene->mNodes) {
+            if (node->drivesFrames()) {
+                scene->mAnimated = true;
+                break;
+            }
+        }
         return scene;
     }
 };
@@ -52,6 +60,8 @@ struct Param {
     std::string name;
     ValueType type;
     Value def;
+    Value min, max;
+    bool hasMin = false, hasMax = false;
 };
 
 bool validId(const std::string& s)
@@ -360,6 +370,30 @@ bool Loader::parseParameters(const glz::generic& json)
             const float s = param.def.v[0];
             param.def.type = param.type;
             param.def.v = { s, s, s, s };
+        }
+        // min/max (§6): optional, per-component for vectors, scalar splats.
+        auto bound = [&](const char* key, Value& out, bool& has) -> bool {
+            auto it = obj.find(key);
+            if (it == obj.end()) {
+                return true;
+            }
+            if (!parseLiteral(it->second, out) ||
+                (out.type != param.type && out.type != ValueType::Scalar)) {
+                fail("parameter '" + name + "': '" + std::string(key) +
+                     "' does not match type");
+                return false;
+            }
+            if (out.type == ValueType::Scalar && param.type != ValueType::Scalar) {
+                const float s = out.v[0];
+                out.type = param.type;
+                out.v = { s, s, s, s };
+            }
+            has = true;
+            return true;
+        };
+        if (!bound("min", param.min, param.hasMin) ||
+            !bound("max", param.max, param.hasMax)) {
+            return false;
         }
         mParamIndex[name] = (int)mParams.size();
         mParams.push_back(std::move(param));
@@ -1052,8 +1086,20 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         return nullptr;
     }
 
+    std::vector<SceneParam> params;
+    for (const auto& p : mParams) {
+        SceneParam sp;
+        sp.name = p.name;
+        sp.type = p.type;
+        sp.value = p.def;
+        sp.min = p.min;
+        sp.max = p.max;
+        sp.hasMin = p.hasMin;
+        sp.hasMax = p.hasMax;
+        params.push_back(std::move(sp));
+    }
     return SceneBuilder::make(nameIt->second.get_string(), std::move(mNodes),
-                              mOutput);
+                              std::move(params), mOutput);
 }
 
 } // namespace
