@@ -89,6 +89,8 @@ public:
     void evaluate(FrameContext& ctx) override;
 
     const std::vector<Track>& tracks() const { return mTracks; }
+    double duration() const { return mDuration; }
+    bool loop() const { return mLoop; }
 
 private:
     const double mDuration;

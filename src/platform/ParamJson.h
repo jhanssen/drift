@@ -9,9 +9,33 @@
 #include <string>
 #include <vector>
 
+#include "core/Nodes.h"
 #include "core/Scene.h"
 
 namespace drift::platform {
+
+// Copyable snapshot of a sequence node for describe (the native endpoint
+// hands describe data across a callback boundary by value).
+struct SequenceDesc {
+    std::string id;
+    double duration = 0.0;
+    bool loop = true;
+    std::vector<core::SequenceNode::Track> tracks;
+
+    static SequenceDesc from(const core::SequenceNode& node)
+    {
+        return { node.id, node.duration(), node.loop(), node.tracks() };
+    }
+};
+
+inline std::vector<SequenceDesc> sequenceDescs(const core::Scene& scene)
+{
+    std::vector<SequenceDesc> out;
+    for (const core::SequenceNode* node : scene.sequences()) {
+        out.push_back(SequenceDesc::from(*node));
+    }
+    return out;
+}
 
 inline std::string jsonEscape(const std::string& s)
 {
@@ -64,7 +88,8 @@ inline std::string valueJson(const core::Value& v)
 // The describe result (ControlServer.h): {"protocol":1,"scene":...}.
 inline std::string describeJson(bool loaded, const std::string& name,
                                 bool animated,
-                                const std::vector<core::SceneParam>& params)
+                                const std::vector<core::SceneParam>& params,
+                                const std::vector<SequenceDesc>& sequences)
 {
     std::string out = "{\"protocol\":1";
     if (!loaded) {
@@ -99,6 +124,46 @@ inline std::string describeJson(bool loaded, const std::string& name,
             out += ",\"hint\":\"" + jsonEscape(p.hint) + "\"";
         }
         out += "}";
+    }
+    out += "]";
+
+    // Sequence timelines (§9.9) — what the editor's timeline panel draws.
+    out += ",\"sequences\":[";
+    for (size_t i = 0; i < sequences.size(); ++i) {
+        const SequenceDesc& seq = sequences[i];
+        if (i) {
+            out += ",";
+        }
+        out += "{\"id\":\"" + jsonEscape(seq.id) + "\"";
+        out += ",\"duration\":" + numberJson(seq.duration);
+        out += ",\"loop\":";
+        out += seq.loop ? "true" : "false";
+        out += ",\"tracks\":[";
+        for (size_t t = 0; t < seq.tracks.size(); ++t) {
+            const core::SequenceNode::Track& track = seq.tracks[t];
+            if (t) {
+                out += ",";
+            }
+            out += "{\"name\":\"" + jsonEscape(track.name) + "\"";
+            out += ",\"kind\":\"value\",\"type\":\"";
+            out += core::valueTypeName(track.type);
+            out += "\",\"interpolate\":\"";
+            switch (track.interpolate) {
+            case core::SequenceNode::Interpolate::Hold: out += "hold"; break;
+            case core::SequenceNode::Interpolate::Linear: out += "linear"; break;
+            case core::SequenceNode::Interpolate::Smooth: out += "smooth"; break;
+            }
+            out += "\",\"keys\":[";
+            for (size_t k = 0; k < track.keys.size(); ++k) {
+                if (k) {
+                    out += ",";
+                }
+                out += "{\"t\":" + numberJson(track.keys[k].t);
+                out += ",\"value\":" + valueJson(track.keys[k].value) + "}";
+            }
+            out += "]}";
+        }
+        out += "]}";
     }
     return out + "]}";
 }

@@ -127,6 +127,13 @@ public:
     bool setParameter(const std::string& name, Value value);
     const std::vector<SceneParam>& parameters() const { return mParams; }
 
+    // Sequence timelines (§9.9), read-only — the editor's timeline panel
+    // is built from these. Pointers stay valid for the scene's lifetime.
+    const std::vector<class SequenceNode*>& sequences() const
+    {
+        return mSequences;
+    }
+
 private:
     Scene() = default;
     friend struct SceneBuilder;
@@ -134,6 +141,7 @@ private:
     std::string mName;
     std::vector<std::unique_ptr<Node>> mNodes; // topological order
     std::vector<SceneParam> mParams;
+    std::vector<class SequenceNode*> mSequences; // owned via mNodes
     Node* mOutput = nullptr;
     bool mAnimated = false;
     uint64_t mFrame = 0;

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "core/Scene.h"
+#include "platform/ParamJson.h"
 
 namespace drift::platform {
 
@@ -33,6 +34,7 @@ public:
         std::string name;
         bool animated = false;
         std::vector<core::SceneParam> parameters;
+        std::vector<SequenceDesc> sequences;
         bool loaded = false;
     };
     struct Callbacks {

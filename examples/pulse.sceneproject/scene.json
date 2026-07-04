@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "name": "Pulse",
+  "description": "A breathing beacon driven by a sequence timeline.",
+  "parameters": {
+    "intensity": { "type": "scalar", "default": 1, "min": 0, "max": 2,
+                   "label": "Intensity" }
+  },
+  "nodes": [
+    { "id": "seq", "type": "sequence", "duration": 8, "loop": true,
+      "tracks": [
+        { "name": "level", "kind": "value", "type": "scalar", "interpolate": "smooth",
+          "keys": [ { "t": 0, "value": 0.15 }, { "t": 2, "value": 1 },
+                    { "t": 4, "value": 0.35 }, { "t": 6, "value": 0.9 },
+                    { "t": 8, "value": 0.15 } ] },
+        { "name": "warm", "kind": "value", "type": "scalar", "interpolate": "hold",
+          "keys": [ { "t": 0, "value": 0 }, { "t": 4, "value": 1 } ] }
+      ],
+      "inputs": { "time": "@time.seconds" } },
+    { "id": "glow", "type": "shader", "shader": "shaders/pulse.wgsl",
+      "inputs": { "level": "@seq.level", "warm": "@seq.warm",
+                  "intensity": "$intensity" } },
+    { "id": "out", "type": "output", "inputs": { "color": "@glow" } }
+  ]
+}

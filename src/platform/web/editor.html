@@ -17,6 +17,12 @@
   main { display: flex; flex-direction: column; min-width: 0; }
   #canvas { flex: 1; width: 100%; min-height: 0; display: block;
             background: #000; }
+  #timeline { border-top: 1px solid var(--edge); background: var(--panel);
+              max-height: 280px; overflow-y: auto; padding: 8px 12px; }
+  #timeline .dim { color: var(--dim); }
+  #timeline h3 { font-size: 11px; margin: 6px 0 4px; color: var(--dim);
+                 font-weight: normal; letter-spacing: .04em; }
+  #timeline canvas { display: block; width: 100%; }
   #statusbar { padding: 6px 12px; border-top: 1px solid var(--edge);
                color: var(--dim); display: flex; gap: 18px;
                white-space: nowrap; overflow: hidden; }
@@ -47,6 +53,7 @@
 <body>
 <main>
   <canvas id="canvas"></canvas>
+  <div id="timeline"><span class="dim">no scene yet</span></div>
   <div id="statusbar">
     <span id="wasmStatus">preview: starting…</span>
     <span id="liveStatus">live: not connected</span>
@@ -83,7 +90,7 @@
 
 // ---- wasm preview runtime (same artifacts as drift.html) -----------------
 
-const SCENES = ['plasma', 'buoy', 'follow', 'trail'];
+const SCENES = ['plasma', 'buoy', 'follow', 'trail', 'pulse'];
 const query = new URLSearchParams(location.search);
 const sceneName = query.get('scene') || SCENES[0];
 
@@ -110,8 +117,10 @@ var Module = {
     const describe = Module.cwrap('drift_describe', 'string', []);
     const set = Module.cwrap('drift_set_parameter', 'number',
         ['string', 'number', 'number', 'number', 'number', 'number']);
+    const time = Module.cwrap('drift_time', 'number', []);
     wasm = {
       describe,
+      time,
       set(name, v) {
         return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
       },
@@ -227,7 +236,171 @@ function applyParam(name, values, { fromRemote = false } = {}) {
   widgets.get(name)?.update(values);
 }
 
+// ---- timeline panel (§16.5 editor mapping; read-only in v0) --------------
+
+const LANE_COLORS = ['#6aa1ff', '#7fd490', '#e3c56d', '#e0787d'];
+const RULER_H = 18, LANE_H = 42, GUTTER_W = 96;
+let timelines = []; // { seq, canvas }
+
+function refreshTimeline() {
+  const container = document.getElementById('timeline');
+  const seqs = activeManifest()?.sequences ?? [];
+  container.textContent = '';
+  timelines = [];
+  if (!seqs.length) {
+    container.innerHTML =
+        '<span class="dim">no sequence nodes in this scene</span>';
+    return;
+  }
+  for (const seq of seqs) {
+    const header = document.createElement('h3');
+    header.textContent =
+        `${seq.id} — ${seq.duration}s${seq.loop ? ' · loop' : ''}`;
+    const canvas = document.createElement('canvas');
+    container.appendChild(header);
+    container.appendChild(canvas);
+    timelines.push({ seq, canvas });
+  }
+  console.log(`editor: timeline: ${seqs.length} sequence(s)`);
+}
+
+// Track sampling mirrors core semantics (§9.9): hold/linear/smooth, first
+// key's value before it, last key's after, no wrap interpolation.
+function sampleTrack(track, t) {
+  const keys = track.keys;
+  let k = 0;
+  while (k + 1 < keys.length && keys[k + 1].t <= t) {
+    k++;
+  }
+  const a = [].concat(keys[k].value);
+  if (track.interpolate === 'hold' || k + 1 >= keys.length ||
+      t <= keys[k].t) {
+    return a;
+  }
+  const b = [].concat(keys[k + 1].value);
+  let f = (t - keys[k].t) / (keys[k + 1].t - keys[k].t);
+  if (track.interpolate === 'smooth') {
+    f = f * f * (3 - 2 * f);
+  }
+  return a.map((v, i) => v + (b[i] - v) * f);
+}
+
+function drawTimeline({ seq, canvas }, playTime) {
+  const dpr = devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || canvas.parentElement.clientWidth;
+  const cssH = RULER_H + seq.tracks.length * LANE_H;
+  canvas.style.height = cssH + 'px';
+  if (canvas.width !== Math.round(cssW * dpr) ||
+      canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const plotW = cssW - GUTTER_W;
+  const xOf = (t) => GUTTER_W + (t / seq.duration) * plotW;
+
+  // Ruler: a tick per second, labels as space allows.
+  ctx.font = '10px system-ui';
+  ctx.fillStyle = '#8a8f98';
+  ctx.strokeStyle = '#2c3038';
+  const labelEvery = Math.max(1, Math.ceil(seq.duration / (plotW / 42)));
+  for (let s = 0; s <= seq.duration; s++) {
+    const x = xOf(s);
+    ctx.beginPath();
+    ctx.moveTo(x, RULER_H - 5);
+    ctx.lineTo(x, cssH);
+    ctx.stroke();
+    if (s % labelEvery === 0) {
+      ctx.fillText(`${s}s`, x + 3, RULER_H - 7);
+    }
+  }
+
+  seq.tracks.forEach((track, lane) => {
+    const top = RULER_H + lane * LANE_H;
+    const bottom = top + LANE_H - 8;
+    const height = bottom - (top + 8);
+
+    ctx.strokeStyle = '#2c3038';
+    ctx.beginPath();
+    ctx.moveTo(0, top + LANE_H);
+    ctx.lineTo(cssW, top + LANE_H);
+    ctx.stroke();
+    ctx.fillStyle = '#d6d9de';
+    ctx.font = '11px system-ui';
+    ctx.fillText(track.name, 8, top + 14);
+    ctx.fillStyle = '#8a8f98';
+    ctx.font = '9px system-ui';
+    ctx.fillText(track.interpolate, 8, top + 26);
+
+    // Value range across all keys/components, padded.
+    const flat = track.keys.flatMap((key) => [].concat(key.value));
+    let vmin = Math.min(...flat), vmax = Math.max(...flat);
+    if (vmin === vmax) {
+      vmin -= 0.5;
+      vmax += 0.5;
+    }
+    const pad = (vmax - vmin) * 0.12;
+    vmin -= pad;
+    vmax += pad;
+    const yOf = (v) => bottom - ((v - vmin) / (vmax - vmin)) * height;
+
+    const arity = [].concat(track.keys[0].value).length;
+    for (let c = 0; c < arity; c++) {
+      ctx.strokeStyle = LANE_COLORS[c];
+      ctx.beginPath();
+      // Sampled polyline reproduces hold steps and smooth curves alike.
+      const steps = Math.max(64, plotW / 3);
+      for (let i = 0; i <= steps; i++) {
+        const t = (i / steps) * seq.duration;
+        const y = yOf(sampleTrack(track, t)[c]);
+        i ? ctx.lineTo(xOf(t), y) : ctx.moveTo(xOf(t), y);
+        if (track.interpolate === 'hold') {
+          // Re-sample just past each step edge to keep risers vertical.
+          const next = sampleTrack(track, Math.min(t + 1e-9, seq.duration));
+          ctx.lineTo(xOf(t), yOf(next[c]));
+        }
+      }
+      ctx.stroke();
+      ctx.fillStyle = LANE_COLORS[c];
+      for (const key of track.keys) {
+        const x = xOf(key.t), y = yOf([].concat(key.value)[c]);
+        ctx.beginPath();
+        ctx.moveTo(x, y - 4);
+        ctx.lineTo(x + 4, y);
+        ctx.lineTo(x, y + 4);
+        ctx.lineTo(x - 4, y);
+        ctx.fill();
+      }
+    }
+  });
+
+  if (playTime !== null) {
+    const local = seq.loop
+        ? ((playTime % seq.duration) + seq.duration) % seq.duration
+        : Math.min(Math.max(playTime, 0), seq.duration);
+    ctx.strokeStyle = '#e0787d';
+    ctx.beginPath();
+    ctx.moveTo(xOf(local), 4);
+    ctx.lineTo(xOf(local), cssH);
+    ctx.stroke();
+  }
+}
+
+(function tickTimelines() {
+  if (timelines.length) {
+    const t = wasm && wasmManifest ? wasm.time() : null;
+    for (const timeline of timelines) {
+      drawTimeline(timeline, t);
+    }
+  }
+  requestAnimationFrame(tickTimelines);
+})();
+
 function refreshPanel() {
+  refreshTimeline();
   const manifest = activeManifest();
   const container = document.getElementById('params');
   const mismatch = document.getElementById('mismatch');

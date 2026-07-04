@@ -350,6 +350,7 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                 info.name = scene->name();
                 info.animated = scene->animated();
                 info.parameters = scene->parameters();
+                info.sequences = drift::platform::sequenceDescs(*scene);
             }
             return info;
         };

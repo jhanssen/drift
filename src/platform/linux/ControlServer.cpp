@@ -384,8 +384,9 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
 
     if (method == "describe") {
         const SceneInfo info = mCallbacks.describe();
-        respond("\"result\":" + describeJson(info.loaded, info.name,
-                                             info.animated, info.parameters));
+        respond("\"result\":" +
+                describeJson(info.loaded, info.name, info.animated,
+                             info.parameters, info.sequences));
         return;
     }
 

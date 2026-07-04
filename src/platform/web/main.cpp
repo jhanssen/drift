@@ -43,6 +43,7 @@ struct App {
     std::unique_ptr<drift::core::Scene> scene;
 
     double startMs = -1.0;
+    double lastSeconds = 0.0;
     float mouseX = 0.5f, mouseY = 0.5f;
     bool mouseActive = false;
     bool warnedNotPresenting = false;
@@ -161,6 +162,7 @@ bool onFrame(double nowMs, void*)
     drift::core::FrameContext ctx{};
     ctx.device = gApp.device;
     ctx.seconds = (nowMs - gApp.startMs) / 1000.0;
+    gApp.lastSeconds = ctx.seconds;
     ctx.mouseX = gApp.mouseX;
     ctx.mouseY = gApp.mouseY;
     ctx.mouseActive = gApp.mouseActive;
@@ -294,8 +296,16 @@ EMSCRIPTEN_KEEPALIVE const char* drift_describe()
         scene != nullptr, scene ? scene->name() : std::string(),
         scene && scene->animated(),
         scene ? scene->parameters()
-              : std::vector<drift::core::SceneParam>());
+              : std::vector<drift::core::SceneParam>(),
+        scene ? drift::platform::sequenceDescs(*scene)
+              : std::vector<drift::platform::SequenceDesc>());
     return json.c_str();
+}
+
+// Current scene time in seconds — drives the editor's timeline playhead.
+EMSCRIPTEN_KEEPALIVE double drift_time()
+{
+    return gApp.lastSeconds;
 }
 
 // count selects scalar (1) through vec4 (4). Returns 0 for an unknown

@@ -16,12 +16,14 @@ struct SceneBuilder {
     static std::unique_ptr<Scene> make(std::string name,
                                        std::vector<std::unique_ptr<Node>> nodes,
                                        std::vector<SceneParam> params,
+                                       std::vector<SequenceNode*> sequences,
                                        Node* output)
     {
         auto scene = std::unique_ptr<Scene>(new Scene());
         scene->mName = std::move(name);
         scene->mNodes = std::move(nodes);
         scene->mParams = std::move(params);
+        scene->mSequences = std::move(sequences);
         scene->mOutput = output;
         for (const auto& node : scene->mNodes) {
             if (node->drivesFrames()) {
@@ -1362,6 +1364,8 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
                  "node and will never run");
         }
     }
+    std::erase_if(mSequences,
+                  [&](SequenceNode* seq) { return !reachable[seq]; });
     mNodes = std::move(kept);
 
     std::vector<SceneParam> params;
@@ -1380,7 +1384,8 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         params.push_back(std::move(sp));
     }
     return SceneBuilder::make(nameIt->second.get_string(), std::move(mNodes),
-                              std::move(params), mOutput);
+                              std::move(params), std::move(mSequences),
+                              mOutput);
 }
 
 } // namespace
