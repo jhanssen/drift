@@ -15,6 +15,7 @@
 
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/linux/ControlServer.h"
 #include "platform/linux/Gpu.h"
 #include "platform/linux/VideoDecoderFFmpeg.h"
 #include "platform/linux/WaylandApp.h"
@@ -38,6 +39,8 @@ void usage(const char* argv0)
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
             "      --out DIR      output directory for --headless (default .)\n"
+            "      --listen PORT  WebSocket control endpoint on 127.0.0.1:PORT\n"
+            "                     (describe/set; not available with --headless)\n"
             "  -h, --help         show this help\n"
             "\n"
             "Without a scene, renders a builtin placeholder gradient.\n"
@@ -288,7 +291,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
 
 int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                uint32_t width, uint32_t height,
-               const std::vector<ParamOverride>& overrides)
+               const std::vector<ParamOverride>& overrides, uint16_t listenPort)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/true)) {
@@ -323,6 +326,73 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     app.setOutputRemoved([&scenes](uint32_t outputId) {
         scenes.erase(outputId);
     });
+
+    // Control endpoint (--listen): parameters are shared across outputs
+    // (§17.6), so a set applies to every instance.
+    drift::platform::ControlServer control;
+    if (listenPort) {
+        auto anyScene = [&]() -> drift::core::Scene* {
+            if (firstScene) {
+                return firstScene.get();
+            }
+            for (auto& [id, scene] : scenes) {
+                if (scene) {
+                    return scene.get();
+                }
+            }
+            return nullptr;
+        };
+        drift::platform::ControlServer::Callbacks callbacks;
+        callbacks.describe = [anyScene] {
+            drift::platform::ControlServer::SceneInfo info;
+            if (drift::core::Scene* scene = anyScene()) {
+                info.loaded = true;
+                info.name = scene->name();
+                info.animated = scene->animated();
+                info.parameters = scene->parameters();
+            }
+            return info;
+        };
+        callbacks.setParameter = [anyScene, &firstScene, &scenes, &app](
+                                     const std::string& name,
+                                     const drift::core::Value& value,
+                                     std::string& error,
+                                     drift::core::Value& applied) {
+            drift::core::Scene* any = anyScene();
+            if (!any) {
+                error = "no scene loaded";
+                return false;
+            }
+            bool ok = false;
+            if (firstScene) {
+                ok = firstScene->setParameter(name, value);
+            }
+            for (auto& [id, scene] : scenes) {
+                if (scene) {
+                    ok = scene->setParameter(name, value) || ok;
+                }
+            }
+            if (!ok) {
+                error = "no parameter '" + name + "' of that type";
+                return false;
+            }
+            for (const auto& p : any->parameters()) {
+                if (p.name == name) {
+                    applied = p.value; // post-clamp (§6)
+                    break;
+                }
+            }
+            app.requestRedrawAll();
+            return true;
+        };
+        std::string error;
+        if (!control.start(listenPort, std::move(callbacks), error)) {
+            fprintf(stderr, "drift: control: %s\n", error.c_str());
+            return 1;
+        }
+        app.setControl(control.fd(), [&control] { control.drive(); });
+        printf("drift: control on ws://127.0.0.1:%u\n", listenPort);
+    }
 
     return app.run(
         [&](const drift::platform::WaylandApp::FrameRequest& req) -> bool {
@@ -363,6 +433,7 @@ int main(int argc, char** argv)
 {
     bool windowed = false;
     int headlessFrames = -1;
+    uint16_t listenPort = 0;
     uint32_t width = 0, height = 0;
     std::string outDir = ".";
     std::string scenePath;
@@ -412,6 +483,14 @@ int main(int argc, char** argv)
             }
         } else if (!strcmp(arg, "--out") && i + 1 < argc) {
             outDir = argv[++i];
+        } else if (!strcmp(arg, "--listen") && i + 1 < argc) {
+            char* end = nullptr;
+            const long port = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || port < 1 || port > 65535) {
+                fprintf(stderr, "drift: bad --listen port '%s'\n", argv[i]);
+                return 2;
+            }
+            listenPort = (uint16_t)port;
         } else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(argv[0]);
             return 0;
@@ -427,6 +506,10 @@ int main(int argc, char** argv)
         headlessFrames = *writeFrames.rbegin() + 1;
     }
     if (headlessFrames >= 0) {
+        if (listenPort) {
+            fprintf(stderr, "drift: --listen is not available with --headless\n");
+            return 2;
+        }
         if (width == 0) { width = 1920; height = 1080; }
         return runHeadless(scenePath, headlessFrames, width, height, outDir,
                            writeFrames, mouse, overrides);
@@ -435,5 +518,5 @@ int main(int argc, char** argv)
     return runWayland(scenePath,
                       windowed ? drift::platform::SurfaceMode::Windowed
                                : drift::platform::SurfaceMode::Wallpaper,
-                      width, height, overrides);
+                      width, height, overrides, listenPort);
 }

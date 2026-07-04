@@ -87,9 +87,11 @@ endif()
 set(WLGEN src/platform/linux/wayland-generated)
 add_executable(drift
     src/main.cpp
+    src/platform/linux/ControlServer.cpp
     src/platform/linux/Gpu.cpp
     src/platform/linux/WaylandApp.cpp
     src/platform/linux/VideoDecoderFFmpeg.cpp
+    src/platform/linux/WsCodec.cpp
     ${WLGEN}/xdg-shell-protocol.c
     ${WLGEN}/wlr-layer-shell-unstable-v1-protocol.c
     ${WLGEN}/linux-dmabuf-v1-protocol.c
@@ -107,6 +109,7 @@ target_include_directories(drift PRIVATE
 )
 target_link_libraries(drift PRIVATE
     drift_core
+    glaze::glaze
     ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES}
     ${LIBDRM_LIBRARIES}
@@ -132,6 +135,8 @@ if(BUILD_TESTING)
         tests/unit/scene_loader_test.cpp
         tests/unit/value_precision_test.cpp
         tests/unit/sequence_test.cpp
+        tests/unit/ws_codec_test.cpp
+        src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
     add_test(NAME unit COMMAND drift_tests)

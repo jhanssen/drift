@@ -78,6 +78,25 @@ public:
     using OutputRemoved = std::function<void(uint32_t)>;
     void setOutputRemoved(OutputRemoved cb) { mOutputRemoved = std::move(cb); }
 
+    // External control endpoint (ControlServer): fd is polled alongside the
+    // display and cb runs when it is readable. The server owns its own
+    // epoll set, so one fd covers all of its connections.
+    void setControl(int fd, std::function<void()> cb)
+    {
+        mControlFd = fd;
+        mControlCb = std::move(cb);
+    }
+
+    // Requests a redraw on every surface (a parameter changed): the frame
+    // evaluates the graph, which decides what actually re-executes (§11) —
+    // for non-animated scenes this is the only wakeup a set would get.
+    void requestRedrawAll()
+    {
+        for (auto& surf : mSurfaces) {
+            surf->wantRedraw = true;
+        }
+    }
+
     // Frame loop until the (windowed) surface is closed. animated: the
     // scene advances with time, so frames are produced continuously
     // (frame-callback throttled, timer-ticked while nothing commits);
@@ -188,6 +207,8 @@ private:
     bool mAnimated = false;
     RenderFrame mRenderFrame;
     OutputRemoved mOutputRemoved;
+    int mControlFd = -1;
+    std::function<void()> mControlCb;
     double mStartTime = 0.0;
 };
 

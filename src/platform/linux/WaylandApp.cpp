@@ -851,9 +851,10 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
             }
         }
         const int timeout = tick ? 16 : -1;
-        pollfd pfd{ fd, POLLIN, 0 };
-        const int ready = poll(&pfd, 1, timeout);
-        if (ready > 0 && (pfd.revents & POLLIN)) {
+        pollfd pfds[2] = { { fd, POLLIN, 0 }, { mControlFd, POLLIN, 0 } };
+        const nfds_t nfds = mControlFd >= 0 ? 2 : 1;
+        const int ready = poll(pfds, nfds, timeout);
+        if (ready > 0 && (pfds[0].revents & POLLIN)) {
             wl_display_read_events(mDisplay);
         } else {
             wl_display_cancel_read(mDisplay);
@@ -868,6 +869,10 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
                     }
                 }
             }
+        }
+        if (ready > 0 && nfds == 2 && (pfds[1].revents & (POLLIN | POLLHUP)) &&
+            mControlCb) {
+            mControlCb();
         }
     }
     return 0;
