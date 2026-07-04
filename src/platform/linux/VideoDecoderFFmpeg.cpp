@@ -8,9 +8,13 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
+
+#include <cstdlib>
+#include <cstring>
 
 namespace drift::platform {
 
@@ -47,6 +51,9 @@ public:
         if (mCodec) {
             avcodec_free_context(&mCodec);
         }
+        if (mHwDevice) {
+            av_buffer_unref(&mHwDevice);
+        }
         if (mFormat) {
             avformat_close_input(&mFormat);
         }
@@ -80,6 +87,37 @@ public:
             error = "cannot configure decoder";
             return false;
         }
+        // The stream's default decoder can be a pure software externa-lib
+        // decoder (AV1 defaults to libdav1d, which has no hwaccel configs);
+        // hardware decode may need a different decoder for the same codec.
+        if (const AVCodec* hwCodec = setupHwDecode(codec)) {
+            if (hwCodec != codec) {
+                codec = hwCodec;
+                avcodec_free_context(&mCodec);
+                mCodec = avcodec_alloc_context3(codec);
+                if (!mCodec ||
+                    avcodec_parameters_to_context(
+                        mCodec, mFormat->streams[mStream]->codecpar) < 0) {
+                    error = "cannot configure decoder";
+                    return false;
+                }
+            }
+            mCodec->hw_device_ctx = av_buffer_ref(mHwDevice);
+            mCodec->opaque = this;
+            mCodec->get_format = [](AVCodecContext* ctx,
+                                    const AVPixelFormat* formats) {
+                auto* self = (FFmpegVideoDecoder*)ctx->opaque;
+                for (const AVPixelFormat* f = formats; *f != AV_PIX_FMT_NONE;
+                     ++f) {
+                    if (*f == self->mHwFormat) {
+                        return *f;
+                    }
+                }
+                // Hardware path not offered (e.g. unsupported profile):
+                // decode in software.
+                return formats[0];
+            };
+        }
         ret = avcodec_open2(mCodec, codec, nullptr);
         if (ret < 0) {
             error = ffmpegError(ret);
@@ -96,6 +134,78 @@ public:
 
         mThread = std::thread([this] { decodeLoop(); });
         return true;
+    }
+
+    // Picks a hardware decode backend per DRIFT_HWDEC (auto|vaapi|cuda|off;
+    // default auto: VAAPI then CUDA) and the decoder implementation that can
+    // drive it. Returns null for software decode (and logs the choice).
+    // Decoded frames transfer back to system memory once and feed the same
+    // swscale path as software; stage two (VAAPI dmabuf zero-copy) builds on
+    // this.
+    const AVCodec* setupHwDecode(const AVCodec* streamCodec)
+    {
+        const char* pref = getenv("DRIFT_HWDEC");
+        if (pref && !strcmp(pref, "off")) {
+            printf("drift: video decode: software\n");
+            return nullptr;
+        }
+        struct Backend {
+            AVHWDeviceType type;
+            const char* name;
+        };
+        const Backend backends[] = {
+            { AV_HWDEVICE_TYPE_VAAPI, "vaapi" },
+            { AV_HWDEVICE_TYPE_CUDA, "cuda" },
+        };
+        for (const Backend& backend : backends) {
+            if (pref && *pref && strcmp(pref, "auto") != 0 &&
+                strcmp(pref, backend.name) != 0) {
+                continue;
+            }
+            // Any decoder for this codec id will do, not just the stream
+            // default — hwaccels live on the native decoders.
+            const AVCodec* found = nullptr;
+            AVPixelFormat hwFormat = AV_PIX_FMT_NONE;
+            void* iter = nullptr;
+            for (const AVCodec* c; (c = av_codec_iterate(&iter));) {
+                if (!av_codec_is_decoder(c) || c->id != streamCodec->id) {
+                    continue;
+                }
+                for (int i = 0;; ++i) {
+                    const AVCodecHWConfig* config = avcodec_get_hw_config(c, i);
+                    if (!config) {
+                        break;
+                    }
+                    if ((config->methods &
+                         AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+                        config->device_type == backend.type) {
+                        found = c;
+                        hwFormat = config->pix_fmt;
+                        break;
+                    }
+                }
+                if (found) {
+                    break;
+                }
+            }
+            if (!found) {
+                continue;
+            }
+            AVBufferRef* device = nullptr;
+            if (av_hwdevice_ctx_create(&device, backend.type, nullptr, nullptr,
+                                       0) < 0 &&
+                av_hwdevice_ctx_create(&device, backend.type,
+                                       "/dev/dri/renderD128", nullptr, 0) < 0) {
+                continue;
+            }
+            mHwDevice = device;
+            mHwFormat = hwFormat;
+            printf("drift: video decode: %s (%s)\n", backend.name,
+                   found->name);
+            return found;
+        }
+        printf("drift: video decode: software\n");
+        return nullptr;
     }
 
     const VideoFrame* frameAt(double seconds) override
@@ -130,6 +240,7 @@ private:
     {
         AVPacket* packet = av_packet_alloc();
         AVFrame* frame = av_frame_alloc();
+        mTransferFrame = av_frame_alloc();
 
         while (true) {
             {
@@ -181,6 +292,7 @@ private:
         }
 
         av_frame_free(&frame);
+        av_frame_free(&mTransferFrame);
         av_packet_free(&packet);
     }
 
@@ -195,9 +307,21 @@ private:
                 return false;
             }
 
+            // Hardware frames come back to system memory once (usually as
+            // NV12) and then share the software conversion path.
+            AVFrame* src = frame;
+            if (mHwDevice && frame->format == mHwFormat) {
+                av_frame_unref(mTransferFrame);
+                if (av_hwframe_transfer_data(mTransferFrame, frame, 0) < 0) {
+                    av_frame_unref(frame);
+                    return false;
+                }
+                src = mTransferFrame;
+            }
+
             mSws = sws_getCachedContext(
-                mSws, frame->width, frame->height, (AVPixelFormat)frame->format,
-                frame->width, frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR,
+                mSws, src->width, src->height, (AVPixelFormat)src->format,
+                src->width, src->height, AV_PIX_FMT_RGBA, SWS_BILINEAR,
                 nullptr, nullptr, nullptr);
             if (!mSws) {
                 av_frame_unref(frame);
@@ -205,14 +329,17 @@ private:
             }
 
             Item item;
-            item.frame.width = (uint32_t)frame->width;
-            item.frame.height = (uint32_t)frame->height;
+            item.frame.width = (uint32_t)src->width;
+            item.frame.height = (uint32_t)src->height;
             item.frame.index = mNextIndex++;
-            item.frame.rgba.resize((size_t)frame->width * frame->height * 4);
+            item.frame.rgba.resize((size_t)src->width * src->height * 4);
             uint8_t* dst[4] = { item.frame.rgba.data() };
-            int dstStride[4] = { frame->width * 4 };
-            sws_scale(mSws, frame->data, frame->linesize, 0, frame->height,
-                      dst, dstStride);
+            int dstStride[4] = { src->width * 4 };
+            sws_scale(mSws, src->data, src->linesize, 0, src->height, dst,
+                      dstStride);
+            if (src == mTransferFrame) {
+                av_frame_unref(mTransferFrame);
+            }
 
             const int64_t ts = frame->best_effort_timestamp;
             const double pts = ts != AV_NOPTS_VALUE
@@ -240,6 +367,9 @@ private:
     AVFormatContext* mFormat = nullptr;
     AVCodecContext* mCodec = nullptr;
     SwsContext* mSws = nullptr;
+    AVBufferRef* mHwDevice = nullptr;
+    AVPixelFormat mHwFormat = AV_PIX_FMT_NONE;
+    AVFrame* mTransferFrame = nullptr; // decode thread only
     int mStream = -1;
     bool mLoop = true;
     double mTimeBase = 0.0;

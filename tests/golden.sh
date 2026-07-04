@@ -24,6 +24,8 @@ golden=$4
 
 : "${DRIFT_ADAPTER:=llvmpipe}"
 export DRIFT_ADAPTER
+# Hardware video decode output can differ per vendor; goldens pin software.
+export DRIFT_HWDEC=off
 
 size=320x180
 [ -f "$golden/size" ] && size=$(cat "$golden/size")
