@@ -14,6 +14,10 @@ endif()
 add_subdirectory(3rdparty/dawn)
 # glaze (FetchContent, header-only). Provides glaze::glaze target.
 add_subdirectory(3rdparty/glaze)
+# libwebp (FetchContent). Provides webpdecoder.
+add_subdirectory(3rdparty/libwebp)
+# libktx (FetchContent). Provides ktx.
+add_subdirectory(3rdparty/libktx)
 
 find_package(Dawn REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -38,7 +42,9 @@ add_library(drift_core STATIC
     src/core/WgslInterface.cpp
 )
 target_include_directories(drift_core PUBLIC src PRIVATE 3rdparty/stb)
-target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn PRIVATE glaze::glaze)
+target_link_libraries(drift_core
+    PUBLIC dawn::webgpu_dawn
+    PRIVATE glaze::glaze webpdecoder ktx)
 
 # ---- drift: native Linux/Wayland runtime ----
 set(WLGEN src/platform/linux/wayland-generated)
@@ -84,7 +90,7 @@ if(BUILD_TESTING)
         tests/unit/wgsl_interface_test.cpp
         tests/unit/scene_loader_test.cpp
     )
-    target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest)
+    target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
     add_test(NAME unit COMMAND drift_tests)
 
     function(drift_golden_test name)

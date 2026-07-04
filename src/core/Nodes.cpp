@@ -8,6 +8,9 @@
 #define STBI_FAILURE_USERMSG
 #include <stb_image.h>
 
+#include <ktx.h>
+#include <webp/decode.h>
+
 namespace drift::core {
 
 namespace {
@@ -84,6 +87,8 @@ wgpu::Sampler makeLinearClampSampler(const wgpu::Device& device)
     wgpu::SamplerDescriptor desc{};
     desc.magFilter = wgpu::FilterMode::Linear;
     desc.minFilter = wgpu::FilterMode::Linear;
+    // Trilinear when the source has a mip chain (KTX2); a no-op otherwise.
+    desc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
     desc.addressModeU = wgpu::AddressMode::ClampToEdge;
     desc.addressModeV = wgpu::AddressMode::ClampToEdge;
     return device.CreateSampler(&desc);
@@ -274,10 +279,39 @@ void SplitNode::evaluate(FrameContext&)
 
 // ---- ImageNode ----
 
-ImageNode::ImageNode(std::vector<uint16_t> pixels, uint32_t width, uint32_t height)
-    : mPixels(std::move(pixels))
-    , mWidth(width)
-    , mHeight(height)
+namespace {
+
+// Converts 8-bit RGBA to the texture-edge contract (§12): linear color,
+// premultiplied alpha, rgba16float.
+void convertRgba8(const uint8_t* rgba, uint32_t width, uint32_t height,
+                  bool srgb, bool premultiplied, std::vector<uint16_t>& out)
+{
+    float toLinear[256];
+    for (int i = 0; i < 256; ++i) {
+        const float c = (float)i / 255.0f;
+        toLinear[i] = srgb ? srgbDecode(c) : c;
+    }
+    out.resize((size_t)width * height * 4);
+    for (size_t i = 0; i < (size_t)width * height; ++i) {
+        const float a = (float)rgba[i * 4 + 3] / 255.0f;
+        const float mul = premultiplied ? 1.0f : a;
+        out[i * 4 + 0] = floatToHalf(toLinear[rgba[i * 4 + 0]] * mul);
+        out[i * 4 + 1] = floatToHalf(toLinear[rgba[i * 4 + 1]] * mul);
+        out[i * 4 + 2] = floatToHalf(toLinear[rgba[i * 4 + 2]] * mul);
+        out[i * 4 + 3] = floatToHalf(a);
+    }
+}
+
+// VkFormat values libktx reports for the payloads we accept.
+constexpr uint32_t kVkFormatR8G8B8A8Unorm = 37;
+constexpr uint32_t kVkFormatR8G8B8A8Srgb = 43;
+
+} // namespace
+
+ImageNode::ImageNode(std::vector<Level> levels)
+    : mLevels(std::move(levels))
+    , mWidth(mLevels[0].width)
+    , mHeight(mLevels[0].height)
 {
     outputs.resize(1);
     outputs[0].value.type = ValueType::Texture;
@@ -285,30 +319,92 @@ ImageNode::ImageNode(std::vector<uint16_t> pixels, uint32_t width, uint32_t heig
 
 ImageNode* ImageNode::decode(const std::string& bytes, std::string& error)
 {
+    const auto* data = (const uint8_t*)bytes.data();
+    const size_t size = bytes.size();
+
+    // KTX2 (§9.1): GPU texture container, possibly Basis-supercompressed,
+    // with an optional stored mip chain.
+    static const uint8_t kKtx2Magic[12] = { 0xAB, 'K',  'T',  'X',  ' ',  '2',
+                                            '0',  0xBB, '\r', '\n', 0x1A, '\n' };
+    if (size >= 12 && std::memcmp(data, kKtx2Magic, 12) == 0) {
+        ktxTexture2* tex = nullptr;
+        KTX_error_code rc = ktxTexture2_CreateFromMemory(
+            data, size, KTX_TEXTURE_CREATE_LOAD_IMAGE_DATA_BIT, &tex);
+        if (rc != KTX_SUCCESS) {
+            error = ktxErrorString(rc);
+            return nullptr;
+        }
+        if (tex->numDimensions != 2 || tex->numFaces != 1 ||
+            tex->numLayers != 1) {
+            error = "only plain 2D KTX2 textures are supported";
+            ktxTexture_Destroy((ktxTexture*)tex);
+            return nullptr;
+        }
+        if (ktxTexture2_NeedsTranscoding(tex)) {
+            rc = ktxTexture2_TranscodeBasis(tex, KTX_TTF_RGBA32, 0);
+            if (rc != KTX_SUCCESS) {
+                error = std::string("transcode failed: ") + ktxErrorString(rc);
+                ktxTexture_Destroy((ktxTexture*)tex);
+                return nullptr;
+            }
+        }
+        if (tex->vkFormat != kVkFormatR8G8B8A8Unorm &&
+            tex->vkFormat != kVkFormatR8G8B8A8Srgb) {
+            error = "unsupported KTX2 payload format (want RGBA8)";
+            ktxTexture_Destroy((ktxTexture*)tex);
+            return nullptr;
+        }
+        const bool srgb = tex->vkFormat == kVkFormatR8G8B8A8Srgb;
+        const bool premultiplied = ktxTexture2_GetPremultipliedAlpha(tex);
+
+        std::vector<Level> levels(tex->numLevels);
+        for (uint32_t l = 0; l < tex->numLevels; ++l) {
+            Level& level = levels[l];
+            level.width = std::max(1u, tex->baseWidth >> l);
+            level.height = std::max(1u, tex->baseHeight >> l);
+            ktx_size_t offset = 0;
+            ktxTexture_GetImageOffset((ktxTexture*)tex, l, 0, 0, &offset);
+            convertRgba8(ktxTexture_GetData((ktxTexture*)tex) + offset,
+                         level.width, level.height, srgb, premultiplied,
+                         level.pixels);
+        }
+        ktxTexture_Destroy((ktxTexture*)tex);
+        return new ImageNode(std::move(levels));
+    }
+
+    // WebP (§9.1): notably the only format here with lossy-plus-alpha.
+    if (size >= 12 && std::memcmp(data, "RIFF", 4) == 0 &&
+        std::memcmp(data + 8, "WEBP", 4) == 0) {
+        int width = 0, height = 0;
+        uint8_t* rgba = WebPDecodeRGBA(data, size, &width, &height);
+        if (!rgba) {
+            error = "WebP decode failed";
+            return nullptr;
+        }
+        std::vector<Level> levels(1);
+        levels[0].width = (uint32_t)width;
+        levels[0].height = (uint32_t)height;
+        convertRgba8(rgba, levels[0].width, levels[0].height, /*srgb=*/true,
+                     /*premultiplied=*/false, levels[0].pixels);
+        WebPFree(rgba);
+        return new ImageNode(std::move(levels));
+    }
+
+    // PNG/JPEG and friends via stb.
     int width = 0, height = 0, comp = 0;
-    stbi_uc* rgba = stbi_load_from_memory((const stbi_uc*)bytes.data(),
-                                          (int)bytes.size(), &width, &height,
-                                          &comp, 4);
+    stbi_uc* rgba = stbi_load_from_memory((const stbi_uc*)data, (int)size,
+                                          &width, &height, &comp, 4);
     if (!rgba) {
         error = stbi_failure_reason();
         return nullptr;
     }
-
-    // sRGB -> linear, premultiply, pack to rgba16float (SCENE_FORMAT.md §12).
-    float srgbTable[256];
-    for (int i = 0; i < 256; ++i) {
-        srgbTable[i] = srgbDecode((float)i / 255.0f);
-    }
-    std::vector<uint16_t> pixels((size_t)width * height * 4);
-    for (size_t i = 0; i < (size_t)width * height; ++i) {
-        const float a = (float)rgba[i * 4 + 3] / 255.0f;
-        pixels[i * 4 + 0] = floatToHalf(srgbTable[rgba[i * 4 + 0]] * a);
-        pixels[i * 4 + 1] = floatToHalf(srgbTable[rgba[i * 4 + 1]] * a);
-        pixels[i * 4 + 2] = floatToHalf(srgbTable[rgba[i * 4 + 2]] * a);
-        pixels[i * 4 + 3] = floatToHalf(a);
-    }
+    std::vector<Level> levels(1);
+    levels[0].width = (uint32_t)width;
+    levels[0].height = (uint32_t)height;
+    convertRgba8(rgba, levels[0].width, levels[0].height, /*srgb=*/true,
+                 /*premultiplied=*/false, levels[0].pixels);
     stbi_image_free(rgba);
-    return new ImageNode(std::move(pixels), (uint32_t)width, (uint32_t)height);
+    return new ImageNode(std::move(levels));
 }
 
 void ImageNode::evaluate(FrameContext& ctx)
@@ -317,20 +413,25 @@ void ImageNode::evaluate(FrameContext& ctx)
         wgpu::TextureDescriptor desc{};
         desc.format = wgpu::TextureFormat::RGBA16Float;
         desc.size = { mWidth, mHeight, 1 };
+        desc.mipLevelCount = (uint32_t)mLevels.size();
         desc.usage = wgpu::TextureUsage::TextureBinding |
                      wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
         mTexture = ctx.device.CreateTexture(&desc);
 
-        wgpu::TexelCopyTextureInfo dst{};
-        dst.texture = mTexture;
-        wgpu::TexelCopyBufferLayout layout{};
-        layout.bytesPerRow = mWidth * 8;
-        layout.rowsPerImage = mHeight;
-        wgpu::Extent3D extent = { mWidth, mHeight, 1 };
-        ctx.device.GetQueue().WriteTexture(&dst, mPixels.data(),
-                                           mPixels.size() * sizeof(uint16_t),
-                                           &layout, &extent);
-        mPixels = {};
+        for (uint32_t l = 0; l < mLevels.size(); ++l) {
+            const Level& level = mLevels[l];
+            wgpu::TexelCopyTextureInfo dst{};
+            dst.texture = mTexture;
+            dst.mipLevel = l;
+            wgpu::TexelCopyBufferLayout layout{};
+            layout.bytesPerRow = level.width * 8;
+            layout.rowsPerImage = level.height;
+            wgpu::Extent3D extent = { level.width, level.height, 1 };
+            ctx.device.GetQueue().WriteTexture(
+                &dst, level.pixels.data(),
+                level.pixels.size() * sizeof(uint16_t), &layout, &extent);
+        }
+        mLevels = {};
     }
 
     Value out{};

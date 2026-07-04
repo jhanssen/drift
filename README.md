@@ -4,15 +4,17 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: v1 feature-complete. Full node set — image (PNG/JPEG), video
+Status: v1 feature-complete. Full node set — image (PNG/JPEG/WebP/KTX2,
+including Basis-supercompressed KTX2 and stored mip chains), video
 (ffmpeg software decode; AV1/H.264/anything your ffmpeg has), shader,
 transform, compositor, wave, remap, combine, split, the implicit
 time/mouse inputs, and previous-frame feedback edges (`"previous": true`)
 for trails and iterative effects. Wallpaper mode covers every output with
 runtime hotplug; the dirty-driven graph skips GPU work and commits when
 nothing changed (a static scene idles at zero GPU cost, and scene time
-freezes while occluded). Wayland (wlr-layer-shell compositors) only.
-Next: VAAPI zero-copy video, KTX2/WebP images, sync-fd presentation.
+freezes while occluded); presentation uses sync-fd fences, not CPU waits.
+Wayland (wlr-layer-shell compositors) only. Next: hardware video decode
+(VAAPI/NVDEC zero-copy).
 
 ## Build
 

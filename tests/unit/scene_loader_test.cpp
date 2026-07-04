@@ -2,6 +2,8 @@
 
 #include <map>
 
+#include <ktx.h>
+
 #include "core/Scene.h"
 
 // Scene::load validation tests (SCENE_FORMAT.md §13). Load never touches the
@@ -39,6 +41,48 @@ const unsigned char kTinyPng[] = {
     165, 7, 61, 226, 7, 123, 172, 157, 78, 228, 0, 0, 0, 0, 73, 69, 78, 68,
     174, 66, 96, 130,
 };
+
+// The same 2x2 image as a lossless WebP.
+const unsigned char kTinyWebp[] = {
+    82, 73, 70, 70, 52, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 76, 39, 0, 0, 0,
+    47, 1, 64, 0, 16, 31, 48, 255, 2, 130, 34, 255, 71, 19, 16, 20, 249, 63,
+    154, 128, 160, 232, 186, 229, 2, 236, 166, 130, 154, 182, 13, 88, 252, 38,
+    29, 17, 253, 143, 3, 0,
+};
+
+// A 2x2 sRGB RGBA8 KTX2 with a full mip chain (2x2 + 1x1), authored through
+// libktx itself.
+std::string makeTinyKtx2()
+{
+    ktxTextureCreateInfo ci{};
+    ci.vkFormat = 43; // VK_FORMAT_R8G8B8A8_SRGB
+    ci.baseWidth = 2;
+    ci.baseHeight = 2;
+    ci.baseDepth = 1;
+    ci.numDimensions = 2;
+    ci.numLevels = 2;
+    ci.numLayers = 1;
+    ci.numFaces = 1;
+
+    ktxTexture2* tex = nullptr;
+    REQUIRE(ktxTexture2_Create(&ci, KTX_TEXTURE_CREATE_ALLOC_STORAGE, &tex) ==
+            KTX_SUCCESS);
+    const unsigned char base[16] = { 255, 0, 0,   255, 0,   255, 0,   128,
+                                     0,   0, 255, 0,   255, 255, 255, 255 };
+    const unsigned char mip[4] = { 128, 128, 128, 255 };
+    REQUIRE(ktxTexture_SetImageFromMemory((ktxTexture*)tex, 0, 0, 0, base,
+                                          sizeof(base)) == KTX_SUCCESS);
+    REQUIRE(ktxTexture_SetImageFromMemory((ktxTexture*)tex, 1, 0, 0, mip,
+                                          sizeof(mip)) == KTX_SUCCESS);
+    ktx_uint8_t* mem = nullptr;
+    ktx_size_t size = 0;
+    REQUIRE(ktxTexture_WriteToMemory((ktxTexture*)tex, &mem, &size) ==
+            KTX_SUCCESS);
+    std::string bytes((const char*)mem, size);
+    free(mem);
+    ktxTexture_Destroy((ktxTexture*)tex);
+    return bytes;
+}
 
 // Canned decoder so video-node wiring is testable without ffmpeg or a GPU.
 struct StubVideoDecoder : drift::core::VideoDecoder {
@@ -96,7 +140,12 @@ LoadResult load(const std::string& json,
         { "shaders/trail.wgsl", kTrailWgsl },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
+        { "assets/tiny.webp",
+          std::string((const char*)kTinyWebp, sizeof(kTinyWebp)) },
+        { "assets/tiny.ktx2", makeTinyKtx2() },
         { "assets/corrupt.png", "this is not a png" },
+        { "assets/corrupt.webp",
+          std::string("RIFF\x10\0\0\0WEBPgarbage", 19) },
     };
     LoadResult r;
     r.scene = Scene::load(
@@ -431,6 +480,29 @@ TEST_CASE("image + transform + compositor scene loads (spec example 14.1 shape)"
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());
+}
+
+TEST_CASE("webp and ktx2 image sources load")
+{
+    for (const char* src : { "assets/tiny.webp", "assets/tiny.ktx2" }) {
+        auto r = load(std::string(R"({
+            "version": 1, "name": "x",
+            "nodes": [
+                { "id": "bg", "type": "image", "src": ")") + src + R"(" },
+                { "id": "out", "type": "output", "inputs": { "color": "@bg" } }
+            ]
+        })");
+        CAPTURE(src);
+        CAPTURE(r.joined());
+        CHECK(r.scene != nullptr);
+    }
+
+    auto corrupt = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [ { "id": "a", "type": "image", "src": "assets/corrupt.webp" } ]
+    })");
+    CHECK(corrupt.scene == nullptr);
+    CHECK(corrupt.hasError("cannot decode"));
 }
 
 TEST_CASE("image validation: missing src, missing file, corrupt file, escaping path")
