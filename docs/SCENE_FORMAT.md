@@ -689,7 +689,7 @@ scheduling hints join the reserved list.
 Status: proposals. Each subsection is independently adoptable and states which
 existing section it amends. §17.4 additionally depends on §16 (`event`).
 Where noted, a proposal *codifies* what the runtime already does (verified
-against `src/core` as of 2026-07-03) rather than prescribing new behavior.
+against `src/core` as of 2026-07-04) rather than prescribing new behavior.
 
 ### 17.1 Layer Sizing and the `fit` Node
 
@@ -728,10 +728,13 @@ Gap: `time.seconds` is a `scalar` (f32, §4), and wallpapers run for weeks. At
 one day of uptime f32 resolution is ~8 ms; at a month, ~0.25 s — `wave`-driven
 motion turns visibly steppy. Scene authors will not anticipate this.
 
-Implementation status: the scene clock itself is already double precision
-(`FrameContext::seconds`), but the value graph is not — the time node
-truncates to f32 on output, and `wave` computes its phase reduction in f32.
-The amendments below are therefore not yet implemented.
+Implementation status: implemented as specified — `Value` carries f64
+components end to end, narrowing to f32 only where uniforms are packed for
+the GPU (transform, shader); `wave` reduces its phase to one cycle in double
+before trig; JSON literals parse without a float round-trip. Unit-tested at
+a month and a year of scene time (`value_precision_test.cpp`), both of which
+fail with an f32 value path. `sequence` (§16.4) is specified to do the same
+reduction when it lands.
 
 Amendments:
 
