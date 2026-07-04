@@ -67,6 +67,35 @@ public:
     void evaluate(FrameContext& ctx) override;
 };
 
+// §9.9 sequence: a timeline — maps a scalar input through named keyframe
+// tracks, one output port per track in declaration order. Value tracks only
+// (event tracks are reserved, §16). Local-time reduction happens in double
+// (§17.2) so a looping sequence stays frame-accurate at any uptime.
+class SequenceNode : public Node {
+public:
+    enum class Interpolate { Hold, Linear, Smooth };
+    struct Key {
+        double t = 0.0;
+        Value value;
+    };
+    struct Track {
+        std::string name;
+        ValueType type = ValueType::Scalar;
+        Interpolate interpolate = Interpolate::Linear;
+        std::vector<Key> keys; // strictly ascending t, validated at load
+    };
+
+    SequenceNode(double duration, bool loop, std::vector<Track> tracks);
+    void evaluate(FrameContext& ctx) override;
+
+    const std::vector<Track>& tracks() const { return mTracks; }
+
+private:
+    const double mDuration;
+    const bool mLoop;
+    const std::vector<Track> mTracks;
+};
+
 // §9.1 image: static texture source, dirty on load only. Decoding happens in
 // the loader (validation without a GPU); PNG/JPEG via stb, WebP via libwebp,
 // KTX2 via libktx. Basis-supercompressed KTX2 transcodes to BC7 and uploads
@@ -115,6 +144,10 @@ private:
     wgpu::Texture mTexture; // CPU path upload target
     uint32_t mWidth = 0, mHeight = 0;
     int64_t mLastIndex = -1;
+    // §9.2 playing: playback clock = scene time minus accumulated paused
+    // spans, so an unpaused video tracks scene time exactly.
+    double mPausedTotal = 0.0;
+    double mLastSeconds = 0.0;
 
 #ifndef __EMSCRIPTEN__
     // The zero-copy path is the one sanctioned exception to the portable-API

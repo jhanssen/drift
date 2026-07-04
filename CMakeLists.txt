@@ -131,6 +131,7 @@ if(BUILD_TESTING)
         tests/unit/wgsl_interface_test.cpp
         tests/unit/scene_loader_test.cpp
         tests/unit/value_precision_test.cpp
+        tests/unit/sequence_test.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
     add_test(NAME unit COMMAND drift_tests)

@@ -848,3 +848,186 @@ TEST_CASE("combine with only x bound is rejected")
     CHECK(r.scene == nullptr);
     CHECK_FALSE(r.errors.empty());
 }
+
+// ---- sequence (§9.9 value tracks) ----
+
+namespace {
+
+// A minimal valid scene wrapping the given sequence node JSON, wiring track
+// 'a' (scalar) into a shader uniform.
+std::string seqScene(const std::string& seqJson)
+{
+    return R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            )" + seqJson + R"(,
+            { "id": "sh", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": "@seq.a" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@sh" } }
+        ]
+    })";
+}
+
+const char* kSeqValid = R"({
+    "id": "seq", "type": "sequence", "duration": 10,
+    "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                  "keys": [ { "t": 0, "value": 0 }, { "t": 10, "value": 1 } ] } ],
+    "inputs": { "time": "@time.seconds" }
+})";
+
+} // namespace
+
+TEST_CASE("sequence loads and its tracks are output ports")
+{
+    auto r = load(seqScene(kSeqValid));
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty());
+    CHECK(r.scene->animated()); // time-driven
+}
+
+TEST_CASE("sequence first track is the default output")
+{
+    // '@seq' with no port name resolves to track 0.
+    std::string json = seqScene(kSeqValid);
+    json.replace(json.find("@seq.a"), 6, "@seq");
+    auto r = load(json);
+    REQUIRE(r.scene != nullptr);
+}
+
+TEST_CASE("sequence unknown track port is rejected")
+{
+    std::string json = seqScene(kSeqValid);
+    json.replace(json.find("@seq.a"), 6, "@seq.b");
+    auto r = load(json);
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("no output port 'b'"));
+}
+
+TEST_CASE("sequence unreferenced track is a warning")
+{
+    std::string json = seqScene(R"({
+        "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [
+            { "name": "a", "kind": "value", "type": "scalar",
+              "keys": [ { "t": 0, "value": 0 } ] },
+            { "name": "unused", "kind": "value", "type": "scalar",
+              "keys": [ { "t": 0, "value": 0 } ] }
+        ],
+        "inputs": { "time": "@time.seconds" }
+    })");
+    auto r = load(json);
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("track 'unused' is not referenced"));
+}
+
+TEST_CASE("sequence validation rejects malformed nodes")
+{
+    auto reject = [](const std::string& seqJson, const std::string& needle) {
+        auto r = load(seqScene(seqJson));
+        CHECK(r.scene == nullptr);
+        CHECK_MESSAGE(r.hasError(needle), "expected '", needle, "' in: ", r.joined());
+    };
+
+    // §13: duration missing or <= 0
+    reject(R"({ "id": "seq", "type": "sequence",
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 0, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "positive 'duration'");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 0,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 0, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "positive 'duration'");
+    // missing or empty tracks
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "inputs": { "time": "@time.seconds" } })",
+        "non-empty 'tracks'");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10, "tracks": [],
+        "inputs": { "time": "@time.seconds" } })",
+        "non-empty 'tracks'");
+    // duplicate track name
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [
+            { "name": "a", "kind": "value", "type": "scalar",
+              "keys": [ { "t": 0, "value": 0 } ] },
+            { "name": "a", "kind": "value", "type": "scalar",
+              "keys": [ { "t": 0, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "duplicate track name 'a'");
+    // reserved and unknown kinds
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "event", "fires": [ 1 ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "event tracks are reserved");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "wiggle", "type": "scalar",
+                      "keys": [ { "t": 0, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "unknown kind 'wiggle'");
+    // keys: empty, non-ascending, out of range, type mismatch
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "non-empty 'keys'");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 5, "value": 0 }, { "t": 5, "value": 1 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "strictly ascending");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 11, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "outside [0, duration]");
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 0, "value": [1, 2] } ] } ],
+        "inputs": { "time": "@time.seconds" } })",
+        "does not match track type");
+    // time input is required
+    reject(R"({ "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "keys": [ { "t": 0, "value": 0 } ] } ] })",
+        "required input 'time' missing");
+}
+
+TEST_CASE("sequence unknown track field is a warning")
+{
+    std::string json = seqScene(R"({
+        "id": "seq", "type": "sequence", "duration": 10,
+        "tracks": [ { "name": "a", "kind": "value", "type": "scalar",
+                      "fires": [ 1 ],
+                      "keys": [ { "t": 0, "value": 0 } ] } ],
+        "inputs": { "time": "@time.seconds" }
+    })");
+    auto r = load(json);
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("unknown field 'fires'"));
+}
+
+TEST_CASE("video accepts a playing input (§9.2)")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "playing": 0 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
+
+    // ...and rejects a non-scalar one.
+    auto bad = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "v", "type": "video", "src": "assets/clip.mp4",
+              "inputs": { "playing": [1, 2] } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    CHECK(bad.scene == nullptr);
+    CHECK(bad.hasError("type mismatch"));
+}

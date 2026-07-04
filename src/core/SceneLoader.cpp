@@ -257,6 +257,12 @@ const PortDef kTransformInputs[] = {
 const PortDef kCompositorInputs[] = {
     { "layers", ValueType::Texture, true, {}, true },
 };
+const PortDef kSequenceInputs[] = {
+    { "time", ValueType::Scalar, true },
+};
+const PortDef kVideoInputs[] = {
+    { "playing", ValueType::Scalar, false, { 1, 0, 0, 0 } },
+};
 
 struct OutputPortDef {
     const char* name;
@@ -302,6 +308,11 @@ private:
     bool bindInputs(const RawNode& raw, Node* node, const std::vector<PortDef>& ports);
     bool resolveInputType(const RawNode& raw, const RawInput& in, ValueType& out);
     bool bindDeferred();
+    // Output ports of a connection's producer. Static per type except
+    // sequence, whose ports are its tracks (the instance must exist — true
+    // for every caller: topo order for forward edges, bindDeferred for
+    // feedback).
+    std::vector<OutputPortDef> producerPorts(const std::string& nodeId);
 
     // Feedback edges bind after all nodes exist — the producer may come
     // later in topo order (or be the consumer itself).
@@ -331,8 +342,26 @@ private:
 
     std::map<std::string, Node*> mInstances;
     std::vector<std::unique_ptr<Node>> mNodes;
+    std::vector<SequenceNode*> mSequences;
     Node* mOutput = nullptr;
 };
+
+std::vector<OutputPortDef> Loader::producerPorts(const std::string& nodeId)
+{
+    if (isImplicitNode(nodeId)) {
+        return outputPortsFor(nodeId);
+    }
+    const RawNode& raw = mRawNodes[mRawIndex[nodeId]];
+    if (raw.type == "sequence") {
+        auto* seq = static_cast<SequenceNode*>(mInstances[nodeId]);
+        std::vector<OutputPortDef> ports;
+        for (int i = 0; i < (int)seq->tracks().size(); ++i) {
+            ports.push_back({ seq->tracks()[i].name.c_str(), i });
+        }
+        return ports;
+    }
+    return outputPortsFor(raw.type);
+}
 
 bool Loader::parseParameters(const glz::generic& json)
 {
@@ -469,6 +498,7 @@ bool Loader::parseNodes(const glz::generic& json)
             { "remap", { "clamp" } },
             { "combine", {} },
             { "split", {} },
+            { "sequence", { "duration", "loop", "tracks" } },
             { "shader", { "shader", "size" } },
             { "image", { "src" } },
             { "video", { "src", "loop" } },
@@ -603,9 +633,7 @@ bool Loader::resolveInputType(const RawNode& raw, const RawInput& in, ValueType&
             return false;
         }
         Node* src = instIt->second;
-        const auto ports = outputPortsFor(
-            isImplicitNode(in.conn.node) ? in.conn.node
-                                         : mRawNodes[mRawIndex[in.conn.node]].type);
+        const auto ports = producerPorts(in.conn.node);
         int idx = 0;
         if (!in.conn.port.empty()) {
             idx = -1;
@@ -722,6 +750,154 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         return new SplitNode(arity);
     }
 
+    if (raw.type == "sequence") {
+        const auto& obj = raw.json->get_object();
+        auto durIt = obj.find("duration");
+        if (durIt == obj.end() || !durIt->second.is_number() ||
+            durIt->second.get_number() <= 0.0) {
+            fail("node '" + raw.id + "': sequence needs a positive 'duration'");
+            return nullptr;
+        }
+        const double duration = durIt->second.get_number();
+        bool loop = true;
+        if (auto loopIt = obj.find("loop"); loopIt != obj.end()) {
+            if (!loopIt->second.is_boolean()) {
+                fail("node '" + raw.id + "': 'loop' must be a boolean");
+                return nullptr;
+            }
+            loop = loopIt->second.get_boolean();
+        }
+        auto tracksIt = obj.find("tracks");
+        if (tracksIt == obj.end() || !tracksIt->second.is_array() ||
+            tracksIt->second.get_array().empty()) {
+            fail("node '" + raw.id + "': sequence needs a non-empty 'tracks' array");
+            return nullptr;
+        }
+
+        std::vector<SequenceNode::Track> tracks;
+        for (const auto& entry : tracksIt->second.get_array()) {
+            if (!entry.is_object()) {
+                fail("node '" + raw.id + "': each track must be an object");
+                return nullptr;
+            }
+            const auto& tobj = entry.get_object();
+            SequenceNode::Track track;
+
+            auto nameIt = tobj.find("name");
+            if (nameIt == tobj.end() || !nameIt->second.is_string() ||
+                !validId(nameIt->second.get_string())) {
+                fail("node '" + raw.id + "': track needs a valid 'name'");
+                return nullptr;
+            }
+            track.name = nameIt->second.get_string();
+            for (const auto& existing : tracks) {
+                if (existing.name == track.name) {
+                    fail("node '" + raw.id + "': duplicate track name '" +
+                         track.name + "'");
+                    return nullptr;
+                }
+            }
+
+            auto kindIt = tobj.find("kind");
+            if (kindIt == tobj.end() || !kindIt->second.is_string()) {
+                fail("node '" + raw.id + "' track '" + track.name +
+                     "': needs a string 'kind'");
+                return nullptr;
+            }
+            if (const std::string& kind = kindIt->second.get_string();
+                kind == "event") {
+                fail("node '" + raw.id + "' track '" + track.name +
+                     "': event tracks are reserved for a future version");
+                return nullptr;
+            } else if (kind != "value") {
+                fail("node '" + raw.id + "' track '" + track.name +
+                     "': unknown kind '" + kind + "'");
+                return nullptr;
+            }
+
+            auto typeIt = tobj.find("type");
+            if (typeIt == tobj.end() || !typeIt->second.is_string() ||
+                !parseValueType(typeIt->second.get_string(), track.type)) {
+                fail("node '" + raw.id + "' track '" + track.name +
+                     "': needs a 'type' of scalar/vec2/vec3/vec4");
+                return nullptr;
+            }
+
+            if (auto interpIt = tobj.find("interpolate"); interpIt != tobj.end()) {
+                const std::string interp = interpIt->second.is_string()
+                    ? interpIt->second.get_string() : std::string();
+                if (interp == "hold") track.interpolate = SequenceNode::Interpolate::Hold;
+                else if (interp == "linear") track.interpolate = SequenceNode::Interpolate::Linear;
+                else if (interp == "smooth") track.interpolate = SequenceNode::Interpolate::Smooth;
+                else {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': unknown interpolate '" + interp + "'");
+                    return nullptr;
+                }
+            }
+
+            for (const auto& [key, value] : tobj) {
+                if (key != "name" && key != "kind" && key != "type" &&
+                    key != "interpolate" && key != "keys") {
+                    warn("node '" + raw.id + "' track '" + track.name +
+                         "': unknown field '" + key + "' ignored");
+                }
+            }
+
+            auto keysIt = tobj.find("keys");
+            if (keysIt == tobj.end() || !keysIt->second.is_array() ||
+                keysIt->second.get_array().empty()) {
+                fail("node '" + raw.id + "' track '" + track.name +
+                     "': needs a non-empty 'keys' array");
+                return nullptr;
+            }
+            for (const auto& keyEntry : keysIt->second.get_array()) {
+                if (!keyEntry.is_object()) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': each key must be an object");
+                    return nullptr;
+                }
+                const auto& kobj = keyEntry.get_object();
+                SequenceNode::Key key;
+                auto tIt = kobj.find("t");
+                if (tIt == kobj.end() || !tIt->second.is_number()) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': key needs a number 't'");
+                    return nullptr;
+                }
+                key.t = tIt->second.get_number();
+                if (key.t < 0.0 || key.t > duration) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': key t outside [0, duration]");
+                    return nullptr;
+                }
+                if (!track.keys.empty() && key.t <= track.keys.back().t) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': key times must be strictly ascending");
+                    return nullptr;
+                }
+                auto vIt = kobj.find("value");
+                if (vIt == kobj.end() || !parseLiteral(vIt->second, key.value)) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': key needs a literal 'value'");
+                    return nullptr;
+                }
+                if (key.value.type != track.type) {
+                    fail("node '" + raw.id + "' track '" + track.name +
+                         "': key value does not match track type");
+                    return nullptr;
+                }
+                track.keys.push_back(std::move(key));
+            }
+            tracks.push_back(std::move(track));
+        }
+
+        portsOut.assign(std::begin(kSequenceInputs), std::end(kSequenceInputs));
+        auto* node = new SequenceNode(duration, loop, std::move(tracks));
+        mSequences.push_back(node);
+        return node;
+    }
+
     if (raw.type == "shader") {
         const auto& obj = raw.json->get_object();
         auto pathIt = obj.find("shader");
@@ -829,7 +1005,7 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': cannot open video '" + path + "': " + err);
             return nullptr;
         }
-        portsOut.clear();
+        portsOut.assign(std::begin(kVideoInputs), std::end(kVideoInputs));
         return new VideoNode(std::move(decoder));
     }
 
@@ -907,8 +1083,7 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
             in.srcNode = mInstances[element.conn.node];
             in.srcPort = 0;
             if (!element.conn.port.empty()) {
-                const auto srcPorts = outputPortsFor(
-                    mRawNodes[mRawIndex[element.conn.node]].type);
+                const auto srcPorts = producerPorts(element.conn.node);
                 for (const auto& p : srcPorts) {
                     if (element.conn.port == p.name) {
                         in.srcPort = p.index;
@@ -973,10 +1148,7 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
             in.srcNode = src;
             in.srcPort = 0;
             if (!rawIn.conn.port.empty()) {
-                const auto srcPorts = outputPortsFor(
-                    isImplicitNode(rawIn.conn.node)
-                        ? rawIn.conn.node
-                        : mRawNodes[mRawIndex[rawIn.conn.node]].type);
+                const auto srcPorts = producerPorts(rawIn.conn.node);
                 for (const auto& p : srcPorts) {
                     if (rawIn.conn.port == p.name) {
                         in.srcPort = p.index;
@@ -1014,9 +1186,7 @@ bool Loader::bindDeferred()
 {
     for (const auto& d : mDeferredBinds) {
         Node* src = mInstances[d.conn.node]; // existence checked in topoSort
-        const auto ports = outputPortsFor(
-            isImplicitNode(d.conn.node) ? d.conn.node
-                                        : mRawNodes[mRawIndex[d.conn.node]].type);
+        const auto ports = producerPorts(d.conn.node);
         int idx = 0;
         if (!d.conn.port.empty()) {
             idx = -1;
@@ -1161,6 +1331,28 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
             }
         }
     }
+    // §13: a sequence track nothing references is a warning (the whole-node
+    // unreachable warning below covers fully unused sequences).
+    for (SequenceNode* seq : mSequences) {
+        if (!reachable[seq]) {
+            continue;
+        }
+        std::vector<bool> used(seq->outputs.size(), false);
+        for (const auto& node : mNodes) {
+            for (const auto& in : node->inputs) {
+                if (in.srcNode == seq && (size_t)in.srcPort < used.size()) {
+                    used[in.srcPort] = true;
+                }
+            }
+        }
+        for (size_t i = 0; i < used.size(); ++i) {
+            if (!used[i]) {
+                warn("node '" + seq->id + "': track '" +
+                     seq->tracks()[i].name + "' is not referenced");
+            }
+        }
+    }
+
     std::vector<std::unique_ptr<Node>> kept;
     for (auto& node : mNodes) {
         if (reachable[node.get()]) {

@@ -208,8 +208,6 @@ Video source. Plays muted; decoding is suspended while no output is presenting.
   actually flips — the node sees clean start/stop transitions for free.
 - A `restart: event` port is reserved (§16).
 
-*(`playing` adopted 2026-07-04; runtime support pending.)*
-
 ### 9.3 `shader`
 
 Fullscreen fragment-shader pass. Input ports are defined by the WGSL itself
@@ -409,8 +407,6 @@ Efficiency note (DESIGN.md §10): a visually static scene that is merely
 callback; the GPU schedules nothing. Runtimes may additionally compute the
 next transition time and skip even CPU evaluation until then; this is an
 implementation optimization with no format impact.
-
-*(Value tracks adopted 2026-07-04; runtime support pending.)*
 
 This set is expected to grow (add/multiply/mix/clamp etc.) as real scenes
 demand; additions are backward compatible.
@@ -763,8 +759,8 @@ components end to end, narrowing to f32 only where uniforms are packed for
 the GPU (transform, shader); `wave` reduces its phase to one cycle in double
 before trig; JSON literals parse without a float round-trip. Unit-tested at
 a month and a year of scene time (`value_precision_test.cpp`), both of which
-fail with an f32 value path. `sequence` (§9.9) is specified to do the same
-reduction (runtime support pending).
+fail with an f32 value path. `sequence` (§9.9) performs the same reduction,
+unit-tested at a month of scene time likewise.
 
 Amendments:
 

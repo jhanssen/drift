@@ -1,5 +1,6 @@
 #include "Nodes.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -276,6 +277,58 @@ void SplitNode::evaluate(FrameContext&)
     for (size_t i = 0; i < outputs.size(); ++i) {
         Value out{};
         out.v[0] = value.v[i];
+        writeOutput(outputs[i], out);
+    }
+}
+
+// ---- SequenceNode ----
+
+SequenceNode::SequenceNode(double duration, bool loop, std::vector<Track> tracks)
+    : mDuration(duration), mLoop(loop), mTracks(std::move(tracks))
+{
+    outputs.resize(mTracks.size());
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        outputs[i].value.type = mTracks[i].type;
+    }
+}
+
+void SequenceNode::evaluate(FrameContext&)
+{
+    // Local-time reduction in double before any interpolation (§17.2).
+    const double time = inputValue(0).v[0];
+    double t;
+    if (mLoop) {
+        t = std::fmod(time, mDuration);
+        if (t < 0.0) {
+            t += mDuration;
+        }
+    } else {
+        t = std::clamp(time, 0.0, mDuration);
+    }
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        const Track& track = mTracks[i];
+        // Last key with key.t <= t; before the first key, the first key's
+        // value; after the last, the last key's (§9.9 — no wrap-around
+        // interpolation).
+        size_t k = 0;
+        while (k + 1 < track.keys.size() && track.keys[k + 1].t <= t) {
+            ++k;
+        }
+        Value out = track.keys[k].value;
+        if (track.interpolate != Interpolate::Hold &&
+            k + 1 < track.keys.size() && t > track.keys[k].t) {
+            const Key& a = track.keys[k];
+            const Key& b = track.keys[k + 1];
+            double f = (t - a.t) / (b.t - a.t);
+            if (track.interpolate == Interpolate::Smooth) {
+                f = f * f * (3.0 - 2.0 * f);
+            }
+            const int n = componentCount(track.type);
+            for (int c = 0; c < n; ++c) {
+                out.v[c] = a.value.v[c] + (b.value.v[c] - a.value.v[c]) * f;
+            }
+        }
         writeOutput(outputs[i], out);
     }
 }
@@ -822,7 +875,21 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
 
 void VideoNode::evaluate(FrameContext& ctx)
 {
-    const VideoFrame* frame = mDecoder->frameAt(ctx.seconds);
+    // §9.2 playing: pause, not stop. While paused the playback clock
+    // freezes (paused spans accumulate into mPausedTotal), the decoder is
+    // never pulled — frameAt is what drives decode-ahead — and result stays
+    // non-dirty. The first evaluate decodes even when paused, so a scene
+    // that starts paused still shows a poster frame.
+    const bool playing = inputs.empty() || inputValue(0).v[0] > 0.5;
+    if (!firstEvaluate && !playing) {
+        mPausedTotal += ctx.seconds - mLastSeconds;
+    }
+    mLastSeconds = ctx.seconds;
+    if (!playing && !firstEvaluate) {
+        return;
+    }
+
+    const VideoFrame* frame = mDecoder->frameAt(ctx.seconds - mPausedTotal);
     if (!frame) {
         return; // decode error; hold the previous frame
     }
