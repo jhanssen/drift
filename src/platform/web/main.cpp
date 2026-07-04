@@ -389,6 +389,12 @@ EMSCRIPTEN_KEEPALIVE int drift_reload()
     return 1;
 }
 
+// Manually fires an event output ("fire now", §16.1).
+EMSCRIPTEN_KEEPALIVE int drift_fire(const char* node, const char* port)
+{
+    return gApp.scene && gApp.scene->fireEvent(node, port) ? 1 : 0;
+}
+
 // The running scene document, for the editor.
 EMSCRIPTEN_KEEPALIVE const char* drift_source()
 {

@@ -25,6 +25,9 @@
 //                                           editors own the document; the
 //                                           old scene keeps running if it
 //                                           fails validation)
+//   -> {"id":9,"method":"fire","params":{"node":"seq","port":"cue"}}
+//                                          (manually fire an event output —
+//                                           the editor's "fire now" verb)
 //   <- {"event":"transport","paused":B,"seconds":T}   (after pause/seek)
 //   <- {"event":"reload"}                  (after reload/load; clients
 //                                           should re-describe)
@@ -71,6 +74,8 @@ public:
         std::function<std::string()> source; // current scene.json text
         std::function<bool(const std::string& sceneJson, std::string& error)>
             load;
+        std::function<bool(const std::string& node, const std::string& port,
+                           std::string& error)> fire;
     };
 
     ~ControlServer();

@@ -1119,3 +1119,24 @@ TEST_CASE("video exposes a finished event output (§17.4)")
     })", stubVideoFactory());
     REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
 }
+
+TEST_CASE("fireEvent resolves event outputs by name")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "seq", "type": "sequence", "duration": 10,
+              "tracks": [ { "name": "cue", "kind": "event", "fires": [ 2 ] } ],
+              "inputs": { "time": "@time.seconds" } },
+            { "id": "v", "type": "video", "src": "assets/clip.mp4", "loop": false,
+              "inputs": { "restart": "@seq.cue" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@v" } }
+        ]
+    })", stubVideoFactory());
+    REQUIRE_MESSAGE(r.scene != nullptr, r.joined());
+    CHECK(r.scene->fireEvent("seq", "cue"));
+    CHECK(r.scene->fireEvent("v", "finished"));
+    CHECK_FALSE(r.scene->fireEvent("seq", "nope"));
+    CHECK_FALSE(r.scene->fireEvent("v", "result")); // texture, not event
+    CHECK_FALSE(r.scene->fireEvent("ghost", "cue"));
+}

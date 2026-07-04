@@ -508,6 +508,33 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
         return;
     }
 
+    if (method == "fire") {
+        std::string node, port;
+        if (auto paramsIt = obj.find("params");
+            paramsIt != obj.end() && paramsIt->second.is_object()) {
+            const auto& params = paramsIt->second.get_object();
+            if (auto it = params.find("node");
+                it != params.end() && it->second.is_string()) {
+                node = it->second.get_string();
+            }
+            if (auto it = params.find("port");
+                it != params.end() && it->second.is_string()) {
+                port = it->second.get_string();
+            }
+        }
+        if (node.empty() || port.empty()) {
+            respond("\"error\":\"'fire' needs string 'node' and 'port'\"");
+            return;
+        }
+        std::string error;
+        if (!mCallbacks.fire(node, port, error)) {
+            respond("\"error\":\"" + jsonEscape(error) + "\"");
+            return;
+        }
+        respond("\"result\":{}");
+        return;
+    }
+
     if (method == "source") {
         respond("\"result\":{\"scene\":\"" +
                 jsonEscape(mCallbacks.source ? mCallbacks.source()

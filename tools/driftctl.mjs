@@ -8,6 +8,7 @@
 //        driftctl.mjs [--port N] pause | resume
 //        driftctl.mjs [--port N] seek SECONDS
 //        driftctl.mjs [--port N] reload           (re-read scene from disk)
+//        driftctl.mjs [--port N] fire NODE PORT   (fire an event output)
 //        driftctl.mjs [--port N] source           (print the scene document)
 //        driftctl.mjs [--port N] load FILE        (push a scene document)
 //        driftctl.mjs [--port N] watch            (print events)
@@ -46,6 +47,11 @@ if (command === 'describe' || command === 'reload' || command === 'source') {
   if (parts.some(Number.isNaN)) usage();
   const value = parts.length === 1 ? parts[0] : parts;
   request = { id: 1, method: 'set', params: { name, value } };
+} else if (command === 'fire') {
+  const node = args.shift();
+  const port = args.shift();
+  if (!node || !port) usage();
+  request = { id: 1, method: 'fire', params: { node, port } };
 } else if (command === 'pause' || command === 'resume') {
   request = { id: 1, method: 'pause',
               params: { paused: command === 'pause' } };

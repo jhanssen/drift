@@ -76,14 +76,15 @@
   <div id="transport">
     <button id="playBtn" title="pause/resume both runtimes">⏸</button>
     <span id="timeText">—</span>
-    <span class="dim" style="color:var(--dim)">click to seek · keys: drag
-      (shift = fine) or click to type · wheel zooms a lane · double-click
-      re-fits</span>
+    <span class="dim" style="color:var(--dim)">click to seek · keys/cues:
+      drag (shift = fine), click to type/delete, dbl-click a lane to add ·
+      wheel zooms · dbl-click gutter re-fits · ⚡ fires now</span>
   </div>
   <div id="timeline"><span class="dim">no scene yet</span></div>
   <div id="keyEdit" hidden>
     <label>t <input id="keyEditT" type="number" step="0.01"></label>
     <label>v <input id="keyEditV" type="number" step="0.01"></label>
+    <button id="keyEditDel" title="delete this key/cue">✕</button>
   </div>
   <div id="statusbar">
     <span id="wasmStatus">preview: starting…</span>
@@ -174,6 +175,7 @@ var Module = {
     const reload = Module.cwrap('drift_reload', 'number', []);
     const source = Module.cwrap('drift_source', 'string', []);
     const load = Module.cwrap('drift_load', 'number', ['string']);
+    const fire = Module.cwrap('drift_fire', 'number', ['string', 'string']);
     const errors = Module.cwrap('drift_errors', 'string', []);
     const writeAsset = Module.cwrap('drift_write_asset', 'number',
         ['string', 'string', 'string']);
@@ -187,6 +189,7 @@ var Module = {
       reload,
       source,
       load,
+      fire,
       errors,
       writeAsset,
       readAsset,
@@ -593,13 +596,29 @@ function seekBoth(seconds) {
   }
 }
 
+// "Fire now" (§16.1): inject a one-frame event fire into both runtimes.
+function fireBoth(node, port) {
+  if (wasm) {
+    wasm.fire(node, port);
+  }
+  if (live) {
+    liveSend('fire', { node, port }).catch((err) =>
+        console.log(`editor: fire: ${err}`));
+  }
+  laneFlashes.set(`${node}/${port}`, performance.now());
+}
+
 document.getElementById('playBtn').onclick = () => setPaused(!paused);
 
 // ---- timeline panel (§16.5 editor mapping; read-only in v0) --------------
 
 const LANE_COLORS = ['#6aa1ff', '#7fd490', '#e3c56d', '#e0787d'];
 const RULER_H = 18, LANE_H = 42, GUTTER_W = 96;
+const FLASH_MS = 300;
 let timelines = []; // { seq, canvas }
+// Fires are one-frame phenomena; flashes are how the UI shows them.
+const cueFlashes = new Map();  // seqId/track/cueIdx -> performance.now()
+const laneFlashes = new Map(); // node/port -> performance.now()
 
 function refreshTimeline() {
   const container = document.getElementById('timeline');
@@ -618,6 +637,15 @@ function refreshTimeline() {
     const canvas = document.createElement('canvas');
     const tl = { seq, canvas, hits: [], laneRanges: [] };
     canvas.onmousedown = (e) => {
+      const button = (tl.fireButtons || []).find(
+          (b) => e.offsetX >= b.x0 && e.offsetX <= b.x1 &&
+                 e.offsetY >= b.y0 && e.offsetY <= b.y1);
+      if (button) {
+        fireBoth(seq.id, seq.tracks[button.lane].name);
+        suppressClick = true;
+        e.preventDefault();
+        return;
+      }
       const hit = tl.hits.find((h) => Math.abs(h.x - e.offsetX) < 7 &&
                                       Math.abs(h.y - e.offsetY) < 7);
       if (!hit) {
@@ -665,12 +693,40 @@ function refreshTimeline() {
       seekBoth(Math.min(Math.max(t, 0), seq.duration));
     };
     canvas.ondblclick = (e) => {
-      // Re-fit this lane's scale to its current keys.
       const lane = Math.floor((e.offsetY - RULER_H) / LANE_H);
-      if (lane >= 0 && lane < seq.tracks.length) {
-        laneRangeMemory.delete(
-            `${activeManifest()?.scene}/${seq.id}/${seq.tracks[lane].name}`);
+      if (lane < 0 || lane >= seq.tracks.length) {
+        return;
       }
+      const track = seq.tracks[lane];
+      if (e.offsetX < GUTTER_W) {
+        // Gutter: re-fit this lane's scale to its current keys.
+        laneRangeMemory.delete(
+            `${activeManifest()?.scene}/${seq.id}/${track.name}`);
+        return;
+      }
+      // Plot area: insert a cue / a key on the current curve at that time.
+      const plotW = canvas.clientWidth - GUTTER_W;
+      const t = Math.min(Math.max(
+          ((e.offsetX - GUTTER_W) / plotW) * seq.duration, 0), seq.duration);
+      if (track.kind === 'event') {
+        const cue = Math.min(t, seq.duration - 0.01);
+        if (track.fires.some((f) => Math.abs(f - cue) < 0.02)) {
+          return;
+        }
+        track.fires.push(+cue.toFixed(3));
+        track.fires.sort((a, b) => a - b);
+      } else {
+        if (track.keys.some((k) => Math.abs(k.t - t) < 0.02)) {
+          return;
+        }
+        const value = sampleTrack(track, t);
+        track.keys.push({
+          t: +t.toFixed(3),
+          value: value.length === 1 ? value[0] : value,
+        });
+        track.keys.sort((a, b) => a.t - b.t);
+      }
+      pushDocument();
     };
     container.appendChild(header);
     container.appendChild(canvas);
@@ -838,6 +894,23 @@ function closeKeyEditor(apply) {
   keyEdit.hidden = true;
 }
 
+document.getElementById('keyEditDel').onclick = () => {
+  if (!keyEditState) {
+    return;
+  }
+  const { tl, lane, keyIdx, comp } = keyEditState;
+  const track = tl.seq.tracks[lane];
+  const list = comp < 0 ? track.fires : track.keys;
+  if (list.length <= 1) {
+    console.log('editor: cannot delete the last key/cue (§13 requires one)');
+    return;
+  }
+  list.splice(keyIdx, 1);
+  keyEditState = null;
+  keyEdit.hidden = true;
+  pushDocument();
+};
+
 keyEdit.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     closeKeyEditor(true);
@@ -894,6 +967,8 @@ function drawTimeline(tl, playTime) {
 
   tl.hits = [];
   tl.laneRanges = [];
+  tl.fireButtons = [];
+  const now = performance.now();
   seq.tracks.forEach((track, lane) => {
     const top = RULER_H + lane * LANE_H;
     const bottom = top + LANE_H - 8;
@@ -913,22 +988,35 @@ function drawTimeline(tl, playTime) {
                  8, top + 26);
 
     if (track.kind === 'event') {
-      // Cue markers on a center line; drag moves them in time only.
+      // Cue markers on a center line; drag moves them in time only. The ⚡
+      // in the gutter is the "fire now" verb (§16.1); markers flash when
+      // the playhead crosses them or a manual fire lands.
       const y = (top + 8 + bottom) / 2;
       tl.laneRanges[lane] = { vmin: 0, vmax: 1, top: top + 8, bottom };
+      ctx.fillStyle = '#e3c56d';
+      ctx.font = '12px system-ui';
+      ctx.fillText('⚡', GUTTER_W - 22, y + 4);
+      tl.fireButtons.push({ x0: GUTTER_W - 28, y0: y - 10,
+                            x1: GUTTER_W - 8, y1: y + 10, lane });
       ctx.strokeStyle = '#2c3038';
       ctx.beginPath();
       ctx.moveTo(GUTTER_W, y);
       ctx.lineTo(cssW, y);
       ctx.stroke();
-      ctx.fillStyle = '#e3c56d';
+      const laneFlash =
+          now - (laneFlashes.get(`${seq.id}/${track.name}`) || 0) < FLASH_MS;
       track.fires.forEach((cue, keyIdx) => {
+        const flash = laneFlash ||
+            now - (cueFlashes.get(`${seq.id}/${track.name}/${keyIdx}`) || 0) <
+                FLASH_MS;
         const x = xOf(cue);
+        const r = flash ? 8 : 5;
+        ctx.fillStyle = flash ? '#ffffff' : '#e3c56d';
         ctx.beginPath();
-        ctx.moveTo(x, y - 5);
-        ctx.lineTo(x + 5, y);
-        ctx.lineTo(x, y + 5);
-        ctx.lineTo(x - 5, y);
+        ctx.moveTo(x, y - r);
+        ctx.lineTo(x + r, y);
+        ctx.lineTo(x, y + r);
+        ctx.lineTo(x - r, y);
         ctx.fill();
         tl.hits.push({ x, y, lane, keyIdx, comp: -1 });
         if (dragState && dragState.tl === tl && dragState.lane === lane &&
@@ -936,7 +1024,6 @@ function drawTimeline(tl, playTime) {
           ctx.fillStyle = '#d6d9de';
           ctx.font = '10px system-ui';
           ctx.fillText(`${cue.toFixed(2)}s`, x + 8, y - 7);
-          ctx.fillStyle = '#e3c56d';
         }
       });
       return;
@@ -1026,6 +1113,31 @@ function drawTimeline(tl, playTime) {
   document.getElementById('timeText').textContent =
       t !== null ? `${t.toFixed(2)}s` : '—';
   for (const timeline of timelines) {
+    // Flash cues the playhead crossed (mirrors the §9.9 crossing rules).
+    if (t !== null) {
+      const seq = timeline.seq;
+      const local = seq.loop
+          ? ((t % seq.duration) + seq.duration) % seq.duration
+          : Math.min(Math.max(t, 0), seq.duration);
+      const prev = timeline.prevLocal;
+      if (prev !== undefined && local !== prev) {
+        const wrapped = local < prev;
+        seq.tracks.forEach((track) => {
+          if (track.kind !== 'event') {
+            return;
+          }
+          track.fires.forEach((cue, cueIdx) => {
+            const fired = wrapped ? cue > prev || cue <= local
+                                  : cue > prev && cue <= local;
+            if (fired) {
+              cueFlashes.set(`${seq.id}/${track.name}/${cueIdx}`,
+                             performance.now());
+            }
+          });
+        });
+      }
+      timeline.prevLocal = local;
+    }
     drawTimeline(timeline, t);
   }
   requestAnimationFrame(tickTimelines);

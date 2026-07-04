@@ -48,6 +48,7 @@ public:
         bool previous = false;   // feedback edge: read frame N-1 (§10)
     };
     struct Output {
+        std::string name; // port name, filled by the loader
         Value value;
         bool dirty = false;
         // Previous-frame state (§10), maintained by Scene::render. prev and
@@ -137,6 +138,12 @@ public:
         return mSequences;
     }
 
+    // Manually fires an event output on the next frame (the editor's
+    // "fire now" verb, §16.1). Returns false for an unknown node/port or a
+    // non-event port. The injected fire behaves exactly like a produced
+    // one: downstream consumers see it dirty for that one frame.
+    bool fireEvent(const std::string& nodeId, const std::string& port);
+
 private:
     Scene() = default;
     friend struct SceneBuilder;
@@ -145,6 +152,7 @@ private:
     std::vector<std::unique_ptr<Node>> mNodes; // topological order
     std::vector<SceneParam> mParams;
     std::vector<class SequenceNode*> mSequences; // owned via mNodes
+    std::vector<std::pair<Node*, size_t>> mPendingFires;
     Node* mOutput = nullptr;
     bool mAnimated = false;
     uint64_t mFrame = 0;

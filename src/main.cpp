@@ -472,6 +472,29 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                                          std::string& error) {
             return applyDocument(&sceneJson, error);
         };
+        callbacks.fire = [anyScene, &firstScene, &scenes, &app](
+                             const std::string& node, const std::string& port,
+                             std::string& error) {
+            if (!anyScene()) {
+                error = "no scene loaded";
+                return false;
+            }
+            bool ok = false;
+            if (firstScene) {
+                ok = firstScene->fireEvent(node, port);
+            }
+            for (auto& [id, scene] : scenes) {
+                if (scene) {
+                    ok = scene->fireEvent(node, port) || ok;
+                }
+            }
+            if (!ok) {
+                error = "no event output '" + node + "." + port + "'";
+                return false;
+            }
+            app.requestRedrawAll();
+            return true;
+        };
         std::string error;
         if (!control.start(listenPort, std::move(callbacks), error)) {
             fprintf(stderr, "drift: control: %s\n", error.c_str());

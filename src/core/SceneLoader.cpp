@@ -1371,6 +1371,16 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         return nullptr;
     }
 
+    // Name every output port so runtime lookups (Scene::fireEvent) can
+    // resolve them the way references do.
+    for (const auto& [id, node] : mInstances) {
+        for (const auto& port : producerPorts(id)) {
+            if ((size_t)port.index < node->outputs.size()) {
+                node->outputs[port.index].name = port.name;
+            }
+        }
+    }
+
     // Nodes unreachable from the output (via any edge, feedback included)
     // are a warning and are never executed (§8).
     std::map<const Node*, bool> reachable;

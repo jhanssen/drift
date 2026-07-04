@@ -48,6 +48,24 @@ bool Node::inputsDirty() const
     return false;
 }
 
+bool Scene::fireEvent(const std::string& nodeId, const std::string& port)
+{
+    for (auto& node : mNodes) {
+        if (node->id != nodeId) {
+            continue;
+        }
+        for (size_t i = 0; i < node->outputs.size(); ++i) {
+            const Node::Output& out = node->outputs[i];
+            if (out.name == port && out.value.type == ValueType::Event) {
+                mPendingFires.push_back({ node.get(), i });
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 bool Scene::setParameter(const std::string& name, Value value)
 {
     for (size_t i = 0; i < mParams.size(); ++i) {
@@ -167,6 +185,14 @@ bool Scene::render(FrameContext& ctx)
             out.dirty = false;
         }
     }
+
+    // Injected event fires (fireEvent): applied after the clear so they
+    // read as fired for this whole frame; topo order puts every consumer
+    // after the producer, so all of them observe it.
+    for (auto& [node, index] : mPendingFires) {
+        node->outputs[index].dirty = true;
+    }
+    mPendingFires.clear();
 
     for (auto& node : mNodes) {
         if (node->alwaysEvaluate() || node->firstEvaluate ||
