@@ -505,3 +505,362 @@ accounts for but v1 does not implement:
 - Additional value nodes (add/multiply/mix/clamp, …) (§9.9)
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
 - `modules/` (WASM logic) and `graphs/` project directories (§1)
+
+## 16. Proposed Extension: Events & Sequencing (draft, not yet adopted)
+
+Status: proposal. Nothing in this section is part of the v1 format until folded
+into the sections above. It specifies discrete/timed behavior: starting and
+stopping video playback at chosen times, and — post-v1 — triggering things like
+particle bursts. It activates the `event` edge type reserved in §4.
+
+### 16.1 Motivation
+
+The format currently expresses only *continuous* animation (values as functions
+of time). Two further kinds of control are needed:
+
+- **Level-triggered** — a condition that holds over a span ("video plays from
+  10s to 25s"). Representable as an ordinary `scalar` that steps between 0 and
+  1; needs no new edge type, only a source for such signals and ports that
+  consume them.
+- **Edge-triggered** — an impulse at an instant ("restart the video", "burst
+  100 particles at t=12"). Not representable as a level; this is what `event`
+  edges are for.
+
+A future particle node is the canonical consumer of both: a continuous
+`rate: scalar` input (particles/sec) and a discrete `burst: event` input.
+
+The two halves are independently adoptable: `playing` (§16.3) plus `sequence`
+value tracks (§16.4) cover timed video start/stop with **no new edge type**;
+`event` edges can stay reserved until a one-shot consumer (video `restart`,
+particles) ships.
+
+### 16.2 The `event` Edge Type
+
+Amends §4. `event` becomes a wireable edge type:
+
+- An event edge carries no value; on any given frame it either **fires** or
+  does not. (Payloads are reserved for a future version.)
+- Connections only — there is no literal form, and parameters cannot be of
+  type `event` (unchanged: parameters are `scalar`/`vecN`).
+- No implicit conversions to or from `event`. (An event→level `latch`/`toggle`
+  value node is future §9.9 growth.)
+- Dirty semantics (§11): an event output is dirty exactly on frames it fires.
+  A fire is a one-frame phenomenon; there is no "current value" to retain.
+- `previous: true` (§7) is valid on an event edge and reads "fired on frame
+  N−1". The §10 acyclicity rule applies unchanged.
+
+### 16.3 `video` Playback Control
+
+Amends §9.2 with two input ports (both optional; a bare `video` node behaves
+exactly as today):
+
+| Kind  | Name      | Type     | Default | Notes                                    |
+|-------|-----------|----------|---------|------------------------------------------|
+| input | `playing` | `scalar` | `1`     | > 0.5 plays; otherwise pauses            |
+| input | `restart` | `event`  | —       | on fire: seek to 0, decode first frame   |
+
+- **Pause, not stop**: while `playing` ≤ 0.5, decoding is suspended (the same
+  machinery as presentation-suspend), the playback position freezes, and
+  `result` holds the last decoded frame, non-dirty. Resuming continues from
+  the paused position.
+- `restart` fires while paused: the first frame is decoded and `result` goes
+  dirty once (a poster frame); playback then waits on `playing`.
+- Change detection (§11) means a `playing` signal wired from a step-like
+  source is dirty only on the frames it actually flips — the node sees clean
+  start/stop transitions for free.
+
+### 16.4 The `sequence` Node
+
+A CPU-evaluated value node (§9.9 family): a timeline. It maps one scalar input
+(typically `@time.seconds`) through named **tracks**, each of which becomes an
+output port. Value tracks emit interpolated levels; event tracks fire at cue
+times.
+
+```json
+{
+  "id": "seq", "type": "sequence",
+  "duration": 40.0,
+  "loop": true,
+  "tracks": [
+    { "name": "videoOn", "kind": "value", "type": "scalar", "interpolate": "hold",
+      "keys": [ { "t": 0, "value": 0 }, { "t": 10, "value": 1 }, { "t": 25, "value": 0 } ] },
+    { "name": "drift", "kind": "value", "type": "vec2", "interpolate": "smooth",
+      "keys": [ { "t": 0, "value": [0.5, 0.5] }, { "t": 20, "value": [0.52, 0.48] } ] },
+    { "name": "burst", "kind": "event", "fires": [ 12.0, 30.0 ] }
+  ],
+  "inputs": { "time": "@time.seconds" }
+}
+```
+
+| Kind     | Name       | Type      | Default | Notes                              |
+|----------|------------|-----------|---------|------------------------------------|
+| property | `duration` | `scalar`  | —       | required, > 0, seconds             |
+| property | `loop`     | `bool`    | `true`  |                                    |
+| property | `tracks`   | —         | —       | required, array (see below)        |
+| input    | `time`     | `scalar`  | —       | required; typically `@time.seconds`|
+| output   | *(per track)* | *(per track)* |  | first track is the default output† |
+
+Local time is `t = loop ? mod(time, duration) : clamp(time, 0, duration)`.
+
+**Track objects** (`tracks` is an array; order fixes the default output and the
+editor's lane order):
+
+- `name` (required): identifier (§3), unique within the node; becomes the
+  output port name.
+- `kind` (required): `"value"` or `"event"`.
+
+Value tracks:
+
+- `type` (required): `scalar`, `vec2`, `vec3`, or `vec4`.
+- `interpolate` (optional, default `"linear"`): `"hold"` (step), `"linear"`,
+  or `"smooth"` (smoothstep between keys). Per-key easing is reserved.
+- `keys` (required, non-empty): array of `{ "t": seconds, "value": literal }`,
+  strictly ascending `t`, each `t` in `[0, duration]`.
+- Before the first key the output is the first key's value; after the last,
+  the last key's value (no wrap-around interpolation — when looping, the value
+  holds until local time wraps back past the first key).
+
+Event tracks:
+
+- `fires` (required, non-empty): ascending array of times in `[0, duration)`.
+- Crossing semantics: with previous local time `t0` and current `t1`, cues in
+  `(t0, t1]` fire; if the loop wrapped, cues in `(t0, duration)` and `[0, t1]`
+  fire. On the node's first evaluation, cues in `[0, t1]` fire. A cue therefore
+  fires exactly once per pass of the playhead, including once per loop
+  iteration.
+
+### 16.5 Dirty & Scheduling Semantics
+
+- The `sequence` node executes whenever `time` is dirty — every rendered
+  frame, like `wave`. Value-track outputs follow §11 change detection: a
+  `hold` track is dirty only on key-transition frames, so downstream nodes
+  (e.g. a paused video) stay fully quiescent between cues.
+- Consequence for the efficiency contract (DESIGN.md §10): a visually static
+  scene that is merely *waiting* for a cue still ticks the CPU value graph
+  each frame callback; the GPU schedules nothing. Runtimes may additionally
+  compute the next key/cue time and skip even CPU evaluation until then; this
+  is an implementation optimization with no format impact.
+- Multiple `sequence` nodes per scene are allowed; each is just a value node.
+
+### 16.6 Editor Mapping
+
+The node is deliberately shaped so a conventional timeline panel edits it
+directly — the JSON *is* the UI model:
+
+- One panel per `sequence` node: a time ruler from `0` to `duration`, a loop
+  toggle, one lane per track in array order. Value tracks draw as
+  step/line/curve lanes with draggable keys; event tracks draw as diamond cue
+  markers. Renaming a lane renames the output port.
+- **What vs. when**: the graph view owns *what* is affected (wiring
+  `@seq.videoOn` → `video.playing`); the timeline panel owns *when*. Neither
+  edits the other's domain, so the two views cannot conflict.
+- **Scrubbing**: the editor drives the node's `time` input directly (overriding
+  the wire while scrubbing). Value tracks are pure functions of `time`, so
+  scrub preview is exact and deterministic. Event cues are edge-triggered and
+  therefore a transport-policy question, not a format one — suggested policy:
+  fire cues when crossed during editor *playback*, suppress them during
+  drag-scrub, and offer a per-cue "fire now" button (a live-sync verb) for
+  testing one-shot effects in isolation.
+- **Live edit cost**: `tracks` is a property, so edits reload the node (§5) —
+  a CPU-only rebuild of key arrays, well within the <100ms hot-reload target;
+  output ports (and thus wiring) survive unless a track is renamed or removed.
+- Convenience gestures (non-normative): "add to timeline" on a wireable port
+  creates a matching value track and wires it; dragging a lane's header onto a
+  port wires that track.
+
+### 16.7 Validation Additions
+
+Load errors: `duration` missing or ≤ 0; empty `tracks`; duplicate or invalid
+track `name`; unknown `kind`; value track with empty `keys`, non-ascending
+`t`, `t` outside `[0, duration]`, or `value` not matching `type`; event track
+with empty or non-ascending `fires` or a time outside `[0, duration)`;
+`event` connection to a non-`event` port or vice versa.
+
+Load warnings: a `sequence` output port that nothing references.
+
+### 16.8 Effect on §15
+
+If adopted: `event` moves from "reserved" to specified (§16.2); event
+payloads, per-key easing, per-cue payload/latch nodes, and wake-until-next-cue
+scheduling hints join the reserved list.
+
+## 17. Proposed Amendments: Spec Gaps (draft, not yet adopted)
+
+Status: proposals. Each subsection is independently adoptable and states which
+existing section it amends. §17.4 additionally depends on §16 (`event`).
+Where noted, a proposal *codifies* what the runtime already does (verified
+against `src/core` as of 2026-07-03) rather than prescribing new behavior.
+
+### 17.1 Layer Sizing and the `fit` Node
+
+Gap: nothing defines how a texture whose size differs from the output maps
+onto the output-sized canvas — yet wiring a native-resolution image straight
+into `compositor` is the first thing every scene does (§14.1), and the same
+scene must hold up on 16:9, 21:9, and portrait outputs.
+
+Amendment to §9.5: a `compositor` layer whose texture size differs from the
+output is scaled to the output size (non-uniformly if aspect differs), linear
+filtering. This codifies current runtime behavior (each layer draws as a
+fullscreen pass). It is rarely what an author wants; aspect-correct placement
+goes through `fit` (not yet implemented):
+
+New node type `fit` — maps a source texture onto an output-sized canvas:
+
+| Kind     | Name     | Type      | Default   | Notes                             |
+|----------|----------|-----------|-----------|-----------------------------------|
+| property | `mode`   | `string`  | `"cover"` | `cover`, `contain`, `stretch`     |
+| input    | `source` | `texture` | —         | required                          |
+| output   | `result`†| `texture` |           | always output-sized               |
+
+- `cover`: uniform scale to fill the output, centered, overflow cropped — the
+  wallpaper default.
+- `contain`: uniform scale to fit entirely, centered, uncovered area
+  transparent.
+- `stretch`: non-uniform scale to fill exactly.
+
+Alignment other than centered is reserved. Under this amendment the §14
+examples would route backgrounds through a `fit` node
+(`{ "id": "bgFit", "type": "fit", "inputs": { "source": "@bg" } }`).
+
+### 17.2 Time Precision Over Long Uptimes
+
+Gap: `time.seconds` is a `scalar` (f32, §4), and wallpapers run for weeks. At
+one day of uptime f32 resolution is ~8 ms; at a month, ~0.25 s — `wave`-driven
+motion turns visibly steppy. Scene authors will not anticipate this.
+
+Implementation status: the scene clock itself is already double precision
+(`FrameContext::seconds`), but the value graph is not — the time node
+truncates to f32 on output, and `wave` computes its phase reduction in f32.
+The amendments below are therefore not yet implemented.
+
+Amendments:
+
+- CPU-evaluated value plumbing (§9.9 nodes, parameter application, port
+  literals) is computed in **double precision**; values convert to f32 only at
+  GPU boundaries (shader uniforms). The `scalar` edge type is unchanged as far
+  as authors are concerned.
+- Nodes that reduce an unbounded time-like input to a bounded range perform
+  the reduction in double precision *before* any f32 conversion: `wave`
+  reduces `input × frequency + phase` modulo one cycle; `sequence` (§16.4)
+  reduces to local time modulo `duration`.
+- Authoring guidance (non-normative): wire bounded signals (a `wave` output, a
+  `sequence` track) into shader params rather than raw `@time.seconds`; a raw
+  f32 seconds uniform degrades no matter what the CPU side does. A wrapped
+  time output (e.g. `@time.wrapped`, period-configurable) is reserved for
+  shaders that genuinely need continuous time.
+
+### 17.3 Scene Frame-Rate Cap
+
+Gap: anything wired to `@time.seconds` is dirty on every compositor frame
+callback, so a subtle ambient animation renders at full monitor refresh
+(144 Hz on a 144 Hz panel) with no way for the scene to declare that less is
+plenty.
+
+Amendment to §2 — optional top-level field:
+
+```json
+"maxFps": 30
+```
+
+- Number, > 0. The runtime skips frame callbacks as needed to approximate the
+  cap; `time.delta` reports real elapsed time, so animation speed is
+  unaffected.
+- This is a *ceiling*, composable with external policy: user settings or power
+  management may lower the effective rate further, never raise it above the
+  cap.
+- On runtimes predating this field it degrades safely: an unknown top-level
+  field is a load warning (§2), and the scene simply runs uncapped.
+- Per-node/per-subtree update rates are reserved.
+
+### 17.4 `video` End of Stream
+
+Depends on §16. Gap: behavior at end of a `loop: false` video is unspecified,
+and nothing can react to playback finishing.
+
+Amendment to §9.2 (with §16.3's ports):
+
+- With `loop: false`, after the final frame is produced the node holds that
+  frame (`result` non-dirty) and enters the finished state; `playing` has no
+  further effect until `restart` fires, which rearms playback from the start.
+  (Hold-last-frame is already the decoder's behavior — `VideoDecoder::frameAt`
+  returns the final frame forever after end of stream; this codifies it.)
+- New output port `finished: event` — fires on the frame the final decoded
+  frame is produced. Never fires while `loop: true`.
+- Chaining is the point: `finished` wired into a `sequence`-adjacent graph (or
+  another video's `restart`) enables playlist- and intro/loop-style scenes.
+
+### 17.5 Shader `size: "auto"` Resolution Rules
+
+Gap: §9.3 defines `"auto"` as "size of first texture input", but (a) "first"
+is undefined, and (b) the canonical feedback shader's first texture input is
+its own previous-frame output — a chicken-and-egg for size inference.
+
+Amendments to §9.3:
+
+- "First texture input" means the reflected `texture_2d<f32>` binding with the
+  lowest `@group`, then lowest `@binding`.
+- Size inference ignores connections with `previous: true` (§10). If every
+  texture input is a `previous` edge, or there are none, `"auto"` resolves to
+  the output size.
+- Authoring guidance: feedback shaders should declare an explicit
+  `size: [w, h]` when the ping-pong buffers must not track output size.
+
+Implementation status: implemented as specified — texture ports are ordered
+by (group, binding) at reflection, and size inference skips `previous` edges
+(without the exclusion, an auto-sized feedback shader locked onto its own
+history size and stopped tracking output resizes).
+
+### 17.6 Multi-Output Semantics
+
+Gap: multi-monitor is a v1 fast-follow (DESIGN.md §13.2) but the format is
+silent on what is shared versus per-output when one scene drives several
+monitors.
+
+Amendment — a scene on N outputs behaves as N logical instances with the
+following sharing rules:
+
+- **Per output**: all node outputs and dirty state, feedback ping-pong buffers
+  (§10), `mouse` (§9.8) — the pointer is only ever over one output.
+- **Shared: the scene clock.** `@time.seconds` is a single clock sampled by
+  each instance at its own frame callbacks. It pauses only while *all*
+  instances are paused; an instance resuming from occlusion therefore snaps
+  forward to the shared clock, keeping adjacent monitors in sync (rather than
+  each output drifting on its own resumed-where-it-left-off clock, §9.7).
+- **Shared: parameter values** (§6) — one user-facing setting, all outputs.
+- **Shared: video decode.** One decoder per `video` node feeds all instances;
+  each instance's `result` goes dirty as it observes new frames at its own
+  frame pacing. Decode suspends only when no instance is presenting.
+- Instances may share the computed results of any subgraph not downstream of
+  a per-output source (in v1: `mouse`) as a pure optimization; this is
+  observable-behavior-neutral and needs no format support.
+
+### 17.7 Small Clarifications
+
+Independently adoptable one-liners. The first three codify what the runtime
+already does; adopting them is purely a documentation change:
+
+- **`mouse` initial value** (§9.8): before the pointer first enters the
+  surface, `position` reads `[0.5, 0.5]` and `active` reads `0`. (Already
+  implemented.)
+- **`remap` degenerate range** (§9.9): when `inMax == inMin` (per component
+  for vectors), the result is `outMin` for that component — no division is
+  performed. (Already implemented.)
+- **`compositor` empty `layers`** (§9.5): a present-but-empty array is a load
+  error (the port is required and an empty stack renders nothing). (Already
+  implemented.)
+- **Parameter persistence** (§6): `scene.json` holds only *defaults*. User
+  overrides live in runtime-managed per-scene settings storage outside the
+  project directory; at load the runtime clamps stored values to the declared
+  `min`/`max` and drops overrides whose parameter or type no longer exists.
+- **Arithmetic value nodes** (§9.9 growth, all `T`-polymorphic per §4):
+  `add` (`a + b`), `multiply` (`a × b`), `mix` (`a + (b − a) × t`, `t` is
+  `scalar`), `clamp` (`min(max(value, lo), hi)`). Motivating footgun: today
+  the only way to scale a value is `remap`, whose `clamp` property defaults to
+  `true` — scaling an unbounded input like `@time.seconds` silently saturates
+  at `outMax`. `multiply` is the correct tool; docs should point at it.
+
+### 17.8 Effect on §15
+
+If adopted: `fit` alignment modes, `@time.wrapped`, per-node update rates, and
+per-layer `fit` on `compositor` join the reserved list; the "additional value
+nodes" bullet is partially discharged by §17.7's arithmetic nodes.
