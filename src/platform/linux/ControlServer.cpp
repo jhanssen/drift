@@ -14,6 +14,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include "platform/ParamJson.h"
 #include "WsCodec.h"
 
 namespace drift::platform {
@@ -23,54 +24,6 @@ namespace {
 // Pre-upgrade headers and per-message JSON are small; a peer exceeding this
 // is broken or hostile.
 constexpr size_t kMaxBuffered = 64 * 1024;
-
-std::string jsonEscape(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        switch (c) {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if ((unsigned char)c < 0x20) {
-                char buf[8];
-                snprintf(buf, sizeof(buf), "\\u%04x", c);
-                out += buf;
-            } else {
-                out.push_back(c);
-            }
-        }
-    }
-    return out;
-}
-
-std::string numberJson(double v)
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.17g", v);
-    return buf;
-}
-
-// Scene-literal form (§4): scalar as a number, vecN as an array.
-std::string valueJson(const core::Value& v)
-{
-    const int n = core::componentCount(v.type);
-    if (n <= 1) {
-        return numberJson(v.v[0]);
-    }
-    std::string out = "[";
-    for (int i = 0; i < n; ++i) {
-        if (i) {
-            out += ",";
-        }
-        out += numberJson(v.v[i]);
-    }
-    return out + "]";
-}
 
 bool parseValueJson(const glz::generic& j, core::Value& out)
 {
@@ -431,44 +384,8 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
 
     if (method == "describe") {
         const SceneInfo info = mCallbacks.describe();
-        std::string result = "{\"protocol\":1";
-        if (info.loaded) {
-            result += ",\"scene\":\"" + jsonEscape(info.name) + "\"";
-            result += ",\"animated\":";
-            result += info.animated ? "true" : "false";
-            result += ",\"parameters\":[";
-            for (size_t i = 0; i < info.parameters.size(); ++i) {
-                const core::SceneParam& p = info.parameters[i];
-                if (i) {
-                    result += ",";
-                }
-                result += "{\"name\":\"" + jsonEscape(p.name) + "\"";
-                result += ",\"type\":\"";
-                result += core::valueTypeName(p.type);
-                result += "\",\"value\":" + valueJson(p.value);
-                if (p.hasMin) {
-                    result += ",\"min\":" + valueJson(p.min);
-                }
-                if (p.hasMax) {
-                    result += ",\"max\":" + valueJson(p.max);
-                }
-                if (p.step != 0.0f) {
-                    result += ",\"step\":" + numberJson(p.step);
-                }
-                if (!p.label.empty()) {
-                    result += ",\"label\":\"" + jsonEscape(p.label) + "\"";
-                }
-                if (!p.hint.empty()) {
-                    result += ",\"hint\":\"" + jsonEscape(p.hint) + "\"";
-                }
-                result += "}";
-            }
-            result += "]";
-        } else {
-            result += ",\"scene\":null";
-        }
-        result += "}";
-        respond("\"result\":" + result);
+        respond("\"result\":" + describeJson(info.loaded, info.name,
+                                             info.animated, info.parameters));
         return;
     }
 

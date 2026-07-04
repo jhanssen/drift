@@ -77,9 +77,15 @@ if(EMSCRIPTEN)
         "-sALLOW_MEMORY_GROWTH=1"
         "-sSTACK_SIZE=1048576"
         "-sENVIRONMENT=web"
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap"
         "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/src/platform/web/shell.html"
         ${DRIFT_WEB_PRELOADS}
     )
+    # The editor page loads drift.js/.wasm/.data from its own directory.
+    add_custom_command(TARGET drift_web POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html"
+            "$<TARGET_FILE_DIR:drift_web>/editor.html")
     return()
 endif()
 

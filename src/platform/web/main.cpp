@@ -22,6 +22,7 @@
 #include <emscripten/html5.h>
 
 #include "core/Scene.h"
+#include "platform/ParamJson.h"
 
 namespace {
 
@@ -279,6 +280,43 @@ void requestDevice()
 }
 
 } // namespace
+
+// JS API for the editor page (same describe schema as the native control
+// endpoint — platform/ParamJson.h): call via ccall/cwrap after the scene
+// loads (describe returns {"scene":null} until then).
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE const char* drift_describe()
+{
+    static std::string json;
+    const drift::core::Scene* scene = gApp.scene.get();
+    json = drift::platform::describeJson(
+        scene != nullptr, scene ? scene->name() : std::string(),
+        scene && scene->animated(),
+        scene ? scene->parameters()
+              : std::vector<drift::core::SceneParam>());
+    return json.c_str();
+}
+
+// count selects scalar (1) through vec4 (4). Returns 0 for an unknown
+// name/type mismatch, like Scene::setParameter.
+EMSCRIPTEN_KEEPALIVE int drift_set_parameter(const char* name, double x,
+                                             double y, double z, double w,
+                                             int count)
+{
+    if (!gApp.scene || count < 1 || count > 4) {
+        return 0;
+    }
+    drift::core::Value value;
+    value.v = { x, y, z, w };
+    value.type = count == 1 ? drift::core::ValueType::Scalar
+               : count == 2 ? drift::core::ValueType::Vec2
+               : count == 3 ? drift::core::ValueType::Vec3
+                            : drift::core::ValueType::Vec4;
+    return gApp.scene->setParameter(name, value) ? 1 : 0;
+}
+
+} // extern "C"
 
 int main(int argc, char** argv)
 {

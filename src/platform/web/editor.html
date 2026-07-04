@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drift editor</title>
+<style>
+  :root {
+    --bg: #16181d; --panel: #1e2128; --edge: #2c3038;
+    --text: #d6d9de; --dim: #8a8f98; --accent: #6aa1ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg);
+               color: var(--text);
+               font: 13px/1.45 system-ui, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 340px; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  #canvas { flex: 1; width: 100%; min-height: 0; display: block;
+            background: #000; }
+  #statusbar { padding: 6px 12px; border-top: 1px solid var(--edge);
+               color: var(--dim); display: flex; gap: 18px;
+               white-space: nowrap; overflow: hidden; }
+  aside { border-left: 1px solid var(--edge); background: var(--panel);
+          overflow-y: auto; padding: 14px; }
+  h1 { font-size: 14px; margin: 0 0 14px; letter-spacing: .02em; }
+  h1 span { color: var(--dim); font-weight: normal; }
+  section { margin-bottom: 20px; }
+  section > h2 { font-size: 11px; text-transform: uppercase;
+                 letter-spacing: .08em; color: var(--dim); margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 0 0 110px; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; }
+  input, select, button {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; padding: 3px 6px;
+  }
+  input[type=range] { flex: 1; padding: 0; }
+  input[type=number] { width: 64px; }
+  input[type=color] { padding: 0; width: 44px; height: 24px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .ok { color: #7fd490; } .bad { color: #e0787d; } .warn { color: #e3c56d; }
+  #params .row { margin: 8px 0; }
+  .mismatch { color: #e3c56d; margin: 6px 0; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="canvas"></canvas>
+  <div id="statusbar">
+    <span id="wasmStatus">preview: starting…</span>
+    <span id="liveStatus">live: not connected</span>
+  </div>
+</main>
+<aside>
+  <h1>drift <span>editor</span></h1>
+
+  <section>
+    <h2>Preview scene</h2>
+    <div class="row">
+      <select id="sceneSelect"></select>
+    </div>
+  </section>
+
+  <section>
+    <h2>Live runtime</h2>
+    <div class="row">
+      <label for="port">ws://127.0.0.1:</label>
+      <input id="port" type="number" value="7681" min="1" max="65535">
+      <button id="connectBtn">Connect</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Parameters</h2>
+    <div id="mismatch" class="mismatch" hidden></div>
+    <div id="params"><span style="color:var(--dim)">none yet</span></div>
+  </section>
+</aside>
+
+<script>
+'use strict';
+
+// ---- wasm preview runtime (same artifacts as drift.html) -----------------
+
+const SCENES = ['plasma', 'buoy', 'follow', 'trail'];
+const query = new URLSearchParams(location.search);
+const sceneName = query.get('scene') || SCENES[0];
+
+const sceneSelect = document.getElementById('sceneSelect');
+for (const name of SCENES) {
+  const option = document.createElement('option');
+  option.value = name;
+  option.textContent = name;
+  option.selected = name === sceneName;
+  sceneSelect.appendChild(option);
+}
+sceneSelect.onchange = () => {
+  query.set('scene', sceneSelect.value);
+  location.search = query.toString(); // runtime scene switch = reload
+};
+
+let wasm = null;          // { describe(), set(name, values) }
+let wasmManifest = null;  // parsed describe once the scene is up
+
+var Module = {
+  canvas: document.getElementById('canvas'),
+  arguments: [sceneName],
+  onRuntimeInitialized() {
+    const describe = Module.cwrap('drift_describe', 'string', []);
+    const set = Module.cwrap('drift_set_parameter', 'number',
+        ['string', 'number', 'number', 'number', 'number', 'number']);
+    wasm = {
+      describe,
+      set(name, v) {
+        return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
+      },
+    };
+    // The scene loads after the async adapter/device dance; poll briefly.
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const info = JSON.parse(wasm.describe());
+      if (info.scene) {
+        clearInterval(timer);
+        wasmManifest = info;
+        setStatus('wasmStatus', `preview: ${info.scene}`, 'ok');
+        console.log(`editor: wasm scene '${info.scene}'`);
+        refreshPanel();
+      } else if (Date.now() - started > 8000) {
+        clearInterval(timer);
+        setStatus('wasmStatus', 'preview: unavailable (WebGPU?)', 'bad');
+        console.log('editor: wasm preview unavailable');
+      }
+    }, 200);
+  },
+};
+
+// ---- live runtime (ControlServer protocol v0) -----------------------------
+
+let live = null;          // WebSocket while connected
+let liveManifest = null;
+let nextId = 1;
+const pending = new Map();
+
+function liveSend(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    live.send(JSON.stringify(params ? { id, method, params }
+                                    : { id, method }));
+  });
+}
+
+function connectLive(port) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+  setStatus('liveStatus', 'live: connecting…');
+  ws.onopen = async () => {
+    live = ws;
+    document.getElementById('connectBtn').textContent = 'Disconnect';
+    try {
+      liveManifest = await liveSend('describe');
+      setStatus('liveStatus', `live: ${liveManifest.scene ?? 'no scene'}`, 'ok');
+      console.log(`editor: live scene '${liveManifest.scene}'`);
+      // Preview mirrors the wallpaper's current state.
+      if (wasm && liveManifest.parameters) {
+        for (const p of liveManifest.parameters) {
+          wasm.set(p.name, [].concat(p.value));
+        }
+      }
+      refreshPanel();
+    } catch (err) {
+      setStatus('liveStatus', `live: ${err}`, 'bad');
+    }
+  };
+  ws.onmessage = (msg) => {
+    const data = JSON.parse(msg.data);
+    if (data.id !== undefined && pending.has(data.id)) {
+      const { resolve, reject } = pending.get(data.id);
+      pending.delete(data.id);
+      data.error !== undefined ? reject(data.error) : resolve(data.result);
+      return;
+    }
+    if (data.event === 'parameter') {
+      // Someone else (driftctl, another editor) changed it.
+      applyParam(data.name, [].concat(data.value), { fromRemote: true });
+    }
+  };
+  ws.onclose = () => {
+    if (live === ws) {
+      live = null;
+      liveManifest = null;
+      document.getElementById('connectBtn').textContent = 'Connect';
+      setStatus('liveStatus', 'live: not connected');
+      console.log('editor: live disconnected');
+      refreshPanel();
+    }
+  };
+  ws.onerror = () => setStatus('liveStatus', 'live: connection failed', 'bad');
+}
+
+document.getElementById('connectBtn').onclick = () => {
+  if (live) {
+    live.close();
+  } else {
+    connectLive(document.getElementById('port').value);
+  }
+};
+
+// ---- parameter panel ------------------------------------------------------
+
+const widgets = new Map(); // name -> { update(values) }
+
+function activeManifest() {
+  return liveManifest?.parameters ? liveManifest : wasmManifest;
+}
+
+// Fan an edit out to every attached runtime; remote-originated changes only
+// update the preview and the widgets (the live app already applied them).
+function applyParam(name, values, { fromRemote = false } = {}) {
+  if (wasm) {
+    wasm.set(name, values);
+  }
+  if (live && !fromRemote) {
+    liveSend('set', { name, value: values.length === 1 ? values[0] : values })
+        .catch((err) => console.log(`editor: set ${name}: ${err}`));
+  }
+  widgets.get(name)?.update(values);
+}
+
+function refreshPanel() {
+  const manifest = activeManifest();
+  const container = document.getElementById('params');
+  const mismatch = document.getElementById('mismatch');
+  mismatch.hidden = !(wasmManifest && liveManifest?.scene &&
+                      wasmManifest.scene !== liveManifest.scene);
+  if (!mismatch.hidden) {
+    mismatch.textContent = `preview shows '${wasmManifest.scene}' but the ` +
+                           `live scene is '${liveManifest.scene}'`;
+  }
+  container.textContent = '';
+  widgets.clear();
+  if (!manifest?.parameters?.length) {
+    container.innerHTML = '<span style="color:var(--dim)">' +
+        (manifest ? 'scene has no parameters' : 'none yet') + '</span>';
+    return;
+  }
+  for (const param of manifest.parameters) {
+    container.appendChild(buildWidget(param));
+  }
+}
+
+function buildWidget(param) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  const label = document.createElement('label');
+  label.textContent = param.label || param.name;
+  label.title = param.name;
+  row.appendChild(label);
+
+  const values = [].concat(param.value);
+  const isColor = param.hint === 'color' &&
+                  (param.type === 'vec3' || param.type === 'vec4');
+
+  if (param.type === 'scalar') {
+    const min = param.min ?? 0;
+    const max = param.max ?? 1;
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = min;
+    slider.max = max;
+    slider.step = param.step || (max - min) / 1000;
+    const number = document.createElement('input');
+    number.type = 'number';
+    number.step = slider.step;
+    const push = (v) => applyParam(param.name, [Number(v)]);
+    slider.oninput = () => push(slider.value);
+    number.onchange = () => push(number.value);
+    row.appendChild(slider);
+    row.appendChild(number);
+    widgets.set(param.name, {
+      update([v]) { slider.value = v; number.value = +v.toFixed(4); },
+    });
+  } else if (isColor) {
+    const color = document.createElement('input');
+    color.type = 'color';
+    const alpha = param.type === 'vec4' ? document.createElement('input') : null;
+    if (alpha) {
+      alpha.type = 'number';
+      alpha.min = 0;
+      alpha.max = 1;
+      alpha.step = 0.01;
+      alpha.title = 'alpha';
+    }
+    const current = () => {
+      const rgb = [1, 3, 5].map(
+          (i) => parseInt(color.value.slice(i, i + 2), 16) / 255);
+      return alpha ? [...rgb, Number(alpha.value)] : rgb;
+    };
+    color.oninput = () => applyParam(param.name, current());
+    if (alpha) {
+      alpha.onchange = () => applyParam(param.name, current());
+      row.appendChild(alpha);
+    }
+    row.insertBefore(color, alpha);
+    widgets.set(param.name, {
+      update(v) {
+        color.value = '#' + v.slice(0, 3).map((c) =>
+            Math.round(Math.max(0, Math.min(1, c)) * 255)
+                .toString(16).padStart(2, '0')).join('');
+        if (alpha) alpha.value = +(v[3] ?? 1).toFixed(2);
+      },
+    });
+  } else {
+    const arity = { vec2: 2, vec3: 3, vec4: 4 }[param.type] ?? values.length;
+    const inputs = [];
+    for (let i = 0; i < arity; ++i) {
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = param.step || 0.01;
+      input.onchange = () =>
+          applyParam(param.name, inputs.map((box) => Number(box.value)));
+      inputs.push(input);
+      row.appendChild(input);
+    }
+    widgets.set(param.name, {
+      update(v) { inputs.forEach((box, i) => box.value = +v[i].toFixed(4)); },
+    });
+  }
+
+  widgets.get(param.name).update(values);
+  return row;
+}
+
+function setStatus(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = cls || '';
+}
+
+// ?connect=PORT auto-connects (handy for tests and a fixed dev setup).
+if (query.get('connect')) {
+  connectLive(query.get('connect'));
+}
+</script>
+<script async src="drift.js"></script>
+</body>
+</html>
