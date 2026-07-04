@@ -317,7 +317,8 @@ void ImageNode::evaluate(FrameContext& ctx)
         wgpu::TextureDescriptor desc{};
         desc.format = wgpu::TextureFormat::RGBA16Float;
         desc.size = { mWidth, mHeight, 1 };
-        desc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+        desc.usage = wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc;
         mTexture = ctx.device.CreateTexture(&desc);
 
         wgpu::TexelCopyTextureInfo dst{};
@@ -460,7 +461,8 @@ void TransformNode::evaluate(FrameContext& ctx)
         desc.format = wgpu::TextureFormat::RGBA16Float;
         desc.size = { ctx.targetWidth, ctx.targetHeight, 1 };
         desc.usage = wgpu::TextureUsage::RenderAttachment |
-                     wgpu::TextureUsage::TextureBinding;
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
         mColor = ctx.device.CreateTexture(&desc);
         mWidth = ctx.targetWidth;
         mHeight = ctx.targetHeight;
@@ -595,7 +597,8 @@ void CompositorNode::evaluate(FrameContext& ctx)
         desc.format = wgpu::TextureFormat::RGBA16Float;
         desc.size = { ctx.targetWidth, ctx.targetHeight, 1 };
         desc.usage = wgpu::TextureUsage::RenderAttachment |
-                     wgpu::TextureUsage::TextureBinding;
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
         mColor = ctx.device.CreateTexture(&desc);
         mWidth = ctx.targetWidth;
         mHeight = ctx.targetHeight;
@@ -711,7 +714,9 @@ void ShaderNode::evaluate(FrameContext& ctx)
         wgpu::TextureDescriptor desc{};
         desc.format = wgpu::TextureFormat::RGBA16Float;
         desc.size = { width, height, 1 };
-        desc.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
         mColor = ctx.device.CreateTexture(&desc);
         mWidth = width;
         mHeight = height;

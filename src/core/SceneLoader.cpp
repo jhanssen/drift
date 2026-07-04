@@ -285,6 +285,19 @@ private:
     Node* makeNode(const RawNode& raw, std::vector<PortDef>& portsOut);
     bool bindInputs(const RawNode& raw, Node* node, const std::vector<PortDef>& ports);
     bool resolveInputType(const RawNode& raw, const RawInput& in, ValueType& out);
+    bool bindDeferred();
+
+    // Feedback edges bind after all nodes exist — the producer may come
+    // later in topo order (or be the consumer itself).
+    struct DeferredBind {
+        Node* node;
+        size_t inputIdx;
+        std::string consumerId; // for error messages
+        std::string portName;
+        RawConn conn;
+        ValueType portType;
+    };
+    std::vector<DeferredBind> mDeferredBinds;
 
     const AssetReader& mReadAsset;
     const wgpu::Device& mDevice;
@@ -401,21 +414,13 @@ bool Loader::parseNodes(const glz::generic& json)
                     fail("node '" + raw.id + "' input '" + port + "': " + err);
                     return false;
                 }
-                bool connOk = true;
                 forEachConn(in, [&](const RawConn& conn) {
-                    if (conn.previous) {
-                        fail("node '" + raw.id + "' input '" + port +
-                             "': previous-frame reads are not implemented yet");
-                        connOk = false;
-                    } else if (conn.node == "time") {
+                    if (conn.node == "time") {
                         mNeedsTime = true;
                     } else if (conn.node == "mouse") {
                         mNeedsMouse = true;
                     }
                 });
-                if (!connOk) {
-                    return false;
-                }
                 raw.inputs[port] = std::move(in);
             }
         }
@@ -444,6 +449,11 @@ bool Loader::topoSort()
                     fail("node '" + mRawNodes[i].id + "' input '" + port +
                          "': unknown node '" + conn.node + "'");
                     ok = false;
+                    return;
+                }
+                // Feedback edges don't constrain evaluation order; the graph
+                // only has to be acyclic without them (§10).
+                if (conn.previous) {
                     return;
                 }
                 adjacency[it->second].push_back(i);
@@ -494,7 +504,18 @@ bool Loader::resolveInputType(const RawNode& raw, const RawInput& in, ValueType&
         return true;
     }
     case RawInput::Kind::Conn: {
-        Node* src = mInstances[in.conn.node]; // topo order: already created
+        // Topo order guarantees non-feedback producers exist. A feedback
+        // edge can point at a node not created yet — only reachable here
+        // when it determines a polymorphic port's type, which we don't
+        // support (the producer's own type may depend on this node).
+        auto instIt = mInstances.find(in.conn.node);
+        if (instIt == mInstances.end()) {
+            fail("node '" + raw.id + "': cannot resolve a polymorphic type "
+                 "through a feedback edge to '" + in.conn.node +
+                 "' (wire the type-determining input without 'previous')");
+            return false;
+        }
+        Node* src = instIt->second;
         const auto ports = outputPortsFor(
             isImplicitNode(in.conn.node) ? in.conn.node
                                          : mRawNodes[mRawIndex[in.conn.node]].type);
@@ -742,6 +763,13 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
         node->inputs.resize(it->second.elements.size());
         for (size_t i = 0; i < it->second.elements.size(); ++i) {
             const RawInput& element = it->second.elements[i];
+            if (element.conn.previous) {
+                node->inputs[i].type = port.type;
+                mDeferredBinds.push_back({ node, i, raw.id,
+                                           port.name + "[" + std::to_string(i) + "]",
+                                           element.conn, port.type });
+                continue;
+            }
             ValueType srcType;
             if (!resolveInputType(raw, element, srcType)) {
                 return false;
@@ -788,6 +816,12 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
         Node::Input& in = node->inputs[portIdx];
         const ValueType portType = ports[portIdx].type;
         in.type = portType;
+
+        if (rawIn.kind == RawInput::Kind::Conn && rawIn.conn.previous) {
+            mDeferredBinds.push_back({ node, (size_t)portIdx, raw.id, portName,
+                                       rawIn.conn, portType });
+            continue;
+        }
 
         ValueType srcType;
         if (!resolveInputType(raw, rawIn, srcType)) {
@@ -849,6 +883,53 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
         in.type = ports[i].type;
         in.constant.type = ports[i].type;
         in.constant.v = ports[i].def;
+    }
+    return true;
+}
+
+// Second pass: feedback edges, bound once every node exists (§10). Marks
+// texture producers so Scene::render maintains their history copies.
+bool Loader::bindDeferred()
+{
+    for (const auto& d : mDeferredBinds) {
+        Node* src = mInstances[d.conn.node]; // existence checked in topoSort
+        const auto ports = outputPortsFor(
+            isImplicitNode(d.conn.node) ? d.conn.node
+                                        : mRawNodes[mRawIndex[d.conn.node]].type);
+        int idx = 0;
+        if (!d.conn.port.empty()) {
+            idx = -1;
+            for (const auto& p : ports) {
+                if (d.conn.port == p.name) {
+                    idx = p.index;
+                    break;
+                }
+            }
+            if (idx < 0 || (size_t)idx >= src->outputs.size()) {
+                fail("node '" + d.consumerId + "': node '" + d.conn.node +
+                     "' has no output port '" + d.conn.port + "'");
+                return false;
+            }
+        }
+
+        const ValueType srcType = src->outputs[idx].value.type;
+        Node::Input& in = d.node->inputs[d.inputIdx];
+        if (srcType != d.portType) {
+            if (srcType == ValueType::Scalar && d.portType != ValueType::Texture) {
+                in.splat = true;
+            } else {
+                fail("node '" + d.consumerId + "' input '" + d.portName +
+                     "': type mismatch (" + valueTypeName(srcType) + " -> " +
+                     valueTypeName(d.portType) + ")");
+                return false;
+            }
+        }
+        in.srcNode = src;
+        in.srcPort = idx;
+        in.previous = true;
+        if (srcType == ValueType::Texture) {
+            src->outputs[idx].needsHistory = true;
+        }
     }
     return true;
 }
@@ -926,6 +1007,9 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         if (!instantiate(mRawNodes[idx])) {
             return nullptr;
         }
+    }
+    if (!bindDeferred()) {
+        return nullptr;
     }
     if (!mOutput) {
         fail("scene has no output node");

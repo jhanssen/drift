@@ -20,6 +20,17 @@ const char* kMinimalWgsl = R"(
     }
 )";
 
+const char* kTrailWgsl = R"(
+    @group(0) @binding(0) var current: texture_2d<f32>;
+    @group(0) @binding(1) var current_sampler: sampler;
+    @group(0) @binding(2) var history: texture_2d<f32>;
+    @group(0) @binding(3) var history_sampler: sampler;
+    @fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+        return textureSample(current, current_sampler, uv) +
+               textureSample(history, history_sampler, uv) * 0.9;
+    }
+)";
+
 // A valid 2x2 RGBA PNG.
 const unsigned char kTinyPng[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2,
@@ -56,6 +67,7 @@ LoadResult load(const std::string& json)
 {
     const std::map<std::string, std::string> assets = {
         { "shaders/minimal.wgsl", kMinimalWgsl },
+        { "shaders/trail.wgsl", kTrailWgsl },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
         { "assets/corrupt.png", "this is not a png" },
@@ -158,17 +170,82 @@ TEST_CASE("cycles without previous edges are rejected")
     CHECK(r.hasError("cycle"));
 }
 
-TEST_CASE("previous-frame reads are a load error until implemented")
+TEST_CASE("self-feedback texture edge loads (trail pattern)")
 {
     auto r = load(R"({
         "version": 1, "name": "x",
         "nodes": [
-            { "id": "a", "type": "remap",
-              "inputs": { "value": { "node": "a", "previous": true } } }
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "trail", "type": "shader", "shader": "shaders/trail.wgsl",
+              "inputs": { "current": "@fx",
+                          "history": { "node": "trail", "previous": true } } },
+            { "id": "out", "type": "output", "inputs": { "color": "@trail" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+}
+
+TEST_CASE("value cycle through a previous edge loads")
+{
+    // w1 <- previous(w2) <- w1: legal because one edge is a feedback edge.
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "w1", "type": "wave",
+              "inputs": { "input": { "node": "w2", "previous": true } } },
+            { "id": "w2", "type": "wave", "inputs": { "input": "@w1" } },
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": "@w2" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+}
+
+TEST_CASE("previous edge to an unknown node is rejected")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "w", "type": "wave",
+              "inputs": { "input": { "node": "ghost", "previous": true } } }
         ]
     })");
     CHECK(r.scene == nullptr);
-    CHECK(r.hasError("not implemented"));
+    CHECK(r.hasError("unknown node 'ghost'"));
+}
+
+TEST_CASE("polymorphic type cannot resolve through a feedback edge")
+{
+    // remap's T comes from 'value'; a self-feedback edge there is circular.
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "acc", "type": "remap",
+              "inputs": { "value": { "node": "acc", "previous": true } } }
+        ]
+    })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("feedback edge"));
+}
+
+TEST_CASE("previous edge type mismatches are still rejected")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "w", "type": "wave",
+              "inputs": { "input": { "node": "fx", "previous": true } } }
+        ]
+    })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("type mismatch"));
 }
 
 TEST_CASE("mouse is an implicit input node")

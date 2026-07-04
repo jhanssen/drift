@@ -40,10 +40,19 @@ public:
         int srcPort = -1;
         ValueType type = ValueType::Scalar; // resolved port type
         bool splat = false;      // scalar source feeding a vecN port
+        bool previous = false;   // feedback edge: read frame N-1 (§10)
     };
     struct Output {
         Value value;
         bool dirty = false;
+        // Previous-frame state (§10), maintained by Scene::render. prev and
+        // prevDirty snapshot value/dirty at frame start; texture outputs read
+        // through a feedback edge additionally keep their last written
+        // contents in a history copy (needsHistory is set by the loader).
+        Value prev;
+        bool prevDirty = false;
+        bool needsHistory = false;
+        wgpu::Texture history;
     };
 
     virtual ~Node() = default;
@@ -89,6 +98,9 @@ private:
     uint64_t mFrame = 0;
     uint32_t mLastWidth = 0, mLastHeight = 0;
     wgpu::TextureFormat mLastFormat = wgpu::TextureFormat::Undefined;
+    // 1x1 transparent texture: what a feedback edge reads before its
+    // producer has ever been written (§10 first-frame rule).
+    wgpu::Texture mBlank;
 };
 
 } // namespace drift::core

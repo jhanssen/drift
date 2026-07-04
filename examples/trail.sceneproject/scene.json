@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "name": "Trail",
+  "description": "Previous-frame feedback demo: a dot circling with a fading trail",
+  "parameters": {
+    "speed": { "type": "scalar", "default": 0.2, "min": 0.02, "max": 1, "label": "Orbit speed" },
+    "decay": { "type": "scalar", "default": 0.94, "min": 0.5, "max": 0.99, "label": "Trail persistence" }
+  },
+  "nodes": [
+    { "id": "wx", "type": "wave", "inputs": { "input": "@time.seconds", "frequency": "$speed" } },
+    { "id": "wy", "type": "wave", "inputs": { "input": "@time.seconds", "frequency": "$speed", "phase": 0.25 } },
+    { "id": "px", "type": "remap", "inputs": { "value": "@wx", "inMin": -1, "inMax": 1, "outMin": 0.3, "outMax": 0.7 } },
+    { "id": "py", "type": "remap", "inputs": { "value": "@wy", "inMin": -1, "inMax": 1, "outMin": 0.2, "outMax": 0.8 } },
+    { "id": "pos", "type": "combine", "inputs": { "x": "@px", "y": "@py" } },
+
+    { "id": "dot", "type": "shader", "shader": "shaders/dot.wgsl",
+      "inputs": { "pos": "@pos" } },
+
+    { "id": "trail", "type": "shader", "shader": "shaders/trail.wgsl",
+      "inputs": { "decay": "$decay",
+                  "current": "@dot",
+                  "history": { "node": "trail", "previous": true } } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@trail" } }
+  ]
+}

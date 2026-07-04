@@ -6,8 +6,9 @@ and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 
 Status: early. Loads and renders `.sceneproject` scenes with the core node
 set: image (PNG/JPEG), shader, transform, compositor, wave, remap, combine,
-split, and the implicit time/mouse inputs. Video and previous-frame feedback
-are next. Wayland (wlr-layer-shell compositors) only.
+split, the implicit time/mouse inputs, and previous-frame feedback edges
+(`"previous": true`) for trails and iterative effects. Video is next.
+Wayland (wlr-layer-shell compositors) only.
 
 ## Build
 
