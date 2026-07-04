@@ -4,9 +4,10 @@ A declarative, GPU-accelerated desktop scene runtime for animated wallpapers
 and ambient visual experiences. See [docs/DESIGN.md](docs/DESIGN.md) and
 [docs/SCENE_FORMAT.md](docs/SCENE_FORMAT.md).
 
-Status: early. Loads and renders `.sceneproject` scenes with a first node set
-(shader, wave, remap, combine, split, time, output); image/video/transform/
-compositor/mouse nodes are next. Wayland (wlr-layer-shell compositors) only.
+Status: early. Loads and renders `.sceneproject` scenes with the core node
+set: image (PNG/JPEG), shader, transform, compositor, wave, remap, combine,
+split, time, output. Video, mouse input, and previous-frame feedback are
+next. Wayland (wlr-layer-shell compositors) only.
 
 ## Build
 

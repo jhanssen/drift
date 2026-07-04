@@ -36,7 +36,7 @@ add_library(drift_core STATIC
     src/core/Nodes.cpp
     src/core/WgslInterface.cpp
 )
-target_include_directories(drift_core PUBLIC src)
+target_include_directories(drift_core PUBLIC src PRIVATE 3rdparty/stb)
 target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn PRIVATE glaze::glaze)
 
 # ---- drift: native Linux/Wayland runtime ----
@@ -82,10 +82,14 @@ if(BUILD_TESTING)
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest)
     add_test(NAME unit COMMAND drift_tests)
 
-    add_test(NAME golden_plasma COMMAND
-        ${CMAKE_SOURCE_DIR}/tests/golden.sh
-        $<TARGET_FILE:drift> $<TARGET_FILE:imgcmp>
-        ${CMAKE_SOURCE_DIR}/examples/plasma.sceneproject
-        ${CMAKE_SOURCE_DIR}/tests/golden/plasma
-    )
+    function(drift_golden_test name)
+        add_test(NAME golden_${name} COMMAND
+            ${CMAKE_SOURCE_DIR}/tests/golden.sh
+            $<TARGET_FILE:drift> $<TARGET_FILE:imgcmp>
+            ${CMAKE_SOURCE_DIR}/examples/${name}.sceneproject
+            ${CMAKE_SOURCE_DIR}/tests/golden/${name}
+        )
+    endfunction()
+    drift_golden_test(plasma)
+    drift_golden_test(buoy)
 endif()

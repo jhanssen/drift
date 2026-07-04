@@ -34,10 +34,11 @@ struct RawConn {
 };
 
 struct RawInput {
-    enum class Kind { Literal, Param, Conn } kind = Kind::Literal;
+    enum class Kind { Literal, Param, Conn, Array } kind = Kind::Literal;
     Value literal;
     std::string param;
     RawConn conn;
+    std::vector<RawInput> elements; // Array: texture[] ports (§9.5)
 };
 
 struct RawNode {
@@ -147,12 +148,53 @@ bool parseRawInput(const glz::generic& j, RawInput& out, std::string& err)
         }
         return true;
     }
+    // An array whose elements aren't all numbers is an array-valued port
+    // (texture[], §9.5): each element follows the reference grammar.
+    if (j.is_array()) {
+        const auto& arr = j.get_array();
+        bool allNumbers = !arr.empty();
+        for (const auto& e : arr) {
+            if (!e.is_number()) {
+                allNumbers = false;
+                break;
+            }
+        }
+        if (!allNumbers) {
+            out.kind = RawInput::Kind::Array;
+            for (const auto& e : arr) {
+                RawInput element;
+                if (!parseRawInput(e, element, err)) {
+                    return false;
+                }
+                if (element.kind != RawInput::Kind::Conn) {
+                    err = "array elements must be connections";
+                    return false;
+                }
+                out.elements.push_back(std::move(element));
+            }
+            return true;
+        }
+    }
+
     if (!parseLiteral(j, out.literal)) {
         err = "invalid literal (number or array of 2-4 numbers)";
         return false;
     }
     out.kind = RawInput::Kind::Literal;
     return true;
+}
+
+// Applies fn to every connection in an input, descending into arrays.
+template <typename Fn>
+void forEachConn(const RawInput& in, Fn&& fn)
+{
+    if (in.kind == RawInput::Kind::Conn) {
+        fn(in.conn);
+    } else if (in.kind == RawInput::Kind::Array) {
+        for (const auto& e : in.elements) {
+            fn(e.conn);
+        }
+    }
 }
 
 // Static input port tables for the fixed-signature node types. Polymorphic
@@ -164,6 +206,7 @@ struct PortDef {
     ValueType type;
     bool required;
     std::array<float, 4> def{};
+    bool array = false; // texture[]: expands to one Node::Input per element
 };
 
 const PortDef kWaveInputs[] = {
@@ -189,6 +232,17 @@ const PortDef kSplitInputs[] = {
 };
 const PortDef kOutputInputs[] = {
     { "color", ValueType::Texture, true },
+};
+const PortDef kTransformInputs[] = {
+    { "source", ValueType::Texture, true },
+    { "position", ValueType::Vec2, false, { 0.5f, 0.5f } },
+    { "rotation", ValueType::Scalar, false, { 0, 0, 0, 0 } },
+    { "scale", ValueType::Vec2, false, { 1, 1 } },
+    { "anchor", ValueType::Vec2, false, { 0.5f, 0.5f } },
+    { "opacity", ValueType::Scalar, false, { 1, 0, 0, 0 } },
+};
+const PortDef kCompositorInputs[] = {
+    { "layers", ValueType::Texture, true, {}, true },
 };
 
 struct OutputPortDef {
@@ -340,20 +394,22 @@ bool Loader::parseNodes(const glz::generic& json)
                     fail("node '" + raw.id + "' input '" + port + "': " + err);
                     return false;
                 }
-                if (in.kind == RawInput::Kind::Conn) {
-                    if (in.conn.previous) {
+                bool connOk = true;
+                forEachConn(in, [&](const RawConn& conn) {
+                    if (conn.previous) {
                         fail("node '" + raw.id + "' input '" + port +
                              "': previous-frame reads are not implemented yet");
-                        return false;
-                    }
-                    if (in.conn.node == "mouse") {
+                        connOk = false;
+                    } else if (conn.node == "mouse") {
                         fail("node '" + raw.id + "' input '" + port +
                              "': mouse input is not implemented yet");
-                        return false;
-                    }
-                    if (in.conn.node == "time") {
+                        connOk = false;
+                    } else if (conn.node == "time") {
                         mNeedsTime = true;
                     }
+                });
+                if (!connOk) {
+                    return false;
                 }
                 raw.inputs[port] = std::move(in);
             }
@@ -373,17 +429,24 @@ bool Loader::topoSort()
 
     for (size_t i = 0; i < n; ++i) {
         for (const auto& [port, in] : mRawNodes[i].inputs) {
-            if (in.kind != RawInput::Kind::Conn || in.conn.node == "time") {
-                continue;
-            }
-            auto it = mRawIndex.find(in.conn.node);
-            if (it == mRawIndex.end()) {
-                fail("node '" + mRawNodes[i].id + "' input '" + port +
-                     "': unknown node '" + in.conn.node + "'");
+            bool ok = true;
+            forEachConn(in, [&](const RawConn& conn) {
+                if (conn.node == "time") {
+                    return;
+                }
+                auto it = mRawIndex.find(conn.node);
+                if (it == mRawIndex.end()) {
+                    fail("node '" + mRawNodes[i].id + "' input '" + port +
+                         "': unknown node '" + conn.node + "'");
+                    ok = false;
+                    return;
+                }
+                adjacency[it->second].push_back(i);
+                ++indegree[i];
+            });
+            if (!ok) {
                 return false;
             }
-            adjacency[it->second].push_back(i);
-            ++indegree[i];
         }
     }
 
@@ -447,6 +510,9 @@ bool Loader::resolveInputType(const RawNode& raw, const RawInput& in, ValueType&
         out = src->outputs[idx].value.type;
         return true;
     }
+    case RawInput::Kind::Array:
+        fail("node '" + raw.id + "': array value is only valid on an array port");
+        return false;
     }
     return false;
 }
@@ -592,6 +658,43 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         return new ShaderNode(std::move(source), std::move(iface), width, height);
     }
 
+    if (raw.type == "image") {
+        const auto& obj = raw.json->get_object();
+        auto srcIt = obj.find("src");
+        if (srcIt == obj.end() || !srcIt->second.is_string()) {
+            fail("node '" + raw.id + "': image node needs a string 'src' path");
+            return nullptr;
+        }
+        const std::string& path = srcIt->second.get_string();
+        if (path.find("..") != std::string::npos || path.starts_with("/")) {
+            fail("node '" + raw.id + "': image path escapes the project");
+            return nullptr;
+        }
+        std::string bytes;
+        if (!mReadAsset(path, bytes)) {
+            fail("node '" + raw.id + "': cannot read image '" + path + "'");
+            return nullptr;
+        }
+        std::string err;
+        ImageNode* node = ImageNode::decode(bytes, err);
+        if (!node) {
+            fail("node '" + raw.id + "': cannot decode '" + path + "': " + err);
+            return nullptr;
+        }
+        portsOut.clear();
+        return node;
+    }
+
+    if (raw.type == "transform") {
+        portsOut.assign(std::begin(kTransformInputs), std::end(kTransformInputs));
+        return new TransformNode();
+    }
+
+    if (raw.type == "compositor") {
+        portsOut.assign(std::begin(kCompositorInputs), std::end(kCompositorInputs));
+        return new CompositorNode();
+    }
+
     if (raw.type == "output") {
         if (mOutput) {
             fail("multiple output nodes");
@@ -608,6 +711,60 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
 bool Loader::bindInputs(const RawNode& raw, Node* node,
                         const std::vector<PortDef>& ports)
 {
+    // Array-valued port (compositor 'layers'): the node's inputs are the
+    // array's elements, one Node::Input per layer.
+    if (ports.size() == 1 && ports[0].array) {
+        const PortDef& port = ports[0];
+        for (const auto& [name, in] : raw.inputs) {
+            if (name != port.name) {
+                fail("node '" + raw.id + "': unknown input port '" + name + "'");
+                return false;
+            }
+        }
+        auto it = raw.inputs.find(port.name);
+        if (it == raw.inputs.end()) {
+            fail("node '" + raw.id + "': required input '" + port.name +
+                 "' missing");
+            return false;
+        }
+        if (it->second.kind != RawInput::Kind::Array ||
+            it->second.elements.empty()) {
+            fail("node '" + raw.id + "' input '" + port.name +
+                 "': must be a non-empty array of connections");
+            return false;
+        }
+        node->inputs.resize(it->second.elements.size());
+        for (size_t i = 0; i < it->second.elements.size(); ++i) {
+            const RawInput& element = it->second.elements[i];
+            ValueType srcType;
+            if (!resolveInputType(raw, element, srcType)) {
+                return false;
+            }
+            if (srcType != port.type) {
+                fail("node '" + raw.id + "' input '" + port.name + "[" +
+                     std::to_string(i) + "]': type mismatch (" +
+                     valueTypeName(srcType) + " -> " + valueTypeName(port.type) +
+                     ")");
+                return false;
+            }
+            Node::Input& in = node->inputs[i];
+            in.type = port.type;
+            in.srcNode = mInstances[element.conn.node];
+            in.srcPort = 0;
+            if (!element.conn.port.empty()) {
+                const auto srcPorts = outputPortsFor(
+                    mRawNodes[mRawIndex[element.conn.node]].type);
+                for (const auto& p : srcPorts) {
+                    if (element.conn.port == p.name) {
+                        in.srcPort = p.index;
+                        break;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     node->inputs.resize(ports.size());
 
     for (const auto& [portName, rawIn] : raw.inputs) {

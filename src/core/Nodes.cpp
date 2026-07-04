@@ -4,6 +4,10 @@
 #include <cstring>
 #include <vector>
 
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_FAILURE_USERMSG
+#include <stb_image.h>
+
 namespace drift::core {
 
 namespace {
@@ -91,6 +95,32 @@ void writeOutput(Node::Output& out, const Value& value)
         out.value = value;
         out.dirty = true;
     }
+}
+
+uint16_t floatToHalf(float f)
+{
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000;
+    const int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
+    uint32_t mant = x & 0x7fffff;
+    if (exp <= 0) {
+        if (exp < -10) {
+            return (uint16_t)sign; // flush to zero
+        }
+        mant = (mant | 0x800000) >> (1 - exp);
+        return (uint16_t)(sign | (mant >> 13));
+    }
+    if (exp >= 31) {
+        return (uint16_t)(sign | 0x7c00); // clamp to inf
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+float srgbDecode(float c)
+{
+    return c <= 0.04045f ? c / 12.92f
+                         : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
 } // namespace
@@ -215,6 +245,378 @@ void SplitNode::evaluate(FrameContext&)
         out.v[0] = value.v[i];
         writeOutput(outputs[i], out);
     }
+}
+
+// ---- ImageNode ----
+
+ImageNode::ImageNode(std::vector<uint16_t> pixels, uint32_t width, uint32_t height)
+    : mPixels(std::move(pixels))
+    , mWidth(width)
+    , mHeight(height)
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Texture;
+}
+
+ImageNode* ImageNode::decode(const std::string& bytes, std::string& error)
+{
+    int width = 0, height = 0, comp = 0;
+    stbi_uc* rgba = stbi_load_from_memory((const stbi_uc*)bytes.data(),
+                                          (int)bytes.size(), &width, &height,
+                                          &comp, 4);
+    if (!rgba) {
+        error = stbi_failure_reason();
+        return nullptr;
+    }
+
+    // sRGB -> linear, premultiply, pack to rgba16float (SCENE_FORMAT.md §12).
+    float srgbTable[256];
+    for (int i = 0; i < 256; ++i) {
+        srgbTable[i] = srgbDecode((float)i / 255.0f);
+    }
+    std::vector<uint16_t> pixels((size_t)width * height * 4);
+    for (size_t i = 0; i < (size_t)width * height; ++i) {
+        const float a = (float)rgba[i * 4 + 3] / 255.0f;
+        pixels[i * 4 + 0] = floatToHalf(srgbTable[rgba[i * 4 + 0]] * a);
+        pixels[i * 4 + 1] = floatToHalf(srgbTable[rgba[i * 4 + 1]] * a);
+        pixels[i * 4 + 2] = floatToHalf(srgbTable[rgba[i * 4 + 2]] * a);
+        pixels[i * 4 + 3] = floatToHalf(a);
+    }
+    stbi_image_free(rgba);
+    return new ImageNode(std::move(pixels), (uint32_t)width, (uint32_t)height);
+}
+
+void ImageNode::evaluate(FrameContext& ctx)
+{
+    if (!mTexture) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { mWidth, mHeight, 1 };
+        desc.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+        mTexture = ctx.device.CreateTexture(&desc);
+
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = mTexture;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.bytesPerRow = mWidth * 8;
+        layout.rowsPerImage = mHeight;
+        wgpu::Extent3D extent = { mWidth, mHeight, 1 };
+        ctx.device.GetQueue().WriteTexture(&dst, mPixels.data(),
+                                           mPixels.size() * sizeof(uint16_t),
+                                           &layout, &extent);
+        mPixels = {};
+    }
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mTexture;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    writeOutput(outputs[0], out); // dirty on first evaluate only
+}
+
+// ---- TransformNode ----
+
+namespace {
+
+// Quad corners in source-uv space, positioned by the vertex stage per
+// SCENE_FORMAT.md §9.4: extent in output-height units so scale is
+// resolution-independent, rotation about the anchor in physical (aspect-
+// corrected) space, y-down clockwise.
+const char* kTransformShader = R"(
+struct TransformParams {
+    position: vec2f,
+    scale: vec2f,
+    anchor: vec2f,
+    rotation: f32,
+    opacity: f32,
+    srcAspect: f32,
+    outAspect: f32,
+}
+@group(0) @binding(0) var<uniform> params: TransformParams;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var src_sampler: sampler;
+
+struct TransformVsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@vertex
+fn transform_vs(@builtin(vertex_index) i: u32) -> TransformVsOut {
+    var corners = array<vec2f, 4>(
+        vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 1.0));
+    let c = corners[i];
+    let extent = vec2f(params.scale.x * params.srcAspect, params.scale.y);
+    let local = (c - params.anchor) * extent;
+    let s = sin(params.rotation);
+    let co = cos(params.rotation);
+    let rotated = vec2f(local.x * co - local.y * s, local.x * s + local.y * co);
+    let uvPos = params.position + vec2f(rotated.x / params.outAspect, rotated.y);
+    var out: TransformVsOut;
+    out.pos = vec4f(uvPos.x * 2.0 - 1.0, 1.0 - uvPos.y * 2.0, 0.0, 1.0);
+    out.uv = c;
+    return out;
+}
+
+@fragment
+fn transform_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    // Premultiplied: opacity scales all channels.
+    return textureSample(src, src_sampler, uv) * params.opacity;
+}
+)";
+
+struct TransformUniforms {
+    float position[2];
+    float scale[2];
+    float anchor[2];
+    float rotation;
+    float opacity;
+    float srcAspect;
+    float outAspect;
+    float pad[2]; // uniform buffer sizes rounded to 16
+};
+static_assert(sizeof(TransformUniforms) == 48);
+
+} // namespace
+
+TransformNode::TransformNode()
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Texture;
+}
+
+bool TransformNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    wgpu::ShaderModule module = makeModule(ctx.device, kTransformShader);
+    if (!module) {
+        return false;
+    }
+
+    wgpu::ColorTargetState color{};
+    color.format = wgpu::TextureFormat::RGBA16Float;
+
+    wgpu::FragmentState fragment{};
+    fragment.module = module;
+    fragment.entryPoint = "transform_fs";
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = "transform_vs";
+    desc.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
+    desc.fragment = &fragment;
+    mPipeline = ctx.device.CreateRenderPipeline(&desc);
+    if (!mPipeline) {
+        return false;
+    }
+
+    wgpu::BufferDescriptor bd{};
+    bd.size = sizeof(TransformUniforms);
+    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mUniforms = ctx.device.CreateBuffer(&bd);
+    mSampler = makeLinearClampSampler(ctx.device);
+    return true;
+}
+
+void TransformNode::evaluate(FrameContext& ctx)
+{
+    const Value source = inputValue(0);
+    if (!source.texture || !ensurePipeline(ctx)) {
+        return;
+    }
+
+    if (!mColor || mWidth != ctx.targetWidth || mHeight != ctx.targetHeight) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { ctx.targetWidth, ctx.targetHeight, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding;
+        mColor = ctx.device.CreateTexture(&desc);
+        mWidth = ctx.targetWidth;
+        mHeight = ctx.targetHeight;
+    }
+
+    constexpr float kDegToRad = kTau / 360.0f;
+    TransformUniforms u{};
+    u.position[0] = inputValue(1).v[0];
+    u.position[1] = inputValue(1).v[1];
+    u.scale[0] = inputValue(3).v[0];
+    u.scale[1] = inputValue(3).v[1];
+    u.anchor[0] = inputValue(4).v[0];
+    u.anchor[1] = inputValue(4).v[1];
+    u.rotation = inputValue(2).v[0] * kDegToRad;
+    u.opacity = inputValue(5).v[0];
+    u.srcAspect = source.texHeight ? (float)source.texWidth / source.texHeight : 1.0f;
+    u.outAspect = mHeight ? (float)mWidth / mHeight : 1.0f;
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, &u, sizeof(u));
+
+    wgpu::BindGroupEntry entries[3] = {};
+    entries[0].binding = 0;
+    entries[0].buffer = mUniforms;
+    entries[0].size = sizeof(TransformUniforms);
+    entries[1].binding = 1;
+    entries[1].textureView = source.texture.CreateView();
+    entries[2].binding = 2;
+    entries[2].sampler = mSampler;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = mPipeline.GetBindGroupLayout(0);
+    bgDesc.entryCount = 3;
+    bgDesc.entries = entries;
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgDesc);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mColor.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+
+    wgpu::RenderPassDescriptor desc{};
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
+    pass.SetPipeline(mPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(4);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mColor;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+}
+
+// ---- CompositorNode ----
+
+namespace {
+
+const char* kCompositeShader = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
+
+@fragment
+fn composite_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    return textureSample(src, src_sampler, uv);
+}
+)";
+
+} // namespace
+
+CompositorNode::CompositorNode()
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Texture;
+}
+
+bool CompositorNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    const std::string source = std::string(kVertexPrelude) + kCompositeShader;
+    wgpu::ShaderModule module = makeModule(ctx.device, source);
+    if (!module) {
+        return false;
+    }
+
+    // Premultiplied source-over (§9.5).
+    wgpu::BlendState blend{};
+    blend.color.srcFactor = wgpu::BlendFactor::One;
+    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    blend.alpha.srcFactor = wgpu::BlendFactor::One;
+    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+
+    wgpu::ColorTargetState color{};
+    color.format = wgpu::TextureFormat::RGBA16Float;
+    color.blend = &blend;
+
+    wgpu::FragmentState fragment{};
+    fragment.module = module;
+    fragment.entryPoint = "composite_fs";
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = "drift_vs";
+    desc.fragment = &fragment;
+    mPipeline = ctx.device.CreateRenderPipeline(&desc);
+    if (!mPipeline) {
+        return false;
+    }
+    mSampler = makeLinearClampSampler(ctx.device);
+    return true;
+}
+
+void CompositorNode::evaluate(FrameContext& ctx)
+{
+    if (!ensurePipeline(ctx)) {
+        return;
+    }
+
+    if (!mColor || mWidth != ctx.targetWidth || mHeight != ctx.targetHeight) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { ctx.targetWidth, ctx.targetHeight, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding;
+        mColor = ctx.device.CreateTexture(&desc);
+        mWidth = ctx.targetWidth;
+        mHeight = ctx.targetHeight;
+    }
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mColor.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+
+    wgpu::RenderPassDescriptor desc{};
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
+    pass.SetPipeline(mPipeline);
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const Value layer = inputValue(i);
+        if (!layer.texture) {
+            continue;
+        }
+        wgpu::BindGroupEntry entries[2] = {};
+        entries[0].binding = 0;
+        entries[0].textureView = layer.texture.CreateView();
+        entries[1].binding = 1;
+        entries[1].sampler = mSampler;
+        wgpu::BindGroupDescriptor bgDesc{};
+        bgDesc.layout = mPipeline.GetBindGroupLayout(0);
+        bgDesc.entryCount = 2;
+        bgDesc.entries = entries;
+        pass.SetBindGroup(0, ctx.device.CreateBindGroup(&bgDesc));
+        pass.Draw(3);
+    }
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mColor;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
 }
 
 // ---- ShaderNode ----

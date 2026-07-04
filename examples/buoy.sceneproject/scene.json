@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "Bobbing Buoy",
+  "description": "SCENE_FORMAT.md example 14.1: static background, bobbing foreground layer",
+  "parameters": {
+    "bobSpeed": { "type": "scalar", "default": 0.25, "min": 0, "max": 2, "label": "Bob speed" }
+  },
+  "nodes": [
+    { "id": "bg",   "type": "image", "src": "assets/sea.png" },
+    { "id": "buoy", "type": "image", "src": "assets/buoy.png" },
+
+    { "id": "bob",  "type": "wave",  "inputs": { "input": "@time.seconds", "frequency": "$bobSpeed" } },
+    { "id": "bobY", "type": "remap",
+      "inputs": { "value": "@bob", "inMin": -1, "inMax": 1, "outMin": 0.66, "outMax": 0.70 } },
+    { "id": "rock", "type": "wave", "inputs": { "input": "@time.seconds", "frequency": "$bobSpeed", "phase": 0.25 } },
+    { "id": "tilt", "type": "remap",
+      "inputs": { "value": "@rock", "inMin": -1, "inMax": 1, "outMin": -6, "outMax": 6 } },
+    { "id": "pos",  "type": "combine", "inputs": { "x": 0.3, "y": "@bobY" } },
+
+    { "id": "place", "type": "transform",
+      "inputs": { "source": "@buoy", "position": "@pos", "rotation": "@tilt", "scale": 0.25,
+                  "anchor": [0.5, 0.7] } },
+
+    { "id": "comp", "type": "compositor", "inputs": { "layers": ["@bg", "@place"] } },
+    { "id": "out",  "type": "output",     "inputs": { "color": "@comp" } }
+  ]
+}

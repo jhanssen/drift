@@ -55,6 +55,61 @@ public:
     void evaluate(FrameContext& ctx) override;
 };
 
+// §9.1 image: static texture source, dirty on load only. Decoding happens in
+// the loader (validation without a GPU); pixels arrive here already linear,
+// premultiplied, packed rgba16float. Upload happens on first evaluate.
+class ImageNode : public Node {
+public:
+    // bytes: encoded file contents. Returns nullptr with error set on decode
+    // failure.
+    static ImageNode* decode(const std::string& bytes, std::string& error);
+
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    ImageNode(std::vector<uint16_t> pixels, uint32_t width, uint32_t height);
+
+    std::vector<uint16_t> mPixels; // released after upload
+    uint32_t mWidth = 0, mHeight = 0;
+    wgpu::Texture mTexture;
+};
+
+// §9.4 transform: renders source into a scene-output-sized transparent
+// canvas with 2D position/rotation/scale/anchor/opacity applied. Sizing is
+// resolution-independent: at scale [1,1] the displayed height equals the
+// output height, width follows the source aspect.
+class TransformNode : public Node {
+public:
+    // Input order: source, position, rotation, scale, anchor, opacity.
+    TransformNode();
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    wgpu::RenderPipeline mPipeline;
+    wgpu::Buffer mUniforms;
+    wgpu::Sampler mSampler;
+    wgpu::Texture mColor;
+    uint32_t mWidth = 0, mHeight = 0;
+};
+
+// §9.5 compositor: stacks its inputs (all texture layers, bottom first) into
+// a scene-output-sized target with premultiplied source-over blending.
+class CompositorNode : public Node {
+public:
+    CompositorNode();
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    wgpu::RenderPipeline mPipeline;
+    wgpu::Sampler mSampler;
+    wgpu::Texture mColor;
+    uint32_t mWidth = 0, mHeight = 0;
+};
+
 // §9.3 shader: fullscreen fragment pass into an rgba16float intermediate.
 // Ports come from the WGSL interface: value inputs first (uniform fields, in
 // declaration order), then texture inputs.
