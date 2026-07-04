@@ -63,7 +63,8 @@
   <div id="transport">
     <button id="playBtn" title="pause/resume both runtimes">⏸</button>
     <span id="timeText">—</span>
-    <span class="dim" style="color:var(--dim)">click a timeline to seek</span>
+    <span class="dim" style="color:var(--dim)">click a timeline to seek ·
+      drag keys to edit · double-click a lane to re-fit its scale</span>
   </div>
   <div id="timeline"><span class="dim">no scene yet</span></div>
   <div id="statusbar">
@@ -446,6 +447,14 @@ function refreshTimeline() {
       const t = ((e.offsetX - GUTTER_W) / plotW) * seq.duration;
       seekBoth(Math.min(Math.max(t, 0), seq.duration));
     };
+    canvas.ondblclick = (e) => {
+      // Re-fit this lane's scale to its current keys.
+      const lane = Math.floor((e.offsetY - RULER_H) / LANE_H);
+      if (lane >= 0 && lane < seq.tracks.length) {
+        laneRangeMemory.delete(
+            `${activeManifest()?.scene}/${seq.id}/${seq.tracks[lane].name}`);
+      }
+    };
     container.appendChild(header);
     container.appendChild(canvas);
     timelines.push(tl);
@@ -480,9 +489,11 @@ function sampleTrack(track, t) {
 let dragState = null;
 let suppressClick = false;
 
-// Lane scales expand to fit new extremes but never shrink back — without
-// this, auto-fit renormalizes after every edit and a 0→1 step looks
-// identical to a 0→1.8 step. Keyed per scene/sequence/track.
+// Lane scales are fitted ONCE from the authored keys and then left alone —
+// any fit-to-data policy pins the data's max at the lane top, so dragging a
+// key up would always snap it back to the same pixel. Edited values beyond
+// the original range draw outside the lane band; double-click a lane to
+// re-fit its scale. Keyed per scene/sequence/track.
 const laneRangeMemory = new Map();
 
 window.addEventListener('mousemove', (e) => {
@@ -575,32 +586,21 @@ function drawTimeline(tl, playTime) {
     ctx.font = '9px system-ui';
     ctx.fillText(track.interpolate, 8, top + 26);
 
-    // Value range across all keys/components, padded; sticky via
-    // laneRangeMemory, and frozen while one of this lane's keys is being
-    // dragged.
-    let vmin, vmax;
-    if (dragState && dragState.tl === tl && dragState.lane === lane) {
-      ({ vmin, vmax } = dragState.range);
-    } else {
+    // Stable lane scale: first fit wins (see laneRangeMemory above).
+    const memoryKey = `${activeManifest()?.scene}/${seq.id}/${track.name}`;
+    let range = laneRangeMemory.get(memoryKey);
+    if (!range) {
       const flat = track.keys.flatMap((key) => [].concat(key.value));
-      vmin = Math.min(...flat);
-      vmax = Math.max(...flat);
-      if (vmin === vmax) {
-        vmin -= 0.5;
-        vmax += 0.5;
+      let lo = Math.min(...flat), hi = Math.max(...flat);
+      if (lo === hi) {
+        lo -= 0.5;
+        hi += 0.5;
       }
-      const pad = (vmax - vmin) * 0.12;
-      vmin -= pad;
-      vmax += pad;
-      const memoryKey =
-          `${activeManifest()?.scene}/${seq.id}/${track.name}`;
-      const remembered = laneRangeMemory.get(memoryKey);
-      if (remembered) {
-        vmin = Math.min(vmin, remembered.vmin);
-        vmax = Math.max(vmax, remembered.vmax);
-      }
-      laneRangeMemory.set(memoryKey, { vmin, vmax });
+      const pad = (hi - lo) * 0.12;
+      range = { vmin: lo - pad, vmax: hi + pad };
+      laneRangeMemory.set(memoryKey, range);
     }
+    const { vmin, vmax } = range;
     tl.laneRanges[lane] = { vmin, vmax, top: top + 8, bottom };
     const yOf = (v) => bottom - ((v - vmin) / (vmax - vmin)) * height;
 
