@@ -480,6 +480,11 @@ function sampleTrack(track, t) {
 let dragState = null;
 let suppressClick = false;
 
+// Lane scales expand to fit new extremes but never shrink back — without
+// this, auto-fit renormalizes after every edit and a 0→1 step looks
+// identical to a 0→1.8 step. Keyed per scene/sequence/track.
+const laneRangeMemory = new Map();
+
 window.addEventListener('mousemove', (e) => {
   if (!dragState) {
     return;
@@ -570,8 +575,9 @@ function drawTimeline(tl, playTime) {
     ctx.font = '9px system-ui';
     ctx.fillText(track.interpolate, 8, top + 26);
 
-    // Value range across all keys/components, padded; frozen while one of
-    // this lane's keys is being dragged.
+    // Value range across all keys/components, padded; sticky via
+    // laneRangeMemory, and frozen while one of this lane's keys is being
+    // dragged.
     let vmin, vmax;
     if (dragState && dragState.tl === tl && dragState.lane === lane) {
       ({ vmin, vmax } = dragState.range);
@@ -586,9 +592,26 @@ function drawTimeline(tl, playTime) {
       const pad = (vmax - vmin) * 0.12;
       vmin -= pad;
       vmax += pad;
+      const memoryKey =
+          `${activeManifest()?.scene}/${seq.id}/${track.name}`;
+      const remembered = laneRangeMemory.get(memoryKey);
+      if (remembered) {
+        vmin = Math.min(vmin, remembered.vmin);
+        vmax = Math.max(vmax, remembered.vmax);
+      }
+      laneRangeMemory.set(memoryKey, { vmin, vmax });
     }
     tl.laneRanges[lane] = { vmin, vmax, top: top + 8, bottom };
     const yOf = (v) => bottom - ((v - vmin) / (vmax - vmin)) * height;
+
+    // The scale itself, so identical shapes at different scales read
+    // differently.
+    ctx.fillStyle = '#8a8f98';
+    ctx.font = '9px system-ui';
+    ctx.textAlign = 'right';
+    ctx.fillText((+vmax.toFixed(2)).toString(), cssW - 4, top + 14);
+    ctx.fillText((+vmin.toFixed(2)).toString(), cssW - 4, bottom);
+    ctx.textAlign = 'left';
 
     const arity = [].concat(track.keys[0].value).length;
     for (let c = 0; c < arity; c++) {
@@ -609,7 +632,8 @@ function drawTimeline(tl, playTime) {
       ctx.stroke();
       ctx.fillStyle = LANE_COLORS[c];
       track.keys.forEach((key, keyIdx) => {
-        const x = xOf(key.t), y = yOf([].concat(key.value)[c]);
+        const value = [].concat(key.value)[c];
+        const x = xOf(key.t), y = yOf(value);
         ctx.beginPath();
         ctx.moveTo(x, y - 4);
         ctx.lineTo(x + 4, y);
@@ -617,6 +641,14 @@ function drawTimeline(tl, playTime) {
         ctx.lineTo(x - 4, y);
         ctx.fill();
         tl.hits.push({ x, y, lane, keyIdx, comp: c });
+        if (dragState && dragState.tl === tl && dragState.lane === lane &&
+            dragState.keyIdx === keyIdx && dragState.comp === c) {
+          ctx.fillStyle = '#d6d9de';
+          ctx.font = '10px system-ui';
+          ctx.fillText(`${key.t.toFixed(2)}s · ${value.toFixed(2)}`,
+                       x + 8, y - 7);
+          ctx.fillStyle = LANE_COLORS[c];
+        }
       });
     }
   });
