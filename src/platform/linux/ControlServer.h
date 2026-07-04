@@ -18,8 +18,16 @@
 //                                            the scene instances, §9.7)
 //   -> {"id":6,"method":"reload"}          (re-read scene from disk, keeping
 //                                            clock and parameter values)
+//   -> {"id":7,"method":"source"}
+//   <- {"id":7,"result":{"scene":"<scene.json text>"}}
+//   -> {"id":8,"method":"load","params":{"scene":"<scene.json text>"}}
+//                                          (swap to the pushed document —
+//                                           editors own the document; the
+//                                           old scene keeps running if it
+//                                           fails validation)
 //   <- {"event":"transport","paused":B,"seconds":T}   (after pause/seek)
-//   <- {"event":"reload"}                  (clients should re-describe)
+//   <- {"event":"reload"}                  (after reload/load; clients
+//                                           should re-describe)
 //
 // V is a number (scalar) or an array of 2-4 numbers (vecN), like scene.json
 // literals (§4). Browser pages may connect only from localhost origins: a
@@ -60,6 +68,9 @@ public:
         std::function<void(bool paused)> setPaused;
         std::function<bool(double seconds, std::string& error)> seek;
         std::function<bool(std::string& error)> reload;
+        std::function<std::string()> source; // current scene.json text
+        std::function<bool(const std::string& sceneJson, std::string& error)>
+            load;
     };
 
     ~ControlServer();

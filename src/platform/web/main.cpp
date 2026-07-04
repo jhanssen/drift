@@ -40,6 +40,7 @@ struct App {
     double cssWidth = 0.0, cssHeight = 0.0;
 
     std::string scenePath;
+    std::string sceneJson; // the running document (bundle or pushed edit)
     std::unique_ptr<drift::core::Scene> scene;
 
     bool started = false;
@@ -55,9 +56,12 @@ struct App {
 App gApp;
 
 // Mirrors the native loader (src/main.cpp) minus video: assets come from the
-// bundle's MEMFS under /scenes/<name>, with the same project-root confinement.
+// bundle's MEMFS under /scenes/<name>, with the same project-root
+// confinement. jsonInOut non-empty = load that document (editor pushes);
+// empty = read scene.json from the bundle and fill it in.
 std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
-                                              const wgpu::Device& device)
+                                              const wgpu::Device& device,
+                                              std::string* jsonInOut)
 {
     namespace fs = std::filesystem;
 
@@ -96,7 +100,9 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
     };
 
     std::string sceneJson;
-    if (!readAsset("scene.json", sceneJson)) {
+    if (jsonInOut && !jsonInOut->empty()) {
+        sceneJson = *jsonInOut;
+    } else if (!readAsset("scene.json", sceneJson)) {
         fprintf(stderr, "drift: cannot read %s/scene.json\n", root.c_str());
         return nullptr;
     }
@@ -111,6 +117,9 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
     }
     if (scene) {
+        if (jsonInOut) {
+            *jsonInOut = sceneJson;
+        }
         printf("drift: loaded scene '%s'\n", scene->name().c_str());
     }
     return scene;
@@ -240,7 +249,7 @@ void onDeviceReady()
     gApp.alphaMode = caps.alphaModeCount ? caps.alphaModes[0]
                                          : wgpu::CompositeAlphaMode::Auto;
 
-    gApp.scene = loadScene(gApp.scenePath, gApp.device);
+    gApp.scene = loadScene(gApp.scenePath, gApp.device, &gApp.sceneJson);
     if (!gApp.scene) {
         return;
     }
@@ -334,7 +343,8 @@ EMSCRIPTEN_KEEPALIVE int drift_seek(double seconds)
     }
     int reloaded = 0;
     if (seconds < gApp.lastSeconds) {
-        gApp.scene = loadScene(gApp.scenePath, gApp.device);
+        // Fresh instance on the same document (§9.7).
+        gApp.scene = loadScene(gApp.scenePath, gApp.device, &gApp.sceneJson);
         if (!gApp.scene) {
             return 0; // reload failed; console has the loader errors
         }
@@ -352,18 +362,44 @@ EMSCRIPTEN_KEEPALIVE void drift_pause(int paused)
     gApp.paused = paused != 0;
 }
 
-// Re-reads the scene from the bundle, keeping the clock (fresh instance
-// starting mid-time — forward-only per §9.7). The caller re-applies
-// parameter values. Returns 1 on success.
+// Re-reads the scene from the bundle (dropping any pushed document),
+// keeping the clock (fresh instance starting mid-time — forward-only per
+// §9.7). The caller re-applies parameter values. Returns 1 on success.
 EMSCRIPTEN_KEEPALIVE int drift_reload()
 {
     if (gApp.scenePath.empty()) {
         return 0;
     }
-    auto fresh = loadScene(gApp.scenePath, gApp.device);
+    std::string json; // empty: read from the bundle
+    auto fresh = loadScene(gApp.scenePath, gApp.device, &json);
     if (!fresh) {
         return 0;
     }
+    gApp.sceneJson = std::move(json);
+    gApp.scene = std::move(fresh);
+    return 1;
+}
+
+// The running scene document, for the editor.
+EMSCRIPTEN_KEEPALIVE const char* drift_source()
+{
+    return gApp.sceneJson.c_str();
+}
+
+// Swaps to an edited document (assets still resolve from the bundled
+// project). The old scene keeps running if validation fails; on success
+// the clock is kept and the caller re-applies parameter values.
+EMSCRIPTEN_KEEPALIVE int drift_load(const char* sceneJson)
+{
+    if (gApp.scenePath.empty() || !sceneJson || !*sceneJson) {
+        return 0;
+    }
+    std::string json(sceneJson);
+    auto fresh = loadScene(gApp.scenePath, gApp.device, &json);
+    if (!fresh) {
+        return 0;
+    }
+    gApp.sceneJson = std::move(json);
     gApp.scene = std::move(fresh);
     return 1;
 }

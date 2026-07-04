@@ -133,12 +133,16 @@ var Module = {
     const seek = Module.cwrap('drift_seek', 'number', ['number']);
     const pause = Module.cwrap('drift_pause', null, ['number']);
     const reload = Module.cwrap('drift_reload', 'number', []);
+    const source = Module.cwrap('drift_source', 'string', []);
+    const load = Module.cwrap('drift_load', 'number', ['string']);
     wasm = {
       describe,
       time,
       seek,
       pause,
       reload,
+      source,
+      load,
       set(name, v) {
         return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
       },
@@ -153,6 +157,7 @@ var Module = {
         setStatus('wasmStatus', `preview: ${info.scene}`, 'ok');
         console.log(`editor: wasm scene '${info.scene}'`);
         refreshPanel();
+        fetchSource();
         // The live connection may have won the race; sync now rather than
         // waiting for the periodic check.
         syncClock(/*force=*/true);
@@ -225,6 +230,7 @@ function connectLive(port) {
         }
       }
       refreshPanel();
+      await fetchSource();
       await syncClock(/*force=*/true);
       syncTimer = setInterval(syncClock, 2000);
     } catch (err) {
@@ -251,6 +257,7 @@ function connectLive(port) {
       (async () => {
         liveManifest = await liveSend('describe');
         refreshPanel();
+        await fetchSource();
         await syncClock(/*force=*/true);
       })();
     }
@@ -298,6 +305,63 @@ function applyParam(name, values, { fromRemote = false } = {}) {
         .catch((err) => console.log(`editor: set ${name}: ${err}`));
   }
   widgets.get(name)?.update(values);
+}
+
+// ---- scene document (the editor owns it; runtimes consume) ----------------
+
+let sceneSource = null; // parsed scene.json of the active target
+
+async function fetchSource() {
+  try {
+    const text = live ? (await liveSend('source')).scene
+                      : wasm ? wasm.source() : null;
+    sceneSource = text ? JSON.parse(text) : null;
+  } catch (err) {
+    console.log(`editor: source: ${err}`);
+    sceneSource = null;
+  }
+}
+
+// Mirrors the edited timeline keys into the document, pushes it to every
+// attached runtime (each keeps its old scene if validation fails), and
+// re-applies parameter values to the preview (a load resets them).
+async function pushDocument() {
+  const manifest = activeManifest();
+  if (!sceneSource || !manifest?.sequences) {
+    return;
+  }
+  for (const seq of manifest.sequences) {
+    const node = sceneSource.nodes?.find((n) => n.id === seq.id);
+    if (!node) {
+      continue;
+    }
+    node.tracks = seq.tracks.map((track) => ({
+      ...node.tracks?.find((t) => t.name === track.name),
+      name: track.name,
+      kind: 'value',
+      type: track.type,
+      interpolate: track.interpolate,
+      keys: track.keys.map((k) => ({
+        t: +k.t.toFixed(3),
+        value: Array.isArray(k.value)
+            ? k.value.map((v) => +v.toFixed(4)) : +k.value.toFixed(4),
+      })),
+    }));
+  }
+  const json = JSON.stringify(sceneSource, null, 2);
+  if (wasm && wasm.load(json)) {
+    for (const [name, values] of currentValues) {
+      wasm.set(name, values);
+    }
+  }
+  if (live) {
+    try {
+      await liveSend('load', { scene: json });
+    } catch (err) {
+      console.log(`editor: load rejected: ${err}`);
+    }
+  }
+  console.log('editor: document pushed');
 }
 
 // ---- transport ------------------------------------------------------------
@@ -360,14 +424,31 @@ function refreshTimeline() {
     header.textContent =
         `${seq.id} — ${seq.duration}s${seq.loop ? ' · loop' : ''}`;
     const canvas = document.createElement('canvas');
+    const tl = { seq, canvas, hits: [], laneRanges: [] };
+    canvas.onmousedown = (e) => {
+      const hit = tl.hits.find((h) => Math.abs(h.x - e.offsetX) < 7 &&
+                                      Math.abs(h.y - e.offsetY) < 7);
+      if (!hit) {
+        return;
+      }
+      const range = tl.laneRanges[hit.lane];
+      dragState = { tl, lane: hit.lane, keyIdx: hit.keyIdx, comp: hit.comp,
+                    range: { ...range }, moved: false };
+      suppressClick = true;
+      e.preventDefault();
+    };
     canvas.onclick = (e) => {
+      if (suppressClick) {
+        suppressClick = false;
+        return;
+      }
       const plotW = canvas.clientWidth - GUTTER_W;
       const t = ((e.offsetX - GUTTER_W) / plotW) * seq.duration;
       seekBoth(Math.min(Math.max(t, 0), seq.duration));
     };
     container.appendChild(header);
     container.appendChild(canvas);
-    timelines.push({ seq, canvas });
+    timelines.push(tl);
   }
   console.log(`editor: timeline: ${seqs.length} sequence(s)`);
 }
@@ -393,7 +474,51 @@ function sampleTrack(track, t) {
   return a.map((v, i) => v + (b[i] - v) * f);
 }
 
-function drawTimeline({ seq, canvas }, playTime) {
+// Key dragging: t moves between neighboring keys; the value follows the
+// vertical axis using the lane range frozen at grab time (so the lane
+// rescaling under the edit doesn't warp the mapping). Pushed on release.
+let dragState = null;
+let suppressClick = false;
+
+window.addEventListener('mousemove', (e) => {
+  if (!dragState) {
+    return;
+  }
+  const { tl, lane, keyIdx, comp, range } = dragState;
+  const rect = tl.canvas.getBoundingClientRect();
+  const seq = tl.seq;
+  const track = seq.tracks[lane];
+  const keys = track.keys;
+
+  const plotW = tl.canvas.clientWidth - GUTTER_W;
+  const t = ((e.clientX - rect.left - GUTTER_W) / plotW) * seq.duration;
+  const lo = keyIdx > 0 ? keys[keyIdx - 1].t + 0.01 : 0;
+  const hi = keyIdx < keys.length - 1 ? keys[keyIdx + 1].t - 0.01
+                                      : seq.duration;
+  keys[keyIdx].t = Math.min(Math.max(t, lo), Math.max(lo, hi));
+
+  const f = (range.bottom - (e.clientY - rect.top)) /
+            (range.bottom - range.top);
+  const v = range.vmin + f * (range.vmax - range.vmin);
+  if (Array.isArray(keys[keyIdx].value)) {
+    keys[keyIdx].value[comp] = v;
+  } else {
+    keys[keyIdx].value = v;
+  }
+  dragState.moved = true;
+});
+
+window.addEventListener('mouseup', () => {
+  if (dragState) {
+    if (dragState.moved) {
+      pushDocument();
+    }
+    dragState = null;
+  }
+});
+
+function drawTimeline(tl, playTime) {
+  const { seq, canvas } = tl;
   const dpr = devicePixelRatio || 1;
   const cssW = canvas.clientWidth || canvas.parentElement.clientWidth;
   const cssH = RULER_H + seq.tracks.length * LANE_H;
@@ -426,6 +551,8 @@ function drawTimeline({ seq, canvas }, playTime) {
     }
   }
 
+  tl.hits = [];
+  tl.laneRanges = [];
   seq.tracks.forEach((track, lane) => {
     const top = RULER_H + lane * LANE_H;
     const bottom = top + LANE_H - 8;
@@ -443,16 +570,24 @@ function drawTimeline({ seq, canvas }, playTime) {
     ctx.font = '9px system-ui';
     ctx.fillText(track.interpolate, 8, top + 26);
 
-    // Value range across all keys/components, padded.
-    const flat = track.keys.flatMap((key) => [].concat(key.value));
-    let vmin = Math.min(...flat), vmax = Math.max(...flat);
-    if (vmin === vmax) {
-      vmin -= 0.5;
-      vmax += 0.5;
+    // Value range across all keys/components, padded; frozen while one of
+    // this lane's keys is being dragged.
+    let vmin, vmax;
+    if (dragState && dragState.tl === tl && dragState.lane === lane) {
+      ({ vmin, vmax } = dragState.range);
+    } else {
+      const flat = track.keys.flatMap((key) => [].concat(key.value));
+      vmin = Math.min(...flat);
+      vmax = Math.max(...flat);
+      if (vmin === vmax) {
+        vmin -= 0.5;
+        vmax += 0.5;
+      }
+      const pad = (vmax - vmin) * 0.12;
+      vmin -= pad;
+      vmax += pad;
     }
-    const pad = (vmax - vmin) * 0.12;
-    vmin -= pad;
-    vmax += pad;
+    tl.laneRanges[lane] = { vmin, vmax, top: top + 8, bottom };
     const yOf = (v) => bottom - ((v - vmin) / (vmax - vmin)) * height;
 
     const arity = [].concat(track.keys[0].value).length;
@@ -473,7 +608,7 @@ function drawTimeline({ seq, canvas }, playTime) {
       }
       ctx.stroke();
       ctx.fillStyle = LANE_COLORS[c];
-      for (const key of track.keys) {
+      track.keys.forEach((key, keyIdx) => {
         const x = xOf(key.t), y = yOf([].concat(key.value)[c]);
         ctx.beginPath();
         ctx.moveTo(x, y - 4);
@@ -481,7 +616,8 @@ function drawTimeline({ seq, canvas }, playTime) {
         ctx.lineTo(x, y + 4);
         ctx.lineTo(x - 4, y);
         ctx.fill();
-      }
+        tl.hits.push({ x, y, lane, keyIdx, comp: c });
+      });
     }
   });
 

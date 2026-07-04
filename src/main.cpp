@@ -89,9 +89,16 @@ bool parseParamOverride(const char* arg, ParamOverride& out)
 
 // Loads a .sceneproject directory (or a scene.json path) with project-root
 // confinement for asset reads.
-std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
-                                              const wgpu::Device& device,
-                                              const std::vector<ParamOverride>& overrides)
+//
+// sceneJsonInOut (optional): non-empty = load this document instead of the
+// on-disk scene.json (assets still resolve from the project dir; this is
+// how the editor pushes edits); empty = read from disk and fill it in.
+// errorsOut (optional) receives the loader's error messages.
+std::unique_ptr<drift::core::Scene> loadScene(
+    const std::string& scenePath, const wgpu::Device& device,
+    const std::vector<ParamOverride>& overrides,
+    std::string* sceneJsonInOut = nullptr,
+    std::vector<std::string>* errorsOut = nullptr)
 {
     namespace fs = std::filesystem;
     fs::path root(scenePath);
@@ -141,8 +148,13 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
     };
 
     std::string sceneJson;
-    if (!readAsset("scene.json", sceneJson)) {
+    if (sceneJsonInOut && !sceneJsonInOut->empty()) {
+        sceneJson = *sceneJsonInOut;
+    } else if (!readAsset("scene.json", sceneJson)) {
         fprintf(stderr, "drift: cannot read %s\n", sceneFile.c_str());
+        if (errorsOut) {
+            errorsOut->push_back("cannot read scene.json");
+        }
         return nullptr;
     }
 
@@ -154,6 +166,12 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& scenePath,
     }
     for (const auto& e : errors) {
         fprintf(stderr, "drift: scene: %s\n", e.c_str());
+    }
+    if (scene && sceneJsonInOut) {
+        *sceneJsonInOut = sceneJson;
+    }
+    if (errorsOut) {
+        *errorsOut = errors;
     }
     if (scene) {
         for (const auto& [name, value] : overrides) {
@@ -306,10 +324,17 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     // Outputs can differ in size, so each gets its own scene instance (with
     // its own graph state and clock); the first one reuses this validation
     // load. nullptr in the map = a load that failed; don't retry per frame.
+    // The scene document currently running: the on-disk scene.json, or the
+    // last one pushed over the control endpoint ("load"). Every instance
+    // creation path uses it, so hotplug and seek-rebuilds stay on the same
+    // document as the visible outputs.
+    std::string currentSceneJson;
+
     std::unique_ptr<drift::core::Scene> firstScene;
     drift::core::Renderer placeholder;
     if (!scenePath.empty()) {
-        firstScene = loadScene(scenePath, gpu.device(), overrides);
+        firstScene = loadScene(scenePath, gpu.device(), overrides,
+                               &currentSceneJson);
         if (!firstScene) {
             return 1;
         }
@@ -399,38 +424,54 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
             app.setScenePaused(paused);
         };
 
-        // Fresh instances from disk, keeping runtime parameter values. The
-        // clock is left alone (reload) or set by the caller (seek).
-        auto reloadScenes = [&scenePath, &device, &overrides, &scenes,
-                             &firstScene, &runtimeParams,
-                             &app](std::string& error) {
+        // Fresh instances, keeping runtime parameter values; the clock is
+        // left alone (reload/load) or set by the caller (seek). newJson:
+        // a pushed document; nullptr re-reads scene.json from disk. The
+        // old instances keep running if the new document fails to load.
+        auto applyDocument = [&scenePath, &device, &overrides, &scenes,
+                              &firstScene, &runtimeParams, &currentSceneJson,
+                              &app](const std::string* newJson,
+                                    std::string& error) {
             if (scenePath.empty()) {
                 error = "no scene loaded";
                 return false;
             }
-            auto fresh = loadScene(scenePath, device, overrides);
+            std::string json = newJson ? *newJson : std::string();
+            std::vector<std::string> errors;
+            auto fresh = loadScene(scenePath, device, overrides, &json,
+                                   &errors);
             if (!fresh) {
-                error = "scene reload failed (see runtime log)";
+                error = errors.empty() ? "scene load failed" : errors[0];
                 return false;
             }
             for (const auto& [name, value] : runtimeParams) {
                 fresh->setParameter(name, value);
             }
+            currentSceneJson = json;
             scenes.clear();
             firstScene = std::move(fresh);
             app.requestRedrawAll();
             return true;
         };
-        callbacks.seek = [&app, reloadScenes](double seconds,
-                                              std::string& error) {
-            // Backward violates §9.7 within an instance; re-create instead.
-            if (seconds < app.currentSceneTime() && !reloadScenes(error)) {
+        callbacks.seek = [&app, &currentSceneJson,
+                          applyDocument](double seconds, std::string& error) {
+            // Backward violates §9.7 within an instance; re-create on the
+            // same document instead.
+            if (seconds < app.currentSceneTime() &&
+                !applyDocument(&currentSceneJson, error)) {
                 return false;
             }
             app.seekSceneTime(seconds);
             return true;
         };
-        callbacks.reload = reloadScenes;
+        callbacks.reload = [applyDocument](std::string& error) {
+            return applyDocument(nullptr, error);
+        };
+        callbacks.source = [&currentSceneJson] { return currentSceneJson; };
+        callbacks.load = [applyDocument](const std::string& sceneJson,
+                                         std::string& error) {
+            return applyDocument(&sceneJson, error);
+        };
         std::string error;
         if (!control.start(listenPort, std::move(callbacks), error)) {
             fprintf(stderr, "drift: control: %s\n", error.c_str());
@@ -452,7 +493,8 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                          .emplace(req.outputId,
                                   firstScene ? std::move(firstScene)
                                              : loadScene(scenePath, device,
-                                                         overrides))
+                                                         overrides,
+                                                         &currentSceneJson))
                          .first;
                 if (it->second) {
                     // Late instance (hotplug/reload): match runtime state.

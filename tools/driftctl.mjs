@@ -8,8 +8,11 @@
 //        driftctl.mjs [--port N] pause | resume
 //        driftctl.mjs [--port N] seek SECONDS
 //        driftctl.mjs [--port N] reload           (re-read scene from disk)
+//        driftctl.mjs [--port N] source           (print the scene document)
+//        driftctl.mjs [--port N] load FILE        (push a scene document)
 //        driftctl.mjs [--port N] watch            (print events)
 
+import fs from 'node:fs';
 import net from 'node:net';
 import crypto from 'node:crypto';
 
@@ -28,8 +31,13 @@ function usage() {
 }
 
 let request;
-if (command === 'describe' || command === 'reload') {
+if (command === 'describe' || command === 'reload' || command === 'source') {
   request = { id: 1, method: command };
+} else if (command === 'load') {
+  const file = args.shift();
+  if (!file) usage();
+  request = { id: 1, method: 'load',
+              params: { scene: fs.readFileSync(file, 'utf8') } };
 } else if (command === 'set') {
   const name = args.shift();
   const raw = args.shift();

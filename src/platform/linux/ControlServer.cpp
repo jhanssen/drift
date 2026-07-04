@@ -21,9 +21,9 @@ namespace drift::platform {
 
 namespace {
 
-// Pre-upgrade headers and per-message JSON are small; a peer exceeding this
-// is broken or hostile.
-constexpr size_t kMaxBuffered = 64 * 1024;
+// Covers the largest legitimate message ("load" carries a whole scene.json
+// document); a peer exceeding this is broken or hostile.
+constexpr size_t kMaxBuffered = 1024 * 1024;
 
 bool parseValueJson(const glz::generic& j, core::Value& out)
 {
@@ -500,6 +500,38 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
     if (method == "reload") {
         std::string error;
         if (!mCallbacks.reload(error)) {
+            respond("\"error\":\"" + jsonEscape(error) + "\"");
+            return;
+        }
+        respond("\"result\":{}");
+        broadcast("{\"event\":\"reload\"}", fd);
+        return;
+    }
+
+    if (method == "source") {
+        respond("\"result\":{\"scene\":\"" +
+                jsonEscape(mCallbacks.source ? mCallbacks.source()
+                                             : std::string()) +
+                "\"}");
+        return;
+    }
+
+    if (method == "load") {
+        const std::string* sceneJson = nullptr;
+        if (auto paramsIt = obj.find("params");
+            paramsIt != obj.end() && paramsIt->second.is_object()) {
+            const auto& params = paramsIt->second.get_object();
+            if (auto it = params.find("scene");
+                it != params.end() && it->second.is_string()) {
+                sceneJson = &it->second.get_string();
+            }
+        }
+        if (!sceneJson) {
+            respond("\"error\":\"'load' needs a string 'scene' document\"");
+            return;
+        }
+        std::string error;
+        if (!mCallbacks.load(*sceneJson, error)) {
             respond("\"error\":\"" + jsonEscape(error) + "\"");
             return;
         }
