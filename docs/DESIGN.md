@@ -140,7 +140,7 @@ Host writes inputs → WASM update() → outputs written → host applies change
 
 Design adopted 2026-07-05; first implementation same day (directory and
 origin-private projects, recents, write-through, the failure-driven
-store overlay — zip import/export, asset drag-drop, and `list-assets`
+store overlay, asset drag-drop — zip import/export and `list-assets`
 remain). The editor reads and writes projects through a **storage
 provider** abstraction; the WASM runtime's in-memory filesystem is only
 the working copy the preview renders from, never the source of truth.

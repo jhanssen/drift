@@ -3679,6 +3679,81 @@ graphCanvas.addEventListener('auxclick', (e) => {
     enterSubgraph(hit.source.graph, hit.id);
   }
 });
+
+// ---- asset drag-drop (§5.4): a dropped file lands in the project (working
+// copy + write-through) and becomes a node at the drop point.
+
+const assetKindOf = (file) => {
+  if (file.type.startsWith('image/')) {
+    return { dir: 'assets', type: 'image', prop: 'src' };
+  }
+  if (file.type === 'video/mp4' || /\.mp4$/i.test(file.name)) {
+    return { dir: 'assets', type: 'video', prop: 'src' };
+  }
+  if (/\.wgsl$/i.test(file.name)) {
+    return { dir: 'shaders', type: 'shader', prop: 'shader' };
+  }
+  return null;
+};
+
+graphCanvas.addEventListener('dragover', (e) => {
+  if ([...e.dataTransfer.items].some((i) => i.kind === 'file')) {
+    e.preventDefault();
+  }
+});
+graphCanvas.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  if (!wasm) {
+    return;
+  }
+  if (!project) {
+    setGraphStatus('open a project to import files — bundled scenes have ' +
+                   'nowhere durable to put them');
+    return;
+  }
+  if (inSubgraph()) {
+    setGraphStatus('leave the subgraph view to import files');
+    return;
+  }
+  const world = graphWorldOf(e.clientX, e.clientY);
+  const doc = activeDoc();
+  let offset = 0;
+  let added = false;
+  for (const file of e.dataTransfer.files) {
+    const kind = assetKindOf(file);
+    if (!kind) {
+      setGraphStatus(`${file.name}: images, mp4 video, or .wgsl only ` +
+                     '(remux other video with ffmpeg -c copy)');
+      continue;
+    }
+    const base = file.name.replace(/[^A-Za-z0-9._-]+/g, '_');
+    const rel = `${kind.dir}/${base}`;
+    const data = new Uint8Array(await file.arrayBuffer());
+    if (data.length > 128 << 20) {
+      setGraphStatus(`${file.name}: large file — the preview keeps a copy ` +
+                     'in memory');
+    }
+    const full = `${projectRoot()}/${rel}`;
+    Module.FS.mkdirTree(full.slice(0, full.lastIndexOf('/')));
+    Module.FS.writeFile(full, data);
+    projectWriteThrough(rel, data);
+    let stem = base.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_]/g, '_')
+                   .replace(/^([0-9])/, '_$1') || kind.type;
+    if (stem === 'time' || stem === 'mouse') {
+      stem = '_' + stem;
+    }
+    const id = freeNodeId(stem);
+    doc.nodes.push({ id, type: kind.type, [kind.prop]: rel });
+    ((doc.editor ??= {}).positions ??= {})[id] =
+        [Math.round(world.x - G.W / 2 + offset), Math.round(world.y + offset)];
+    offset += 26;
+    selectedNodeId = id;
+    added = true;
+  }
+  if (added) {
+    await pushFromGraph();
+  }
+});
 document.getElementById('backBtn').onclick = leaveSubgraph;
 
 // ---- graph view: drawing ---------------------------------------------------

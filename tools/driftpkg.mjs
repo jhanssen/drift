@@ -4,7 +4,8 @@
 // index.json (§20.4); the store is where the runtime resolves
 // packages/<name>/… references from (§20.2).
 //
-// usage: driftpkg.mjs index [REPO-DIR]           (regenerate index.json)
+// usage: driftpkg.mjs init PATH                  (new .sceneproject skeleton)
+//        driftpkg.mjs index [REPO-DIR]           (regenerate index.json)
 //        driftpkg.mjs install NAME[@PIN] [--repo DIR|URL] [--store DIR]
 //        driftpkg.mjs list [--store DIR]
 //
@@ -21,10 +22,64 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const defaultRepo = path.join(here, '..', 'library');
 
 function usage() {
-  console.error('usage: driftpkg.mjs index [REPO-DIR] | ' +
+  console.error('usage: driftpkg.mjs init PATH | index [REPO-DIR] | ' +
                 'install NAME[@PIN] [--repo DIR|URL] [--store DIR] | ' +
                 'list [--store DIR]');
   process.exit(2);
+}
+
+// The same starter the editor's New… writes (editor.html TEMPLATE_*):
+// a sequence-driven glow with one parameter, ready to run and edit.
+const TEMPLATE_SCENE = (name) => JSON.stringify({
+  version: 1,
+  name,
+  parameters: {
+    tint: { type: 'vec3', default: [0.4, 0.6, 1.0], hint: 'color',
+            label: 'Tint' },
+  },
+  nodes: [
+    { id: 'seq', type: 'sequence', duration: 8, loop: true,
+      tracks: [
+        { name: 'level', kind: 'value', type: 'scalar',
+          interpolate: 'smooth',
+          keys: [{ t: 0, value: 0.2 }, { t: 4, value: 1 },
+                 { t: 8, value: 0.2 }] },
+      ],
+      inputs: { time: '@time.seconds' } },
+    { id: 'main', type: 'shader', shader: 'shaders/main.wgsl',
+      inputs: { level: '@seq.level', tint: '$tint' } },
+    { id: 'out', type: 'output', inputs: { color: '@main' } },
+  ],
+}, null, 2) + '\n';
+
+const TEMPLATE_WGSL = `struct Params {
+    level: f32,
+    tint: vec3<f32>,
+}
+@group(0) @binding(0) var<uniform> params: Params;
+
+@fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let d = distance(uv, vec2f(0.5, 0.5));
+    let glow = params.level * exp(-d * d * 8.0);
+    return vec4f(params.tint * glow, 1.0);
+}
+`;
+
+function cmdInit(target) {
+  if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
+    throw new Error(`${target} exists and is not empty`);
+  }
+  const name = path.basename(target).replace(/\.sceneproject$/, '') ||
+               'Untitled';
+  fs.mkdirSync(path.join(target, 'shaders'), { recursive: true });
+  fs.mkdirSync(path.join(target, 'assets'), { recursive: true });
+  fs.writeFileSync(path.join(target, 'scene.json'), TEMPLATE_SCENE(name));
+  fs.writeFileSync(path.join(target, 'shaders', 'main.wgsl'),
+                   TEMPLATE_WGSL);
+  console.log(`created ${target}`);
+  console.log(`run it:   drift ${target}`);
+  console.log('edit it:  open the folder in the editor (Open…), or run');
+  console.log(`          drift ${target} --listen 7681 and connect`);
 }
 
 function defaultStore() {
@@ -247,7 +302,10 @@ while (args.length) {
 }
 
 try {
-  if (command === 'index') {
+  if (command === 'init') {
+    if (positional.length !== 1) usage();
+    cmdInit(positional[0]);
+  } else if (command === 'index') {
     cmdIndex(positional[0] ?? defaultRepo);
   } else if (command === 'install') {
     if (positional.length !== 1) usage();
