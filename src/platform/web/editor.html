@@ -1973,7 +1973,7 @@ function buildGraph() {
         [...Object.entries(doc.inputs ?? {}).map(([name, decl]) =>
              [name, typeCategory(decl?.type)]),
          ['+', 'value']]);
-    face('#outputs',
+    const outFace = face('#outputs',
         [...Object.keys(doc.outputs ?? {}).map((name) =>
              ({ name, unbound: true, category: 'value' })),
          { name: '+', unbound: true, category: 'value' }],
@@ -2004,6 +2004,15 @@ function buildGraph() {
       if (from) {
         const fromPort = conn.port ?? from.outputs[0]?.[0];
         const found = from.outputs.find(([n]) => n === fromPort);
+        // A mapped output is wired, not an open slot: filled pin, bright
+        // label, the inner port's category — its consumers live in the
+        // parent graph.
+        const entry = outFace.inputs.find((i) => i.name === name);
+        if (entry) {
+          entry.unbound = false;
+          entry.conn = { node: from.id, port: fromPort, previous: false };
+          entry.category = found ? found[1] : 'value';
+        }
         edges.push({ from: from.id, fromPort, to: '#outputs', toPort: name,
                      category: found ? found[1] : 'value', previous: false });
       }
