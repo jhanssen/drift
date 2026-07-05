@@ -75,6 +75,15 @@ Responsibilities:
   - fluid systems
   - procedural effects
   - data-driven animation
+- **Per-device Basis transcode target (planned):** KTX2/Basis sources
+  currently transcode to BC7 unconditionally. Request the adapter's
+  compression features (`texture-compression-bc` / `-astc` / `-etc2`)
+  at device creation and pick the target per device — BC7 on desktop,
+  ASTC 4×4 where that's all there is, RGBA8 decompression as the
+  graceful floor (mobile browsers). Authoring constraints
+  (premultiplied-or-opaque, multiple-of-4 dimensions) hold for every
+  block target; the decode path needs the device's feature set plumbed
+  in, which it currently does not receive.
 
 ## 4. Scripting / Logic System
 
