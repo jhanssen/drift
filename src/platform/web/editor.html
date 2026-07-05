@@ -2023,11 +2023,17 @@ function buildGraph() {
         if (to) {
           const entry = to.inputs.find((i) => i.name === conn.port);
           if (entry) {
-            // Interface-fed: draws wired like any connection, and
-            // remembers its feeder so the wire can be picked up and
-            // re-bound.
+            // The bind is always picked up from here (boundBind), but the
+            // pin only draws wired when the interface input is itself fed
+            // by the instance — a dim boundary row keeps its inner pins
+            // dim, showing the declared default they run at.
             entry.boundBind = name;
             entry.category ??= typeCategory(decl?.type);
+            if (!inFace.dimPorts.has(name)) {
+              entry.boundFed = true;
+            } else if (entry.def === undefined) {
+              entry.def = decl?.default;
+            }
           }
           edges.push({ from: inFace.id, fromPort: name, to: to.id,
                        toPort: conn.port, category: typeCategory(decl?.type),
@@ -3433,12 +3439,12 @@ function drawGraph() {
 
     node.inputs.forEach((input, i) => {
       const y = pinY(node, i);
-      ctx.fillStyle = (input.unbound && !input.boundBind) || input.append
+      ctx.fillStyle = (input.unbound && !input.boundFed) || input.append
           ? '#8a8f98' : '#c6cad1';
       ctx.fillText(input.name, node.x + 8, y + 3);
       const binding = input.param ? (input.paramEdge ? null : '$' + input.param)
                     : input.literal !== undefined ? shortLit(input.literal)
-                    : input.unbound && !input.boundBind &&
+                    : input.unbound && !input.boundFed &&
                       input.def !== undefined
                         ? shortLit(input.def)
                     : null;
@@ -3469,7 +3475,7 @@ function drawGraph() {
       const y = pinY(node, i);
       ctx.beginPath();
       ctx.arc(node.x, y, 3, 0, Math.PI * 2);
-      if (input.conn || input.paramEdge || input.boundBind) {
+      if (input.conn || input.paramEdge || input.boundFed) {
         ctx.fillStyle = GRAPH_COLORS[input.category ?? 'value'];
         ctx.fill();
       } else {
