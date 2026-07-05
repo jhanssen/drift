@@ -2479,6 +2479,7 @@ function pinAt(wx, wy) {
 const graphView = { x: 0, y: 0, scale: 1 }; // screen = (world + x/y) · scale
 let graphDrag = null; // { kind: 'node'|'pan', ... }
 let wireDrag = null;  // { seek: 'in'|'out', from?, to?, detach?, cursor }
+let pinPress = null;  // in-pin mousedown; a no-move release edits the value
 
 const graphWorldOf = (clientX, clientY) => {
   const rect = graphCanvas.getBoundingClientRect();
@@ -2508,6 +2509,8 @@ graphCanvas.onmousedown = (e) => {
   const { x: wx, y: wy } = graphWorldOf(e.clientX, e.clientY);
   const pin = pinAt(wx, wy);
   if (pin) {
+    pinPress = pin.side === 'in' ? { pin, cx: e.clientX, cy: e.clientY }
+                                 : null;
     wireDrag = startWireDrag(pin);
     if (wireDrag) {
       wireDrag.cursor = { x: wx, y: wy };
@@ -2576,6 +2579,17 @@ window.addEventListener('mousemove', (e) => {
 });
 
 window.addEventListener('mouseup', (e) => {
+  if (pinPress) {
+    const press = pinPress;
+    pinPress = null;
+    if (wireDrag &&
+        Math.hypot(e.clientX - press.cx, e.clientY - press.cy) < 4) {
+      // A click, not a drag: edit the pin's value in place.
+      wireDrag = null;
+      openPinEditor(press.pin, e);
+      return;
+    }
+  }
   if (wireDrag) {
     const w = graphWorldOf(e.clientX, e.clientY);
     applyWireDrop(wireDrag, pinAt(w.x, w.y));
@@ -2723,6 +2737,76 @@ function removeInput(node, entry) {
   } else {
     unbindPort(node.id, inputs, entry.name);
   }
+}
+
+// Click a pin to type its value in place: a number, an "x, y…" vector, a
+// $parameter, an @node.port reference, or empty to fall back to the
+// port's default. Wiring stays a drag; this is the literal/param path.
+function openPinEditor(pin, anchor) {
+  const { node, input } = pin;
+  if (node.boundary || node.implicit || node.param || input.append) {
+    return;
+  }
+  if (input.boundBind) {
+    setGraphStatus(`'${input.name}' is fed by the interface — edit the ` +
+                   'bind at #inputs (§19.2)');
+    return;
+  }
+  const raw = input.arrayOf
+      ? node.source.inputs?.[input.arrayOf.base]?.[input.arrayOf.index]
+      : node.source.inputs?.[input.name];
+  const display = raw === undefined ? ''
+      : typeof raw === 'string' ? raw
+      : Array.isArray(raw) && raw.every((v) => typeof v === 'number')
+          ? raw.join(', ')
+      : JSON.stringify(raw);
+  openQuickForm({ left: anchor.clientX, bottom: anchor.clientY },
+                `${node.id} · ${input.name}`, [
+    { key: 'value', label: 'value', value: display },
+    { note: 'number, "x, y…" vector, $parameter, or @node.port — empty ' +
+            'resets' + (input.def !== undefined
+                ? ` to the default ${JSON.stringify(input.def)}` : '') },
+  ], (v) => {
+    const text = v.value.trim();
+    if (text === display) {
+      return null; // unchanged
+    }
+    if (!text) {
+      // An explicit reset outranks the disconnect-restores-literal
+      // memory: the port really goes back to its default.
+      priorBindings.delete(`${node.id}/${input.name}`);
+      removeInput(node, input);
+      pushFromGraph();
+      return null;
+    }
+    let value;
+    if (text[0] === '$') {
+      if (inSubgraph()) {
+        return '$parameters are not allowed inside a graph file (§19.1)';
+      }
+      if (!sceneSource.parameters?.[text.slice(1)]) {
+        return `unknown parameter '${text}'`;
+      }
+      value = text;
+    } else if (text[0] === '@') {
+      value = text; // the loader validates the reference (draft explains)
+    } else if (text[0] === '[' || text[0] === '{') {
+      try {
+        value = JSON.parse(text);
+      } catch {
+        return 'unparseable JSON';
+      }
+    } else {
+      const parts = text.split(',').map((s) => Number(s.trim()));
+      if (!parts.length || parts.some(Number.isNaN)) {
+        return 'expected a number, "x, y…", $parameter, or @node.port';
+      }
+      value = parts.length === 1 ? parts[0] : parts;
+    }
+    writeInput(node, input, value);
+    pushFromGraph();
+    return null;
+  });
 }
 
 function applyWireDrop(drag, pin) {
@@ -3097,11 +3181,27 @@ function placeAtViewCenter(key) {
 
 // Parameters are declarations (§6), not nodes, but they are created and
 // placed from the same palette; the graph draws them as source nodes.
+// Parse "x, y…" against a declared arity; a single number splats.
+function parseParamValue(text, arity) {
+  const parts = text.split(',').map((s) => Number(s.trim()));
+  if (!parts.length || parts.some(Number.isNaN) ||
+      (parts.length !== 1 && parts.length !== arity)) {
+    return undefined;
+  }
+  return arity === 1 ? parts[0]
+       : parts.length === 1 ? Array(arity).fill(parts[0]) : parts;
+}
+
 function addParameter(anchor) {
   openQuickForm(anchor, 'add parameter', [
     { key: 'name', label: 'name', value: '' },
     { key: 'type', label: 'type',
       options: ['scalar', 'vec2', 'vec3', 'vec4'] },
+    { key: 'default', label: 'default', value: '0' },
+    { key: 'min', label: 'min', value: '0' },
+    { key: 'max', label: 'max', value: '1' },
+    { note: 'min/max bound the panel control (scalars); vector defaults ' +
+            'are "x, y…"' },
   ], (v) => {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
       return 'name must be an identifier (§3)';
@@ -3110,9 +3210,19 @@ function addParameter(anchor) {
       return `parameter '${v.name}' already exists`;
     }
     const arity = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[v.type];
-    const decl = arity === 1
-        ? { type: v.type, default: 0, min: 0, max: 1 }
-        : { type: v.type, default: Array(arity).fill(0) };
+    const def = parseParamValue(v.default, arity);
+    if (def === undefined) {
+      return `default: expected ${arity} number(s)`;
+    }
+    const decl = { type: v.type, default: def };
+    if (arity === 1) {
+      const min = Number(v.min), max = Number(v.max);
+      if (Number.isNaN(min) || Number.isNaN(max) || !(max > min)) {
+        return 'min/max must be numbers with max > min';
+      }
+      decl.min = min;
+      decl.max = max;
+    }
     (sceneSource.parameters ??= {})[v.name] = decl;
     placeAtViewCenter('$' + v.name);
     selectedNodeId = '$' + v.name;
@@ -4038,6 +4148,57 @@ function renderInspector() {
     for (const [name, category] of node.outputs) {
       row(name, category);
     }
+  }
+  if (node.param) {
+    // The declaration (default/min/max) is document state, editable here;
+    // the panel's slider edits the live value.
+    const edit = document.createElement('button');
+    edit.textContent = 'Edit declaration…';
+    edit.style.marginTop = '10px';
+    edit.onclick = (e) => {
+      const decl = node.decl;
+      const arity =
+          { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[decl.type] ?? 1;
+      const fields = [
+        { key: 'default', label: 'default',
+          value: Array.isArray(decl.default) ? decl.default.join(', ')
+                                             : String(decl.default ?? 0) },
+      ];
+      if (arity === 1) {
+        fields.push({ key: 'min', label: 'min',
+                      value: decl.min !== undefined ? String(decl.min)
+                                                    : '' });
+        fields.push({ key: 'max', label: 'max',
+                      value: decl.max !== undefined ? String(decl.max)
+                                                    : '' });
+        fields.push({ note: 'empty min/max removes the bounds' });
+      }
+      openQuickForm(e.target.getBoundingClientRect(), '$' + node.param,
+                    fields, (v) => {
+        const def = parseParamValue(v.default, arity);
+        if (def === undefined) {
+          return `default: expected ${arity} number(s)`;
+        }
+        decl.default = def;
+        if (arity === 1) {
+          if (v.min === '' && v.max === '') {
+            delete decl.min;
+            delete decl.max;
+          } else {
+            const min = Number(v.min), max = Number(v.max);
+            if (Number.isNaN(min) || Number.isNaN(max) || !(max > min)) {
+              return 'min/max must be numbers with max > min';
+            }
+            decl.min = min;
+            decl.max = max;
+          }
+        }
+        pushFromGraph();
+        renderInspector();
+        return null;
+      });
+    };
+    info.appendChild(edit);
   }
   if (!node.implicit) {
     const del = document.createElement('button');
