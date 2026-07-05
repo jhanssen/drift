@@ -136,6 +136,82 @@ Host writes inputs → WASM update() → outputs written → host applies change
   - module recompilation
   - live preview updates (<100ms target)
 
+### 5.4 Project Storage Providers
+
+Design adopted 2026-07-05 (not yet implemented). The editor reads and
+writes projects through a **storage provider** abstraction; the WASM
+runtime's in-memory filesystem is only the working copy the preview
+renders from, never the source of truth. Every project write funnels
+through one path (today: preview FS + live wall) and fans out to the
+active provider.
+
+Providers:
+
+- **Bundle** (exists): the examples baked into the web build. Read-only;
+  editing one forks it into another provider ("save as").
+- **Live wall** (exists): a native runtime with the control endpoint;
+  `read-asset`/`write-asset` operate on the real project directory. The
+  protocol needs a `list-assets` verb (enumerate the project tree) so
+  the editor can browse and mirror an opened project — today it can only
+  address files it already knows by name.
+- **Local directory**: the user picks a real `.sceneproject` folder via
+  the browser's directory-picker API (`showDirectoryPicker`,
+  read-write mode). Access is user-granted, scoped to the picked
+  subtree, and revocable — the same confinement contract as the
+  runtime's project root (SCENE_FORMAT.md §1), so a project edited in
+  the browser is byte-for-byte the folder the native runtime runs.
+  Handles persist (IndexedDB) to power "recent projects", with a
+  re-confirmation prompt per session. Chromium-only; other browsers fall
+  back to the providers below.
+- **Origin-private storage (OPFS)**: default home for "new project"
+  when no directory is picked — persistent across reloads, no
+  permission friction, works in every modern browser. Invisible to the
+  user's real filesystem, so it always pairs with export.
+- **Zip import/export**: universal bridge and the offline interchange —
+  "download project" packs the tree; dropping a zip (or a folder via a
+  directory-typed file input) opens one anywhere. Shares its packing
+  code with the future `.wallpkg` exporter (§6.2), which is this plus
+  vendored packages and a manifest.
+
+Asset ingestion rides the same funnel: drag-drop or file-pick →
+`assets/`/`shaders/` in the active provider (drop on the graph canvas
+also creates the `image`/`video`/`shader` node). Surfaced constraints,
+not discovered ones: video must be mp4 (the built-in demuxer; remux
+with `-c copy`), and the working copy is RAM — large files warn, and
+streaming from the provider instead of mirroring is the reserved
+follow-up.
+
+**Packages.** The bundled `/packages` store is frozen at build time, so
+packages installed after the build resolve on a wall but not in the
+preview. Two closures, both riding SCENE_FORMAT.md §20.2 unchanged:
+
+- Wall-connected: `read-asset` already resolves `packages/` paths
+  through the wall's store (pin-aware). The editor mirrors a referenced
+  package's files into the working copy's project-local `packages/`
+  dir — the §20.2 override, which wins over every store by design.
+  Enumeration comes from the `list-assets` verb, which resolves
+  `packages/` prefixes the same way.
+- Standalone: the browser is effectively a second machine with its own
+  store, overlaid on the bundled one. It fills three ways: pointing the
+  editor at a local store directory via the directory picker (the
+  persisted handle makes it a live overlay — packages installed
+  natively appear on the next visit, no copy step); the in-browser
+  §20.4 repository client (`index.json`'s per-file hashes exist so a
+  static host can be fetched file-by-file and verified) installing into
+  origin storage; or a dropped package zip. Pickers cannot be seeded
+  with arbitrary paths (browser policy) and the default store lives
+  under a hidden directory, so the store-pick dialog shows the expected
+  path (and the show-hidden-files hint); the documented setup for
+  browser-centric use is `DRIFT_PACKAGE_PATH` pointed at a visible
+  folder, which the runtime, the install tool, and the picker then all
+  share — relocation, not symlinking: browser file access deliberately
+  does not follow symlinks inside a granted tree (scope-escape
+  defense), so a linked store is not reliable. Picker `id`s keep store
+  and project picks remembering their locations independently. The
+  store prompt is failure-driven: it appears only when a `packages/`
+  reference misses after the project-local override, the bundled
+  store, and any already-attached overlay.
+
 ## 6. Scene Format
 
 ### 6.1 Project Format
