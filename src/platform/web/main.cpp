@@ -28,6 +28,7 @@ static std::string gLastLoadErrors;
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 
+#include "core/NodeProps.h"
 #include "core/Scene.h"
 #include "core/WgslInterface.h"
 #include "platform/PackageStore.h"
@@ -603,6 +604,63 @@ EMSCRIPTEN_KEEPALIVE const char* drift_reflect(const char* path)
         add(t.name, "texture", "out");
     }
     json += "]}";
+    return json.c_str();
+}
+
+// The declared property surface per node type (core/NodeProps.h) — the
+// editor builds creation forms and the inspector's defaults from this
+// instead of hardcoding node types.
+EMSCRIPTEN_KEEPALIVE const char* drift_node_props()
+{
+    static std::string json;
+    if (!json.empty()) {
+        return json.c_str();
+    }
+    json = "{";
+    const char* current = nullptr;
+    for (const auto& p : drift::core::kNodeProps) {
+        if (!current || strcmp(current, p.node) != 0) {
+            if (current) {
+                json += "],";
+            }
+            json += std::string("\"") + p.node + "\":[";
+            current = p.node;
+        } else {
+            json += ",";
+        }
+        json += std::string("{\"name\":\"") + p.name + "\",\"kind\":\"" +
+                p.kind + "\",\"required\":" +
+                (p.required ? "true" : "false");
+        if (p.def) {
+            json += std::string(",\"default\":") + p.def;
+        }
+        if (p.options) {
+            json += ",\"options\":[";
+            std::string opts(p.options);
+            size_t start = 0;
+            bool first = true;
+            while (start <= opts.size()) {
+                const size_t space = opts.find(' ', start);
+                const std::string opt = opts.substr(
+                    start,
+                    space == std::string::npos ? space : space - start);
+                if (!opt.empty()) {
+                    json += std::string(first ? "\"" : ",\"") + opt + "\"";
+                    first = false;
+                }
+                if (space == std::string::npos) {
+                    break;
+                }
+                start = space + 1;
+            }
+            json += "]";
+        }
+        json += "}";
+    }
+    if (current) {
+        json += "]";
+    }
+    json += "}";
     return json.c_str();
 }
 

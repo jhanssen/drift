@@ -6,6 +6,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include "NodeProps.h"
 #include "Nodes.h"
 #include "Scene.h"
 
@@ -701,27 +702,19 @@ bool Loader::parseRawNode(const glz::generic& entry, RawNode& raw,
 
     // Unknown properties are a warning, not an error (§13) — but a
     // typo'd property silently changing behavior is the worst authoring
-    // footgun, so say something.
-    static const std::map<std::string, std::vector<std::string>> kProps = {
-        { "wave", { "shape" } },
-        { "remap", { "clamp" } },
-        { "combine", {} },
-        { "split", {} },
-        { "sequence", { "duration", "loop", "tracks" } },
-        { "shader", { "shader", "size" } },
-        { "compute", { "shader", "capacity", "dispatch" } },
-        { "particles",
-          { "capacity", "emitter", "emitters", "spawnCount" } },
-        { "sprites", { "blend", "sheet" } },
-        { "trails", { "blend", "length" } },
-        { "image", { "src" } },
-        { "video", { "src", "loop" } },
-        { "transform", {} },
-        { "fit", { "mode" } },
-        { "compositor", {} },
-        { "output", {} },
-        { "graph", { "graph" } },
-    };
+    // footgun, so say something. The known set derives from the shared
+    // NodeProps.h table (also served to editors via drift_node_props).
+    static const std::map<std::string, std::vector<std::string>> kProps =
+        [] {
+            std::map<std::string, std::vector<std::string>> map;
+            for (const char* type : kNodeTypes) {
+                map[type];
+            }
+            for (const NodePropDef& p : kNodeProps) {
+                map[p.node].push_back(p.name);
+            }
+            return map;
+        }();
     if (auto propsIt = kProps.find(raw.type); propsIt != kProps.end()) {
         for (const auto& [key, value] : obj) {
             if (key == "id" || key == "type" || key == "inputs") {

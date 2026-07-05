@@ -277,11 +277,13 @@ var Module = {
     const readAsset = Module.cwrap('drift_read_asset', 'string', ['string']);
     const open = Module.cwrap('drift_open', 'number', ['string']);
     const reflect = Module.cwrap('drift_reflect', 'string', ['string']);
+    const nodeProps = Module.cwrap('drift_node_props', 'string', []);
     const scenes = Module.cwrap('drift_scenes', 'string', []);
     const graphs = Module.cwrap('drift_graphs', 'string', []);
     wasm = {
       describe,
       reflect,
+      nodeProps,
       scenes,
       graphs,
       time,
@@ -1564,13 +1566,18 @@ const NODE_INPUTS = {
   split: [['value', 'value']],
   sequence: [['time', 'value']],
 };
-// Declared properties per type with their defaults (§9) — the inspector
-// shows unset ones the way unbound pins show the default they run at.
-const NODE_PROPS = {
-  video: { loop: true },
-  shader: { size: 'auto' },
-  fit: { mode: 'cover' },
-};
+// Declared properties per type (name/kind/required/default/options) come
+// from the runtime (drift_node_props ← core/NodeProps.h): creation forms
+// and the inspector's defaults follow the engine, not editor hardcoding.
+let nodePropsCache = null;
+function nodePropDefs(type) {
+  try {
+    nodePropsCache ??= wasm ? JSON.parse(wasm.nodeProps()) : null;
+    return nodePropsCache?.[type] ?? [];
+  } catch {
+    return [];
+  }
+}
 const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d',
                        buffer: '#b48ade' };
 const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
@@ -2828,17 +2835,30 @@ function addNodeOfType(type, anchor, graphPath) {
     addParameter(anchor);
     return;
   }
-  const fields = [];
-  if (type === 'image' || type === 'video') {
-    fields.push({ key: 'src', label: 'path', value: 'assets/' });
-  } else if (type === 'shader' || type === 'compute') {
-    fields.push({ key: 'shader', label: 'path', value: 'shaders/' });
-  }
-  if (type === 'compute') {
-    fields.push({ key: 'capacity', label: 'capacity', value: '1000' });
-  }
+  // Creation parameters come from the runtime's property metadata:
+  // structured ("json") kinds are edited by richer tooling, and a graph
+  // instance's file is already chosen in the palette.
+  const defs = nodePropDefs(type).filter((p) =>
+      p.kind !== 'json' && !(graphPath && p.name === 'graph'));
+  const fields = defs.map((p) => {
+    if (p.options) {
+      return { key: p.name, label: p.name, options: p.options,
+               value: p.default };
+    }
+    if (p.kind === 'bool') {
+      return { key: p.name, label: p.name, options: ['true', 'false'],
+               value: String(p.default ?? true) };
+    }
+    const value = p.kind === 'asset'
+        ? (p.name === 'shader' ? 'shaders/'
+                               : p.name === 'src' ? 'assets/' : '')
+        : p.default !== undefined ? String(p.default)
+        : type === 'sequence' && p.name === 'duration' ? '8' : '';
+    return { key: p.name, label: p.name, value };
+  });
   const baseId = graphPath
-      ? graphPath.replace(/^graphs\//, '').replace(/\.json$/, '')
+      ? graphPath.split('/').pop().replace(/\.json$/, '')
+            .replace(/[^A-Za-z0-9_]/g, '_')
       : type;
   fields.push({ key: 'id', label: 'id', value: freeNodeId(baseId) });
   openQuickForm(anchor, `add ${graphPath ?? type}`, fields, (v) => {
@@ -2846,29 +2866,38 @@ function addNodeOfType(type, anchor, graphPath) {
         v.id === 'mouse' || doc.nodes.some((n) => n.id === v.id)) {
       return 'invalid, reserved, or duplicate id (§3)';
     }
-    if ((fields[0].key === 'src' && !v.src) ||
-        (fields[0].key === 'shader' && !v.shader)) {
-      return 'a project-relative path is required';
-    }
-    if (type === 'compute' && !(parseInt(v.capacity, 10) > 0)) {
-      return 'capacity must be a positive integer (§18.2)';
-    }
     const node = { id: v.id, type };
     if (graphPath) {
       node.graph = graphPath; // §19.3 instance
     }
-    if (v.src) {
-      node.src = v.src;
-    }
-    if (v.shader) {
-      node.shader = v.shader;
-    }
-    if (type === 'compute') {
-      node.capacity = parseInt(v.capacity, 10);
+    for (const p of defs) {
+      const text = (v[p.name] ?? '').trim();
+      if (!text) {
+        if (p.required) {
+          return `'${p.name}' is required`;
+        }
+        continue;
+      }
+      let value = text;
+      if (p.kind === 'bool') {
+        value = text === 'true';
+      } else if (p.kind === 'int') {
+        value = parseInt(text, 10);
+        if (!(value > 0) || String(value) !== text) {
+          return `'${p.name}' must be a positive integer`;
+        }
+      } else if (p.kind === 'number') {
+        value = parseFloat(text);
+        if (!Number.isFinite(value)) {
+          return `'${p.name}' must be a number`;
+        }
+      }
+      if (p.default !== undefined && value === p.default) {
+        continue; // stays on the default; keep the document minimal
+      }
+      node[p.name] = value;
     }
     if (type === 'sequence') {
-      node.duration = 8;
-      node.loop = true;
       node.tracks = [{ name: 'level', kind: 'value', type: 'scalar',
                        interpolate: 'linear', keys: [{ t: 0, value: 0 }] }];
     }
@@ -3608,15 +3637,15 @@ function renderInspector() {
   row('type', node.type);
   const props = Object.entries(node.source)
       .filter(([key]) => key !== 'id' && key !== 'type' && key !== 'inputs');
-  const unsetProps = Object.entries(NODE_PROPS[node.source.type] ?? {})
-      .filter(([key]) => !(key in node.source));
+  const unsetProps = nodePropDefs(node.source.type)
+      .filter((p) => p.default !== undefined && !(p.name in node.source));
   if (props.length || unsetProps.length) {
     heading('properties');
     for (const [key, value] of props) {
       row(key, fmt(value), JSON.stringify(value));
     }
-    for (const [key, def] of unsetProps) {
-      row(key, `(default ${JSON.stringify(def)})`);
+    for (const p of unsetProps) {
+      row(p.name, `(default ${JSON.stringify(p.default)})`);
     }
   }
   const inputs = node.inputs.filter((input) => !input.append);
