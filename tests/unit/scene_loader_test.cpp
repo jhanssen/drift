@@ -33,6 +33,56 @@ const char* kTrailWgsl = R"(
     }
 )";
 
+// §18.2 compute kernels. Particle is the §18.3 contract (64-byte stride).
+const char* kSimWgsl = R"(
+    struct Particle {
+        pos: vec3f, age: f32,
+        vel: vec3f, lifetime: f32,
+        color: vec4f,
+        size: f32, rotation: f32, seed: f32, reserved: f32,
+    }
+    struct Params { dt: f32 }
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var<storage, read> prev: array<Particle>;
+    @group(0) @binding(2) var<storage, read_write> state: array<Particle>;
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+        if (id.x >= arrayLength(&state)) { return; }
+        var p = prev[id.x];
+        p.age += params.dt;
+        state[id.x] = p;
+    }
+)";
+
+const char* kPaintWgsl = R"(
+    struct Particle {
+        pos: vec3f, age: f32,
+        vel: vec3f, lifetime: f32,
+        color: vec4f,
+        size: f32, rotation: f32, seed: f32, reserved: f32,
+    }
+    @group(0) @binding(0) var<storage, read> pts: array<Particle>;
+    @group(0) @binding(1) var canvas: texture_storage_2d<rgba16float, write>;
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+        textureStore(canvas, vec2i(id.xy), vec4f(0.0));
+    }
+)";
+
+const char* kVec4ConsumerWgsl = R"(
+    @group(0) @binding(0) var<storage, read> pts: array<vec4f>;
+    @group(0) @binding(1) var canvas: texture_storage_2d<rgba16float, write>;
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+        textureStore(canvas, vec2i(id.xy), pts[0]);
+    }
+)";
+
+const char* kNoOutputsWgsl = R"(
+    @group(0) @binding(0) var<storage, read> pts: array<vec4f>;
+    @compute @workgroup_size(64) fn main() {}
+)";
+
 // A valid 2x2 RGBA PNG.
 const unsigned char kTinyPng[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2,
@@ -189,6 +239,10 @@ LoadResult load(const std::string& json,
     const std::map<std::string, std::string> assets = {
         { "shaders/minimal.wgsl", kMinimalWgsl },
         { "shaders/trail.wgsl", kTrailWgsl },
+        { "shaders/sim.wgsl", kSimWgsl },
+        { "shaders/paint.wgsl", kPaintWgsl },
+        { "shaders/vec4consumer.wgsl", kVec4ConsumerWgsl },
+        { "shaders/nooutputs.wgsl", kNoOutputsWgsl },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
         { "assets/tiny.webp",
@@ -772,6 +826,133 @@ TEST_CASE("load warnings: unknown properties, fields, hints, unreachable nodes")
     // Pruned orphans must not force animation: only the reachable graph
     // counts, and nothing reachable here uses time.
     CHECK_FALSE(r.scene->animated());
+}
+
+TEST_CASE("compute pipeline loads (§18): ping-pong sim into a painter")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+              "capacity": 256,
+              "inputs": { "dt": "@time.delta",
+                          "prev": { "node": "sim", "port": "state",
+                                    "previous": true } } },
+            { "id": "paint", "type": "compute", "shader": "shaders/paint.wgsl",
+              "inputs": { "pts": "@sim.state" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@paint" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    CHECK(r.warnings.empty());
+    // @time.delta ticks the sim: the scene needs a steady frame supply.
+    CHECK(r.scene->animated());
+}
+
+TEST_CASE("compute: capacity object form, explicit dispatch, auto dispatch")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+              "capacity": { "state": 128 }, "dispatch": [2],
+              "inputs": { "dt": "@time.delta",
+                          "prev": { "node": "sim", "port": "state",
+                                    "previous": true } } },
+            { "id": "paint", "type": "compute", "shader": "shaders/paint.wgsl",
+              "dispatch": "auto",
+              "inputs": { "pts": "@sim.state" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@paint" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty());
+}
+
+TEST_CASE("compute validation (§13 additions)")
+{
+    const char* kOut = R"(,
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ] })";
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    kOut);
+    };
+
+    // Buffer element strides must agree (64-byte Particle -> 16-byte vec4).
+    auto r = scene(R"(
+        { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+          "capacity": 64,
+          "inputs": { "dt": "@time.delta",
+                      "prev": { "node": "sim", "port": "state",
+                                "previous": true } } },
+        { "id": "bad", "type": "compute", "shader": "shaders/vec4consumer.wgsl",
+          "inputs": { "pts": "@sim.state" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("stride mismatch"));
+
+    // ...also across previous edges.
+    r = scene(R"(
+        { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+          "capacity": 64,
+          "inputs": { "dt": "@time.delta",
+                      "prev": { "node": "sim", "port": "state",
+                                "previous": true } } },
+        { "id": "bad", "type": "compute", "shader": "shaders/vec4consumer.wgsl",
+          "inputs": { "pts": { "node": "sim", "port": "state",
+                               "previous": true } } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("stride mismatch"));
+
+    // capacity is required when the kernel owns buffers.
+    r = scene(R"(
+        { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+          "inputs": { "dt": "@time.delta",
+                      "prev": { "node": "sim", "port": "state",
+                                "previous": true } } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'capacity' is required"));
+
+    // Literals cannot feed buffer ports (§18.1: no conversions).
+    r = scene(R"(
+        { "id": "bad", "type": "compute", "shader": "shaders/vec4consumer.wgsl",
+          "inputs": { "pts": 0.5 } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("type mismatch (scalar -> buffer)"));
+
+    // A kernel with nothing to produce is refused.
+    r = scene(R"(
+        { "id": "idle", "type": "compute", "shader": "shaders/nooutputs.wgsl",
+          "inputs": { "pts": 0.5 } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("no storage outputs"));
+
+    // Compute sources cannot masquerade as fragment shaders, nor vice versa.
+    r = scene(R"(
+        { "id": "bad", "type": "shader", "shader": "shaders/sim.wgsl",
+          "inputs": { "dt": 0.5 } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("use a 'compute' node"));
+    r = scene(R"(
+        { "id": "bad", "type": "compute", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("no @compute entry point"));
+
+    // Malformed dispatch.
+    r = scene(R"(
+        { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+          "capacity": 64, "dispatch": [0],
+          "inputs": { "dt": "@time.delta",
+                      "prev": { "node": "sim", "port": "state",
+                                "previous": true } } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'dispatch'"));
 }
 
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")

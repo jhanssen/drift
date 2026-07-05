@@ -1470,6 +1470,271 @@ void ShaderNode::evaluate(FrameContext& ctx)
     outputs[0].dirty = true;
 }
 
+// ---- ComputeNode (§18.2) ----
+
+ComputeNode::ComputeNode(std::string source, WgslInterface iface,
+                         std::vector<uint32_t> capacities,
+                         std::array<uint32_t, 3> dispatch)
+    : mSource(std::move(source))
+    , mInterface(std::move(iface))
+    , mCapacities(std::move(capacities))
+    , mDispatch(dispatch)
+{
+    // Outputs: read_write buffers (in group/binding order), then storage
+    // textures. Stride/capacity metadata is filled here, before any GPU
+    // work, so buffer connections validate at load and history buffers can
+    // allocate on the first frame.
+    size_t rw = 0;
+    for (const auto& buf : mInterface.storageBuffers) {
+        if (!buf.readWrite) {
+            continue;
+        }
+        Output out;
+        out.name = buf.name;
+        out.value.type = ValueType::Buffer;
+        out.value.bufStride = buf.elementStride;
+        out.value.bufCapacity = mCapacities[rw++];
+        outputs.push_back(std::move(out));
+    }
+    for (const auto& tex : mInterface.storageTextures) {
+        Output out;
+        out.name = tex.name;
+        out.value.type = ValueType::Texture;
+        outputs.push_back(std::move(out));
+    }
+}
+
+bool ComputeNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    wgpu::ShaderModule module = makeModule(ctx.device, mSource);
+    if (!module) {
+        return false;
+    }
+    wgpu::ComputePipelineDescriptor desc{};
+    desc.compute.module = module;
+    desc.compute.entryPoint = "main";
+    mPipeline = ctx.device.CreateComputePipeline(&desc);
+    if (!mPipeline) {
+        return false;
+    }
+    if (mInterface.hasUniforms) {
+        wgpu::BufferDescriptor bd{};
+        bd.size = mInterface.uniformSize;
+        bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+        mUniforms = ctx.device.CreateBuffer(&bd);
+    }
+    // Owned storage buffers: WebGPU zero-initializes, satisfying §18.1's
+    // first-read rule. CopySrc feeds the §10 history copies.
+    size_t rw = 0;
+    for (const auto& buf : mInterface.storageBuffers) {
+        if (!buf.readWrite) {
+            continue;
+        }
+        wgpu::BufferDescriptor bd{};
+        bd.size = (uint64_t)buf.elementStride * mCapacities[rw++];
+        bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+        mOwned.push_back(ctx.device.CreateBuffer(&bd));
+    }
+    if (!mInterface.textures.empty()) {
+        mSampler = makeLinearClampSampler(ctx.device);
+    }
+    return true;
+}
+
+void ComputeNode::evaluate(FrameContext& ctx)
+{
+    if (!ensurePipeline(ctx)) {
+        return;
+    }
+
+    // Wait for inputs that have not produced yet (video first frame,
+    // an upstream pipeline error) — the shader-node pattern.
+    for (size_t i = textureInputStart(); i < bufferInputStart(); ++i) {
+        if (!inputValue(i).texture) {
+            return;
+        }
+    }
+    for (size_t i = bufferInputStart(); i < inputs.size(); ++i) {
+        if (!inputValue(i).buffer) {
+            return;
+        }
+    }
+
+    // Storage textures size like shader outputs (§9.3/§17.5): first sampled
+    // texture input (feedback edges excluded), else the output target.
+    if (!mInterface.storageTextures.empty()) {
+        uint32_t width = 0, height = 0;
+        for (size_t i = textureInputStart(); i < bufferInputStart(); ++i) {
+            if (inputs[i].previous) {
+                continue;
+            }
+            const Value v = inputValue(i);
+            if (v.texWidth != 0) {
+                width = v.texWidth;
+                height = v.texHeight;
+                break;
+            }
+        }
+        if (width == 0) {
+            width = ctx.targetWidth;
+            height = ctx.targetHeight;
+        }
+        if (mStorageTex.empty() || width != mTexWidth || height != mTexHeight) {
+            mStorageTex.clear();
+            for (size_t i = 0; i < mInterface.storageTextures.size(); ++i) {
+                wgpu::TextureDescriptor desc{};
+                desc.format = wgpu::TextureFormat::RGBA16Float;
+                desc.size = { width, height, 1 };
+                desc.usage = wgpu::TextureUsage::StorageBinding |
+                             wgpu::TextureUsage::TextureBinding |
+                             wgpu::TextureUsage::CopySrc;
+                mStorageTex.push_back(ctx.device.CreateTexture(&desc));
+            }
+            mTexWidth = width;
+            mTexHeight = height;
+        }
+    }
+
+    if (mInterface.hasUniforms) {
+        std::vector<uint8_t> data(mInterface.uniformSize, 0);
+        for (size_t i = 0; i < mInterface.fields.size(); ++i) {
+            const Value v = inputValue(i);
+            const int n = componentCount(mInterface.fields[i].type);
+            float f[4];
+            for (int c = 0; c < n; ++c) {
+                f[c] = (float)v.v[c]; // §17.2 GPU boundary: f64 -> f32
+            }
+            std::memcpy(data.data() + mInterface.fields[i].offset, f,
+                        n * sizeof(float));
+        }
+        ctx.device.GetQueue().WriteBuffer(mUniforms, 0, data.data(),
+                                          data.size());
+    }
+
+    uint32_t maxGroup = 0;
+    if (mInterface.hasUniforms) {
+        maxGroup = std::max(maxGroup, mInterface.uniformGroup);
+    }
+    for (const auto& t : mInterface.textures) {
+        maxGroup = std::max(maxGroup, t.group);
+        if (t.hasSampler) {
+            maxGroup = std::max(maxGroup, t.samplerGroup);
+        }
+    }
+    for (const auto& b : mInterface.storageBuffers) {
+        maxGroup = std::max(maxGroup, b.group);
+    }
+    for (const auto& t : mInterface.storageTextures) {
+        maxGroup = std::max(maxGroup, t.group);
+    }
+
+    std::vector<wgpu::BindGroup> groups(maxGroup + 1);
+    for (uint32_t g = 0; g <= maxGroup; ++g) {
+        std::vector<wgpu::BindGroupEntry> entries;
+        if (mInterface.hasUniforms && mInterface.uniformGroup == g) {
+            wgpu::BindGroupEntry e{};
+            e.binding = mInterface.uniformBinding;
+            e.buffer = mUniforms;
+            e.size = mInterface.uniformSize;
+            entries.push_back(e);
+        }
+        for (size_t i = 0; i < mInterface.textures.size(); ++i) {
+            const auto& t = mInterface.textures[i];
+            if (t.group == g) {
+                wgpu::BindGroupEntry e{};
+                e.binding = t.binding;
+                e.textureView =
+                    inputValue(textureInputStart() + i).texture.CreateView();
+                entries.push_back(e);
+            }
+            if (t.hasSampler && t.samplerGroup == g) {
+                wgpu::BindGroupEntry e{};
+                e.binding = t.samplerBinding;
+                e.sampler = mSampler;
+                entries.push_back(e);
+            }
+        }
+        size_t readIdx = 0, rwIdx = 0;
+        for (const auto& b : mInterface.storageBuffers) {
+            wgpu::Buffer buffer;
+            uint64_t size = 0;
+            if (b.readWrite) {
+                buffer = mOwned[rwIdx];
+                size = (uint64_t)b.elementStride *
+                       outputs[rwIdx].value.bufCapacity;
+                rwIdx++;
+            } else {
+                const Value v = inputValue(bufferInputStart() + readIdx++);
+                buffer = v.buffer;
+                size = (uint64_t)v.bufStride * v.bufCapacity;
+            }
+            if (b.group == g) {
+                wgpu::BindGroupEntry e{};
+                e.binding = b.binding;
+                e.buffer = buffer;
+                e.size = size;
+                entries.push_back(e);
+            }
+        }
+        for (size_t i = 0; i < mInterface.storageTextures.size(); ++i) {
+            if (mInterface.storageTextures[i].group == g) {
+                wgpu::BindGroupEntry e{};
+                e.binding = mInterface.storageTextures[i].binding;
+                e.textureView = mStorageTex[i].CreateView();
+                entries.push_back(e);
+            }
+        }
+        wgpu::BindGroupDescriptor desc{};
+        desc.layout = mPipeline.GetBindGroupLayout(g);
+        desc.entryCount = entries.size();
+        desc.entries = entries.data();
+        groups[g] = ctx.device.CreateBindGroup(&desc);
+    }
+
+    // Dispatch: explicit, else cover the primary output — the first owned
+    // buffer's capacity along x, or the storage-texture extent in x/y.
+    uint32_t dx = mDispatch[0], dy = mDispatch[1], dz = mDispatch[2];
+    if (dx == 0) {
+        const uint32_t* wg = mInterface.workgroupSize;
+        if (!mOwned.empty()) {
+            dx = (outputs[0].value.bufCapacity + wg[0] - 1) / wg[0];
+            dy = 1;
+            dz = 1;
+        } else {
+            dx = (mTexWidth + wg[0] - 1) / wg[0];
+            dy = (mTexHeight + wg[1] - 1) / wg[1];
+            dz = 1;
+        }
+    }
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(mPipeline);
+    for (uint32_t g = 0; g < groups.size(); ++g) {
+        pass.SetBindGroup(g, groups[g]);
+    }
+    pass.DispatchWorkgroups(dx, dy, dz);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    // §18.1: buffer outputs are dirty whenever the node executes.
+    size_t out = 0;
+    for (size_t i = 0; i < mOwned.size(); ++i, ++out) {
+        outputs[out].value.buffer = mOwned[i];
+        outputs[out].dirty = true;
+    }
+    for (size_t i = 0; i < mStorageTex.size(); ++i, ++out) {
+        outputs[out].value.texture = mStorageTex[i];
+        outputs[out].value.texWidth = mTexWidth;
+        outputs[out].value.texHeight = mTexHeight;
+        outputs[out].dirty = true;
+    }
+}
+
 // ---- OutputNode ----
 
 OutputNode::OutputNode()

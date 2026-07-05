@@ -52,13 +52,15 @@ public:
         Value value;
         bool dirty = false;
         // Previous-frame state (§10), maintained by Scene::render. prev and
-        // prevDirty snapshot value/dirty at frame start; texture outputs read
-        // through a feedback edge additionally keep their last written
-        // contents in a history copy (needsHistory is set by the loader).
+        // prevDirty snapshot value/dirty at frame start; texture and buffer
+        // outputs read through a feedback edge additionally keep their last
+        // written contents in a history copy (needsHistory is set by the
+        // loader).
         Value prev;
         bool prevDirty = false;
         bool needsHistory = false;
         wgpu::Texture history;
+        wgpu::Buffer historyBuffer; // §18.1 buffer feedback
     };
 
     virtual ~Node() = default;

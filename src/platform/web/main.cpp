@@ -486,16 +486,25 @@ EMSCRIPTEN_KEEPALIVE const char* drift_reflect(const char* path)
               });
     json = "{\"ports\":[";
     bool first = true;
-    for (const auto& t : textures) {
+    auto add = [&](const std::string& name, const std::string& type,
+                   const char* dir) {
         json += first ? "" : ",";
         first = false;
-        json += "{\"name\":" + quote(t.name) + ",\"type\":\"texture\"}";
+        json += "{\"name\":" + quote(name) + ",\"type\":\"" + type +
+                "\",\"dir\":\"" + dir + "\"}";
+    };
+    for (const auto& t : textures) {
+        add(t.name, "texture", "in");
     }
     for (const auto& f : iface.fields) {
-        json += first ? "" : ",";
-        first = false;
-        json += "{\"name\":" + quote(f.name) + ",\"type\":\"" +
-                drift::core::valueTypeName(f.type) + "\"}";
+        add(f.name, drift::core::valueTypeName(f.type), "in");
+    }
+    // §18.2 compute interfaces: storage buffers and storage textures.
+    for (const auto& b : iface.storageBuffers) {
+        add(b.name, "buffer", b.readWrite ? "out" : "in");
+    }
+    for (const auto& t : iface.storageTextures) {
+        add(t.name, "texture", "out");
     }
     json += "]}";
     return json.c_str();

@@ -2,6 +2,7 @@
 
 // Built-in node types (SCENE_FORMAT.md §9). Instantiated by the loader.
 
+#include <array>
 #include <map>
 #include <string>
 
@@ -237,6 +238,43 @@ private:
     wgpu::Sampler mSampler;
     wgpu::Texture mColor;
     uint32_t mWidth = 0, mHeight = 0;
+};
+
+// §18.2 compute: a GPU compute pass. Ports come from the WGSL interface:
+// value inputs (uniform fields), sampled textures, then read-only storage
+// buffers; outputs are the read_write storage buffers it owns (allocated
+// zeroed at `capacity` elements), then storage textures. Buffer outputs are
+// dirty whenever the node executes (§18.1 — no change detection on GPU
+// contents); a previous-edge self-connection is the ping-pong simulation
+// idiom, realized by Scene::render's history copies like textures.
+class ComputeNode : public Node {
+public:
+    ComputeNode(std::string source, WgslInterface iface,
+                std::vector<uint32_t> capacities, // per read_write buffer
+                std::array<uint32_t, 3> dispatch); // {0,0,0} = auto
+    void evaluate(FrameContext& ctx) override;
+
+    const WgslInterface& interface() const { return mInterface; }
+    size_t textureInputStart() const { return mInterface.fields.size(); }
+    size_t bufferInputStart() const
+    {
+        return textureInputStart() + mInterface.textures.size();
+    }
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    std::string mSource;
+    WgslInterface mInterface;
+    std::vector<uint32_t> mCapacities;
+    std::array<uint32_t, 3> mDispatch;
+
+    wgpu::ComputePipeline mPipeline;
+    wgpu::Buffer mUniforms;
+    wgpu::Sampler mSampler;
+    std::vector<wgpu::Buffer> mOwned;        // read_write storage buffers
+    std::vector<wgpu::Texture> mStorageTex;  // storage texture outputs
+    uint32_t mTexWidth = 0, mTexHeight = 0;
 };
 
 // §9.6 output: blits the final linear texture to the platform target with

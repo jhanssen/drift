@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "Swarm",
+  "description": "GPU compute (§18): a ping-pong particle buffer simulated and painted entirely on the GPU — orbiting motes seeded from dead slots on the first frame.",
+  "nodes": [
+    { "id": "sim", "type": "compute", "shader": "shaders/sim.wgsl",
+      "capacity": 64,
+      "inputs": { "dt": "@time.delta",
+                  "prev": { "node": "sim", "port": "state", "previous": true } } },
+
+    { "id": "paint", "type": "compute", "shader": "shaders/paint.wgsl",
+      "inputs": { "pts": "@sim.state" } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@paint" } }
+  ]
+}

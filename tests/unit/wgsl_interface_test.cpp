@@ -137,9 +137,108 @@ TEST_CASE("non-float field types are an error")
     CHECK(error.find("unsupported type") != std::string::npos);
 }
 
-TEST_CASE("storage buffers are not part of the v1 contract")
+// ---- §18.2 compute interfaces ----------------------------------------------
+
+namespace {
+
+// The §18.3 Particle contract: 64 bytes under WGSL storage layout, scalars
+// packed into the vec3 alignment slots.
+const char* kParticleStruct = R"(
+    struct Particle {
+        pos: vec3f, age: f32,
+        vel: vec3f, lifetime: f32,
+        color: vec4f,
+        size: f32, rotation: f32, seed: f32, reserved: f32,
+    }
+)";
+
+} // namespace
+
+TEST_CASE("compute: storage arrays reflect with WGSL storage strides")
 {
-    parseFail(R"(
-        @group(0) @binding(0) var<storage, read> data: array<f32>;
+    const auto iface = parseOk(std::string(kParticleStruct) + R"(
+        struct Params { dt: f32 }
+        @group(0) @binding(0) var<uniform> params: Params;
+        @group(0) @binding(1) var<storage, read> prev: array<Particle>;
+        @group(0) @binding(2) var<storage, read_write> state: array<Particle>;
+        @compute @workgroup_size(64)
+        fn main(@builtin(global_invocation_id) id: vec3u) {
+            state[id.x] = prev[id.x];
+        }
     )");
+    CHECK(iface.isCompute);
+    CHECK(iface.workgroupSize[0] == 64);
+    CHECK(iface.workgroupSize[1] == 1);
+    REQUIRE(iface.storageBuffers.size() == 2);
+    CHECK(iface.storageBuffers[0].name == "prev");
+    CHECK(!iface.storageBuffers[0].readWrite);
+    CHECK(iface.storageBuffers[0].elementStride == 64);
+    CHECK(iface.storageBuffers[1].name == "state");
+    CHECK(iface.storageBuffers[1].readWrite);
+    CHECK(iface.storageBuffers[1].elementStride == 64);
+    REQUIRE(iface.fields.size() == 1);
+    CHECK(iface.fields[0].name == "dt");
+}
+
+TEST_CASE("compute: scalar and vector element strides")
+{
+    const auto iface = parseOk(R"(
+        @group(0) @binding(0) var<storage, read> weights: array<f32>;
+        @group(0) @binding(1) var<storage, read> dirs: array<vec3f>;
+        @group(0) @binding(2) var<storage, read_write> sums: array<vec4f>;
+        @compute @workgroup_size(8, 8)
+        fn main() {}
+    )");
+    CHECK(iface.workgroupSize[0] == 8);
+    CHECK(iface.workgroupSize[1] == 8);
+    REQUIRE(iface.storageBuffers.size() == 3);
+    CHECK(iface.storageBuffers[0].elementStride == 4);  // f32
+    CHECK(iface.storageBuffers[1].elementStride == 16); // vec3f: stride 16
+    CHECK(iface.storageBuffers[2].elementStride == 16); // vec4f
+}
+
+TEST_CASE("compute: storage textures accept only the §12 intermediate format")
+{
+    const auto iface = parseOk(R"(
+        @group(0) @binding(0) var target: texture_storage_2d<rgba16float, write>;
+        @compute @workgroup_size(8, 8) fn main() {}
+    )");
+    REQUIRE(iface.storageTextures.size() == 1);
+    CHECK(iface.storageTextures[0].name == "target");
+
+    parseFail(R"(
+        @group(0) @binding(0) var target: texture_storage_2d<rgba8unorm, write>;
+        @compute @workgroup_size(8, 8) fn main() {}
+    )");
+}
+
+TEST_CASE("compute: entry point requirements")
+{
+    // @compute without @workgroup_size
+    CHECK(parseFail(R"(
+        @group(0) @binding(0) var<storage, read_write> s: array<f32>;
+        @compute fn main() {}
+    )").find("workgroup_size") != std::string::npos);
+    // entry point not named main
+    CHECK(parseFail(R"(
+        @group(0) @binding(0) var<storage, read_write> s: array<f32>;
+        @compute @workgroup_size(64) fn tick() {}
+    )").find("main") != std::string::npos);
+    // zero workgroup dimension
+    parseFail(R"(
+        @compute @workgroup_size(0) fn main() {}
+    )");
+}
+
+TEST_CASE("compute: element structs are f32/vecN only, and must exist")
+{
+    CHECK(parseFail(R"(
+        struct Cell { alive: u32 }
+        @group(0) @binding(0) var<storage, read_write> cells: array<Cell>;
+        @compute @workgroup_size(64) fn main() {}
+    )").find("unsupported type") != std::string::npos);
+    CHECK(parseFail(R"(
+        @group(0) @binding(0) var<storage, read_write> cells: array<Ghost>;
+        @compute @workgroup_size(64) fn main() {}
+    )").find("not found") != std::string::npos);
 }

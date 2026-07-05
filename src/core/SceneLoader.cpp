@@ -222,6 +222,7 @@ struct PortDef {
     bool required;
     std::array<double, 4> def{};
     bool array = false; // texture[]: expands to one Node::Input per element
+    uint32_t stride = 0; // buffer ports (§18.1): required element stride
 };
 
 const PortDef kWaveInputs[] = {
@@ -327,6 +328,7 @@ private:
         std::string portName;
         RawConn conn;
         ValueType portType;
+        uint32_t portStride = 0; // buffer ports (§18.1)
     };
     std::vector<DeferredBind> mDeferredBinds;
 
@@ -361,6 +363,16 @@ std::vector<OutputPortDef> Loader::producerPorts(const std::string& nodeId)
         std::vector<OutputPortDef> ports;
         for (int i = 0; i < (int)seq->tracks().size(); ++i) {
             ports.push_back({ seq->tracks()[i].name.c_str(), i });
+        }
+        return ports;
+    }
+    if (raw.type == "compute") {
+        // Reflected outputs (§18.2), named at construction like sequence
+        // tracks; the instance exists for every caller (topo/deferred).
+        Node* node = mInstances[nodeId];
+        std::vector<OutputPortDef> ports;
+        for (int i = 0; i < (int)node->outputs.size(); ++i) {
+            ports.push_back({ node->outputs[i].name.c_str(), i });
         }
         return ports;
     }
@@ -504,6 +516,7 @@ bool Loader::parseNodes(const glz::generic& json)
             { "split", {} },
             { "sequence", { "duration", "loop", "tracks" } },
             { "shader", { "shader", "size" } },
+            { "compute", { "shader", "capacity", "dispatch" } },
             { "image", { "src" } },
             { "video", { "src", "loop" } },
             { "transform", {} },
@@ -974,6 +987,12 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': " + path + ": " + err);
             return nullptr;
         }
+        if (iface.isCompute || !iface.storageBuffers.empty() ||
+            !iface.storageTextures.empty()) {
+            fail("node '" + raw.id + "': " + path +
+                 " declares a compute interface; use a 'compute' node (§18.2)");
+            return nullptr;
+        }
         uint32_t width = 0, height = 0;
         if (auto sizeIt = obj.find("size"); sizeIt != obj.end()) {
             if (sizeIt->second.is_array()) {
@@ -999,6 +1018,131 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             portsOut.push_back({ t.name, ValueType::Texture, true });
         }
         return new ShaderNode(std::move(source), std::move(iface), width, height);
+    }
+
+    if (raw.type == "compute") {
+        const auto& obj = raw.json->get_object();
+        auto pathIt = obj.find("shader");
+        if (pathIt == obj.end() || !pathIt->second.is_string()) {
+            fail("node '" + raw.id + "': compute node needs a string 'shader' path");
+            return nullptr;
+        }
+        const std::string& path = pathIt->second.get_string();
+        if (path.find("..") != std::string::npos || path.starts_with("/")) {
+            fail("node '" + raw.id + "': shader path escapes the project");
+            return nullptr;
+        }
+        std::string source;
+        if (!mReadAsset(path, source)) {
+            fail("node '" + raw.id + "': cannot read shader '" + path + "'");
+            return nullptr;
+        }
+        WgslInterface iface;
+        std::string err;
+        if (!WgslInterface::parse(source, iface, err)) {
+            fail("node '" + raw.id + "': " + path + ": " + err);
+            return nullptr;
+        }
+        if (!iface.isCompute) {
+            fail("node '" + raw.id + "': " + path +
+                 " has no @compute entry point (§18.2)");
+            return nullptr;
+        }
+        size_t rwCount = 0;
+        for (const auto& buf : iface.storageBuffers) {
+            rwCount += buf.readWrite ? 1 : 0;
+        }
+        if (rwCount == 0 && iface.storageTextures.empty()) {
+            fail("node '" + raw.id + "': " + path +
+                 " has no storage outputs (nothing to produce)");
+            return nullptr;
+        }
+
+        // capacity (§18.2): required when owning buffers. A number applies
+        // to every read_write output; the object form maps port -> count.
+        std::vector<uint32_t> capacities;
+        auto capacityFor = [&](const std::string& port,
+                               uint32_t& out) -> bool {
+            auto capIt = obj.find("capacity");
+            if (capIt == obj.end()) {
+                fail("node '" + raw.id +
+                     "': 'capacity' is required for buffer outputs (§18.2)");
+                return false;
+            }
+            const glz::generic* entry = &capIt->second;
+            if (capIt->second.is_object()) {
+                const auto& map = capIt->second.get_object();
+                auto it = map.find(port);
+                if (it == map.end()) {
+                    fail("node '" + raw.id + "': 'capacity' has no entry for '" +
+                         port + "'");
+                    return false;
+                }
+                entry = &it->second;
+            }
+            if (!entry->is_number() ||
+                entry->get_number() != (double)(uint32_t)entry->get_number() ||
+                entry->get_number() <= 0) {
+                fail("node '" + raw.id +
+                     "': 'capacity' must be a positive integer");
+                return false;
+            }
+            out = (uint32_t)entry->get_number();
+            return true;
+        };
+        for (const auto& buf : iface.storageBuffers) {
+            if (!buf.readWrite) {
+                continue;
+            }
+            uint32_t capacity = 0;
+            if (!capacityFor(buf.name, capacity)) {
+                return nullptr;
+            }
+            capacities.push_back(capacity);
+        }
+
+        std::array<uint32_t, 3> dispatch = { 0, 0, 0 }; // auto
+        if (auto dIt = obj.find("dispatch"); dIt != obj.end()) {
+            const bool isAuto =
+                dIt->second.is_string() && dIt->second.get_string() == "auto";
+            if (!isAuto) {
+                if (!dIt->second.is_array() ||
+                    dIt->second.get_array().empty() ||
+                    dIt->second.get_array().size() > 3) {
+                    fail("node '" + raw.id +
+                         "': 'dispatch' must be [x], [x,y], [x,y,z], or \"auto\"");
+                    return nullptr;
+                }
+                const auto& arr = dIt->second.get_array();
+                dispatch = { 1, 1, 1 };
+                for (size_t i = 0; i < arr.size(); ++i) {
+                    if (!arr[i].is_number() || arr[i].get_number() <= 0) {
+                        fail("node '" + raw.id +
+                             "': 'dispatch' counts must be positive");
+                        return nullptr;
+                    }
+                    dispatch[i] = (uint32_t)arr[i].get_number();
+                }
+            }
+        }
+
+        // Ports: uniform fields, sampled textures, then read-only storage
+        // buffers; all required (§9.10's rule extends to compute).
+        portsOut.clear();
+        for (const auto& f : iface.fields) {
+            portsOut.push_back({ f.name, f.type, true });
+        }
+        for (const auto& t : iface.textures) {
+            portsOut.push_back({ t.name, ValueType::Texture, true });
+        }
+        for (const auto& buf : iface.storageBuffers) {
+            if (!buf.readWrite) {
+                portsOut.push_back({ buf.name, ValueType::Buffer, true, {},
+                                     false, buf.elementStride });
+            }
+        }
+        return new ComputeNode(std::move(source), std::move(iface),
+                               std::move(capacities), dispatch);
     }
 
     if (raw.type == "image") {
@@ -1168,7 +1312,8 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
 
         if (rawIn.kind == RawInput::Kind::Conn && rawIn.conn.previous) {
             mDeferredBinds.push_back({ node, (size_t)portIdx, raw.id, portName,
-                                       rawIn.conn, portType });
+                                       rawIn.conn, portType,
+                                       ports[portIdx].stride });
             continue;
         }
 
@@ -1179,11 +1324,34 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
         if (srcType != portType) {
             if (srcType == ValueType::Scalar &&
                 portType != ValueType::Texture &&
-                portType != ValueType::Event) {
+                portType != ValueType::Event &&
+                portType != ValueType::Buffer) {
                 in.splat = true; // §4: scalar splats to vecN
             } else {
                 fail("node '" + raw.id + "' input '" + portName + "': type mismatch (" +
                      valueTypeName(srcType) + " -> " + valueTypeName(portType) + ")");
+                return false;
+            }
+        }
+        if (portType == ValueType::Buffer &&
+            rawIn.kind == RawInput::Kind::Conn) {
+            // §18.1: buffer connections validate on element stride.
+            Node* src = mInstances[rawIn.conn.node];
+            int srcPort = 0;
+            if (!rawIn.conn.port.empty()) {
+                for (const auto& p : producerPorts(rawIn.conn.node)) {
+                    if (rawIn.conn.port == p.name) {
+                        srcPort = p.index;
+                        break;
+                    }
+                }
+            }
+            const uint32_t srcStride = src->outputs[srcPort].value.bufStride;
+            if (srcStride != ports[portIdx].stride) {
+                fail("node '" + raw.id + "' input '" + portName +
+                     "': buffer element stride mismatch (" +
+                     std::to_string(srcStride) + " -> " +
+                     std::to_string(ports[portIdx].stride) + " bytes)");
                 return false;
             }
         }
@@ -1263,7 +1431,8 @@ bool Loader::bindDeferred()
         if (srcType != d.portType) {
             if (srcType == ValueType::Scalar &&
                 d.portType != ValueType::Texture &&
-                d.portType != ValueType::Event) {
+                d.portType != ValueType::Event &&
+                d.portType != ValueType::Buffer) {
                 in.splat = true;
             } else {
                 fail("node '" + d.consumerId + "' input '" + d.portName +
@@ -1272,10 +1441,18 @@ bool Loader::bindDeferred()
                 return false;
             }
         }
+        if (srcType == ValueType::Buffer &&
+            src->outputs[idx].value.bufStride != d.portStride) {
+            fail("node '" + d.consumerId + "' input '" + d.portName +
+                 "': buffer element stride mismatch (" +
+                 std::to_string(src->outputs[idx].value.bufStride) + " -> " +
+                 std::to_string(d.portStride) + " bytes)");
+            return false;
+        }
         in.srcNode = src;
         in.srcPort = idx;
         in.previous = true;
-        if (srcType == ValueType::Texture) {
+        if (srcType == ValueType::Texture || srcType == ValueType::Buffer) {
             src->outputs[idx].needsHistory = true;
         }
     }

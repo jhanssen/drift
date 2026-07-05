@@ -1460,31 +1460,44 @@ const NODE_INPUTS = {
   split: [['value', 'value']],
   sequence: [['time', 'value']],
 };
-const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d' };
+const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d',
+                       buffer: '#b48ade' };
 const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
 
 function specInputsOf(source) {
-  if (source.type === 'shader') {
-    // The WGSL is the port declaration (§9.10); the wasm runtime reflects
-    // it for us. Without a preview runtime only bound ports get pins.
-    if (!wasm || typeof source.shader !== 'string') {
-      return null;
-    }
-    try {
-      const reflected = JSON.parse(wasm.reflect(source.shader));
-      return reflected.ports?.map((p) =>
-          [p.name, p.type === 'texture' ? 'texture' : 'value', false]) ?? null;
-    } catch {
-      return null;
-    }
+  if (source.type === 'shader' || source.type === 'compute') {
+    // The WGSL is the port declaration (§9.10/§18.2); the wasm runtime
+    // reflects it. Without a preview runtime only bound ports get pins.
+    return reflectPorts(source, false)?.map((p) =>
+        [p.name, reflectCategory(p), false]) ?? null;
   }
   return NODE_INPUTS[source.type] ?? null;
+}
+
+const reflectCategory = (p) =>
+    p.type === 'texture' ? 'texture' : p.type === 'buffer' ? 'buffer' : 'value';
+
+function reflectPorts(source, dir) {
+  if (!wasm || typeof source.shader !== 'string') {
+    return null;
+  }
+  try {
+    const reflected = JSON.parse(wasm.reflect(source.shader));
+    return reflected.ports?.filter((p) => (p.dir === 'out') === dir) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function outputsOf(node) {
   if (node.type === 'sequence') {
     return (node.tracks ?? []).filter((t) => t?.name).map((t) =>
         [t.name, t.kind === 'event' ? 'event' : 'value']);
+  }
+  if (node.type === 'compute') {
+    // §18.2: outputs are the read_write storage bindings, reflected.
+    return reflectPorts(node, true)?.map((p) =>
+        [p.name, reflectCategory(p)]) ?? [];
   }
   return NODE_OUTPUTS[node.type] ?? [['result', 'value']];
 }
@@ -2119,9 +2132,9 @@ window.addEventListener('mousedown', (e) => {
 // Defaults keep a fresh node valid where possible (wave/sequence tick along
 // immediately); nodes with required texture ports (transform, output-like)
 // stay a draft until wired — that is the expected add-then-wire flow.
-const NODE_PALETTE = ['image', 'video', 'shader', 'transform', 'compositor',
-                      'sequence', 'wave', 'remap', 'combine', 'split',
-                      'parameter'];
+const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'transform',
+                      'compositor', 'sequence', 'wave', 'remap', 'combine',
+                      'split', 'parameter'];
 const NODE_DEFAULT_INPUTS = {
   wave: { input: '@time.seconds' },
   sequence: { time: '@time.seconds' },
@@ -2186,8 +2199,11 @@ function addNodeOfType(type, anchor) {
   const fields = [];
   if (type === 'image' || type === 'video') {
     fields.push({ key: 'src', label: 'path', value: 'assets/' });
-  } else if (type === 'shader') {
+  } else if (type === 'shader' || type === 'compute') {
     fields.push({ key: 'shader', label: 'path', value: 'shaders/' });
+  }
+  if (type === 'compute') {
+    fields.push({ key: 'capacity', label: 'capacity', value: '1000' });
   }
   fields.push({ key: 'id', label: 'id', value: freeNodeId(type) });
   openQuickForm(anchor, `add ${type}`, fields, (v) => {
@@ -2199,12 +2215,18 @@ function addNodeOfType(type, anchor) {
         (fields[0].key === 'shader' && !v.shader)) {
       return 'a project-relative path is required';
     }
+    if (type === 'compute' && !(parseInt(v.capacity, 10) > 0)) {
+      return 'capacity must be a positive integer (§18.2)';
+    }
     const node = { id: v.id, type };
     if (v.src) {
       node.src = v.src;
     }
     if (v.shader) {
       node.shader = v.shader;
+    }
+    if (type === 'compute') {
+      node.capacity = parseInt(v.capacity, 10);
     }
     if (type === 'sequence') {
       node.duration = 8;

@@ -137,6 +137,30 @@ bool Scene::render(FrameContext& ctx)
             if (!out.needsHistory) {
                 continue;
             }
+            if (out.value.type == ValueType::Buffer) {
+                // Buffer feedback (§18.1): the history buffer is created
+                // eagerly — WebGPU zero-initializes it, which IS the
+                // first-frame all-zeroes rule — and refreshed with a copy
+                // whenever the producer wrote this past frame.
+                const uint64_t size =
+                    (uint64_t)out.value.bufStride * out.value.bufCapacity;
+                if (!out.historyBuffer && size) {
+                    wgpu::BufferDescriptor desc{};
+                    desc.size = size;
+                    desc.usage = wgpu::BufferUsage::Storage |
+                                 wgpu::BufferUsage::CopyDst;
+                    out.historyBuffer = ctx.device.CreateBuffer(&desc);
+                }
+                if (out.dirty && out.value.buffer && out.historyBuffer) {
+                    if (!copyEncoder) {
+                        copyEncoder = ctx.device.CreateCommandEncoder();
+                    }
+                    copyEncoder.CopyBufferToBuffer(out.value.buffer, 0,
+                                                   out.historyBuffer, 0, size);
+                }
+                out.prev.buffer = out.historyBuffer;
+                continue;
+            }
             if (out.dirty && out.value.texture) {
                 const uint32_t w = out.value.texWidth, h = out.value.texHeight;
                 if (!out.history || out.history.GetWidth() != w ||

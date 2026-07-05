@@ -85,10 +85,9 @@ Edge/value types in v1:
 | `vec4`   | `[x, y, z, w]`               | also used for colors (RGBA)        |
 | `texture`| — (connections only)         | 2D texture, premultiplied alpha    |
 | `event`  | — (connections only)         | fires or not, per frame (see below)|
+| `buffer` | — (connections only)         | GPU array of structs (§18.1)       |
 | `bool`   | `true` / `false`             | properties only, not wireable      |
 | `string` | `"..."`                      | properties only, not wireable      |
-
-Reserved for future versions: `buffer`.
 
 Rules:
 
@@ -545,7 +544,11 @@ required input; unknown `$parameter`; reference to unknown node; cycle without
 a `previous` edge; zero or multiple `output` nodes; missing asset or shader
 file; path escaping the project root; WGSL that fails to compile or reflect;
 unbound shader port; `event` connection to a non-`event` port or vice versa
-(§4: events take part in no conversions). For `sequence`: `duration` missing
+(§4: events take part in no conversions; the same for `buffer`). For
+`compute` (§18.2): missing `@compute` entry point; a compute interface in a
+`shader` node or vice versa; a `buffer` connection whose element strides
+differ; missing/invalid `capacity`; malformed `dispatch`; no storage
+outputs. For `sequence`: `duration` missing
 or ≤ 0; missing or empty `tracks`; duplicate or invalid track `name`;
 unknown track `kind`; value track with empty `keys`, non-ascending `t`, `t`
 outside `[0, duration]`, or `value` not matching `type`; event track with
@@ -635,7 +638,6 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 Collected from the sections above — features the format's structure already
 accounts for but v1 does not implement:
 
-- `buffer` edge type (§4)
 - Event payloads, and event→level `latch`/`toggle` value nodes (§4, §9.9)
 - Per-key easing and wake-until-next-key scheduling hints (§9.9)
 - Inline references inside vector literals, as sugar desugaring to `combine` (§7, §9.9)
@@ -861,14 +863,18 @@ If adopted: `fit` alignment modes, `@time.wrapped`, per-node update rates, and
 per-layer `fit` on `compositor` join the reserved list; the "additional value
 nodes" bullet is partially discharged by §17.7's arithmetic nodes.
 
-## 18. Proposed Amendment: Buffers, Compute, and Particles (draft)
+## 18. Buffers, Compute, and Particles
 
-Status: proposal, not yet adopted. Three layers, independently adoptable in
-order — §18.1 (the `buffer` edge type) is prerequisite to §18.2 (the
-`compute` node), which is prerequisite in spirit (shared machinery) but not
-in format to §18.3 (the particle nodes). Simulation runs on the GPU: state
-lives in storage buffers, emission and update are compute passes, rendering
-is an instanced draw. The CPU contributes uniforms.
+Status: **§18.1 and §18.2 adopted and implemented 2026-07-04** (see
+`examples/swarm.sceneproject` for the idioms, golden-tested; buffer
+feedback is realized as history copies exactly like textures). §18.3 (the
+particle nodes) remains a proposal. Simulation runs on the GPU: state lives
+in storage buffers, emission and update are compute passes, rendering is an
+instanced draw. The CPU contributes uniforms.
+
+Authoring note (non-normative): WGSL reserved words (`target`, `filter`,
+`sample`, …) are rejected by the compiler as binding names even though the
+reflection recognizer accepts them; the loader surfaces the compile error.
 
 Design note (non-normative): the §18.3 vocabulary covers what established
 2D particle systems offer (shaped emitters; randomized color/size/alpha/
