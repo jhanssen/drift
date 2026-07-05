@@ -39,6 +39,10 @@
   body.graph-mode #canvas { inset: auto 10px 10px auto; width: 224px;
                             height: 126px; border: 1px solid var(--edge);
                             z-index: 2; }
+  /* While the document is an invalid draft the preview shows the LAST VALID
+     scene — dim it so nobody mistakes it for the edited document. */
+  body.draft #canvas { filter: grayscale(.8) brightness(.45); }
+  body.draft #canvas { border-color: #e3c56d; }
   #graphCanvas { position: absolute; inset: 0; width: 100%; height: 100%;
                  display: block; background: var(--bg); }
   body:not(.graph-mode) #graphCanvas { display: none; }
@@ -438,6 +442,7 @@ async function fetchSource() {
     console.log(`editor: source: ${err}`);
     sceneSource = null;
   }
+  priorBindings.clear(); // a fresh document invalidates remembered bindings
   refreshGraph(); // callers refresh the panel before the source arrives
 }
 
@@ -496,6 +501,8 @@ async function pushDocument() {
     }
   }
   console.log('editor: document pushed');
+  const error = result.wasmError ?? result.liveError;
+  setGraphStatus(error ? `draft — ${error.split('\n')[0]}` : null);
   return result;
 }
 
@@ -554,6 +561,8 @@ function newScene() {
   }
   scratchActive = true;
   currentValues.clear();
+  setGraphStatus(null);
+  priorBindings.clear();
   wasmManifest = JSON.parse(wasm.describe());
   sceneSource = JSON.parse(wasm.source());
   graphNeedsFit = true; // a whole new graph deserves a fresh framing
@@ -627,6 +636,8 @@ document.getElementById('saveBtn').onclick = saveToFolder;
 document.getElementById('revertBtn').onclick = async () => {
   // Re-read from disk (or the bundle) everywhere — how hand-edits to
   // scene.json get picked up, and how pushed edits get discarded.
+  setGraphStatus(null); // a draft is exactly what revert discards
+  priorBindings.clear();
   if (wasm && wasmManifest && wasm.reload()) {
     currentValues.clear();
     wasmManifest = JSON.parse(wasm.describe());
@@ -1734,6 +1745,23 @@ function startWireDrag(pin) {
 // producer's default output ever changes (e.g. sequence track reorder).
 const refFor = (nodeId, port) => `@${nodeId}.${port}`;
 
+// A wire dropped on a port replaces its literal/$param binding; remember
+// what it clobbered so a later disconnect restores the original instead of
+// leaving a required port unbound (an inexplicable draft — the port never
+// looked empty to the author).
+const priorBindings = new Map(); // 'node/port' -> raw JSON value
+
+function unbindPort(nodeId, inputs, name) {
+  const key = `${nodeId}/${name}`;
+  const prior = priorBindings.get(key);
+  priorBindings.delete(key);
+  if (prior !== undefined) {
+    inputs[name] = prior;
+  } else {
+    delete inputs[name];
+  }
+}
+
 function writeInput(node, entry, rawValue) {
   const inputs = (node.source.inputs ??= {});
   if (entry.append) {
@@ -1741,6 +1769,10 @@ function writeInput(node, entry, rawValue) {
   } else if (entry.arrayOf) {
     inputs[entry.arrayOf.base][entry.arrayOf.index] = rawValue;
   } else {
+    const old = inputs[entry.name];
+    if (old !== undefined && !parseConnection(old)) {
+      priorBindings.set(`${node.id}/${entry.name}`, old);
+    }
     inputs[entry.name] = rawValue;
   }
 }
@@ -1753,7 +1785,7 @@ function removeInput(node, entry) {
   if (entry.arrayOf) {
     inputs[entry.arrayOf.base].splice(entry.arrayOf.index, 1);
   } else {
-    delete inputs[entry.name];
+    unbindPort(node.id, inputs, entry.name);
   }
 }
 
@@ -1823,23 +1855,29 @@ function applyWireDrop(drag, pin) {
   pushFromGraph();
 }
 
-// Graph edits land here: push the document, surface accept/draft state, and
-// re-describe an accepting preview so the timeline and params follow along
-// (a live accept re-describes itself via its reload event).
+// Graph edits land here: push the document (which owns the draft status),
+// then re-describe an accepting preview so the timeline and params follow
+// along (a live accept re-describes itself via its reload event).
 async function pushFromGraph() {
-  const { wasmError, liveError } = await pushDocument() ?? {};
+  const { wasmError } = await pushDocument() ?? {};
   if (wasm && !wasmError) {
     const manifest = JSON.parse(wasm.describe());
     if (manifest.scene) {
       wasmManifest = manifest;
     }
   }
-  const error = wasmError ?? liveError;
-  setGraphStatus(error ? `draft — ${error.split('\n')[0]}` : null);
   refreshPanel();
 }
 
+let graphStatusText = null;   // mirrored as an in-canvas banner
+let graphDraftIds = new Set(); // nodes named in the error get a warn border
+
 function setGraphStatus(text) {
+  graphStatusText = text ?? null;
+  graphDraftIds = new Set(
+      [...(text ?? '').matchAll(/node '([A-Za-z_][A-Za-z0-9_]*)'/g)]
+          .map((m) => m[1]));
+  document.body.classList.toggle('draft', !!text?.startsWith('draft'));
   const el = document.getElementById('graphStatus');
   el.textContent = text ?? '';
   el.className = text ? 'warn' : '';
@@ -1940,7 +1978,7 @@ function deleteSelectedNode() {
           other.inputs[name] = kept;
         }
       } else if (refNode(value) === id) {
-        delete other.inputs[name];
+        unbindPort(other.id, other.inputs, name);
       }
     }
   }
@@ -2066,12 +2104,13 @@ function drawGraph() {
   };
   for (const node of graph.nodes) {
     const selected = node.id === selectedNodeId;
+    const draft = graphDraftIds.has(node.id);
     ctx.beginPath();
     ctx.roundRect(node.x, node.y, node.w, node.h, 6);
     ctx.fillStyle = '#1e2128';
     ctx.fill();
-    ctx.strokeStyle = selected ? '#6aa1ff' : '#2c3038';
-    ctx.lineWidth = selected ? 1.5 : 1;
+    ctx.strokeStyle = draft ? '#e3c56d' : selected ? '#6aa1ff' : '#2c3038';
+    ctx.lineWidth = selected || draft ? 1.5 : 1;
     ctx.stroke();
     ctx.lineWidth = 1;
 
@@ -2135,6 +2174,30 @@ function drawGraph() {
       ctx.fillStyle = GRAPH_COLORS[category];
       ctx.fill();
     });
+  }
+
+  if (graphStatusText) {
+    // Screen-space banner: the chip in the tab bar is easy to miss, and a
+    // draft's most surprising symptom is "my edit changed nothing".
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.font = '11px system-ui';
+    const note = graphStatusText.startsWith('draft')
+        ? `⚠ ${graphStatusText} — runtimes keep playing the last valid scene`
+        : `⚠ ${graphStatusText}`;
+    const w = Math.min(ctx.measureText(note).width + 20, cw - 20);
+    ctx.beginPath();
+    ctx.roundRect(10, 10, w, 24, 5);
+    ctx.fillStyle = 'rgba(30, 33, 40, .92)';
+    ctx.fill();
+    ctx.strokeStyle = '#e3c56d';
+    ctx.stroke();
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = '#e3c56d';
+    ctx.fillText(note, 20, 26);
+    ctx.restore();
+    ctx.setTransform(dpr * s, 0, 0, dpr * s,
+                     dpr * s * graphView.x, dpr * s * graphView.y);
   }
 
   if (wireDrag?.cursor) {
