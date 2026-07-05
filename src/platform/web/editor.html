@@ -79,6 +79,10 @@
                    color: var(--dim); }
   #keyEdit input { width: 72px; }
   #timeline .dim { color: var(--dim); }
+  #seqTabs { display: flex; gap: 4px; margin: 2px 0 4px; }
+  #seqTabs button { font-size: 10px; padding: 1px 10px; }
+  #seqTabs button.active { border-color: var(--accent);
+                           color: var(--accent); }
   #timeline h3 { font-size: 11px; margin: 6px 0 4px; color: var(--dim);
                  font-weight: normal; letter-spacing: .04em; }
   #timeline canvas { display: block; width: 100%; }
@@ -676,6 +680,30 @@ document.getElementById('wgsl').addEventListener('keydown', (e) => {
   }
 });
 
+// duration/loop are node properties (§9.9); edits push the whole document.
+// Shrinking below existing keys/cues is a §13 load error — the push is
+// rejected and the draft banner names the node until the times are fixed.
+function editSequenceProps(seq, anchor) {
+  openQuickForm(anchor, `${seq.id} properties`, [
+    { key: 'duration', label: 'duration', value: String(seq.duration) },
+    { key: 'loop', label: 'loop', options: ['on', 'off'],
+      value: seq.loop ? 'on' : 'off' },
+  ], (v) => {
+    const duration = parseFloat(v.duration);
+    if (!(duration > 0)) {
+      return 'duration must be a number > 0 (seconds)';
+    }
+    const node = sceneSource?.nodes.find((n) => n.id === seq.id);
+    if (!node) {
+      return `node '${seq.id}' is not in the document`;
+    }
+    node.duration = duration;
+    node.loop = v.loop === 'on';
+    pushFromGraph();
+    return null;
+  });
+}
+
 // Track add/remove (the timeline owns tracks, §16.1). New tracks get a
 // minimal valid shape (§13 requires one key/cue); shape it by editing.
 function addTrack(seq, anchor) {
@@ -784,6 +812,11 @@ let timelines = []; // { seq, canvas }
 const cueFlashes = new Map();  // seqId/track/cueIdx -> performance.now()
 const laneFlashes = new Map(); // node/port -> performance.now()
 
+// The timeline shows one sequence at a time: the active one, synced from
+// the graph selection (§16.1's one-panel-per-node, minus the stacking).
+// With several sequence nodes a tab row switches between them.
+let activeSequenceId = null;
+
 function refreshTimeline() {
   const container = document.getElementById('timeline');
   const seqs = activeManifest()?.sequences ?? [];
@@ -794,13 +827,55 @@ function refreshTimeline() {
         '<span class="dim">no sequence nodes in this scene</span>';
     return;
   }
-  for (const seq of seqs) {
+  if (!seqs.some((s) => s.id === activeSequenceId)) {
+    activeSequenceId = seqs[0].id;
+  }
+  if (seqs.length > 1) {
+    const tabs = document.createElement('div');
+    tabs.id = 'seqTabs';
+    for (const s of seqs) {
+      const tab = document.createElement('button');
+      tab.textContent = s.id;
+      tab.className = s.id === activeSequenceId ? 'active' : '';
+      tab.onclick = () => {
+        activeSequenceId = s.id;
+        if (graph?.byId.has(s.id)) {
+          selectedNodeId = s.id; // the tab and the graph agree on focus
+        }
+        renderInspector();
+        refreshTimeline();
+      };
+      tabs.appendChild(tab);
+    }
+    container.appendChild(tabs);
+  }
+  // A selected-but-unwired sequence is pruned by the loader (§8) and has
+  // no runtime timeline; say so instead of silently showing another one.
+  const selected = graph?.byId.get(selectedNodeId);
+  if (selected?.source?.type === 'sequence' &&
+      !seqs.some((s) => s.id === selected.id)) {
+    const note = document.createElement('div');
+    note.className = 'dim';
+    note.textContent = `sequence '${selected.id}' is not wired into the ` +
+        'graph, so it never runs and has no timeline yet — wire one of ' +
+        'its outputs first';
+    container.appendChild(note);
+  }
+  for (const seq of seqs.filter((s) => s.id === activeSequenceId)) {
     const header = document.createElement('h3');
     header.textContent =
         `${seq.id} — ${seq.duration}s${seq.loop ? ' · loop' : ''} `;
+    const buttonCss = 'font-size:10px;padding:1px 6px;margin-left:8px';
+    const editBtn = document.createElement('button');
+    editBtn.textContent = '✎';
+    editBtn.title = 'duration / loop';
+    editBtn.style.cssText = buttonCss;
+    editBtn.onclick = (e) =>
+        editSequenceProps(seq, e.target.getBoundingClientRect());
+    header.appendChild(editBtn);
     const addBtn = document.createElement('button');
     addBtn.textContent = '+ track';
-    addBtn.style.cssText = 'font-size:10px;padding:1px 6px;margin-left:8px';
+    addBtn.style.cssText = buttonCss;
     addBtn.onclick = (e) => addTrack(seq, e.target.getBoundingClientRect());
     header.appendChild(addBtn);
     const canvas = document.createElement('canvas');
@@ -1288,18 +1363,21 @@ function drawTimeline(tl, playTime) {
   }
 }
 
+const seqPrevLocal = new Map(); // seq id -> previous local time
+
 (function tickTimelines() {
   const t = wasm && wasmManifest ? wasm.time() : null;
   document.getElementById('timeText').textContent =
       t !== null ? `${t.toFixed(2)}s` : '—';
-  for (const timeline of timelines) {
-    // Flash cues the playhead crossed (mirrors the §9.9 crossing rules).
-    if (t !== null) {
-      const seq = timeline.seq;
+  // Flash cues the playhead crossed (mirrors the §9.9 crossing rules) —
+  // over every sequence, not just the visible timeline panel, so event
+  // wires in the graph keep flashing for sequences whose panel is hidden.
+  if (t !== null) {
+    for (const seq of activeManifest()?.sequences ?? []) {
       const local = seq.loop
           ? ((t % seq.duration) + seq.duration) % seq.duration
           : Math.min(Math.max(t, 0), seq.duration);
-      const prev = timeline.prevLocal;
+      const prev = seqPrevLocal.get(seq.id);
       if (prev !== undefined && local !== prev) {
         const wrapped = local < prev;
         seq.tracks.forEach((track) => {
@@ -1316,8 +1394,10 @@ function drawTimeline(tl, playTime) {
           });
         });
       }
-      timeline.prevLocal = local;
+      seqPrevLocal.set(seq.id, local);
     }
+  }
+  for (const timeline of timelines) {
     drawTimeline(timeline, t);
   }
   if (document.body.classList.contains('graph-mode')) {
@@ -2440,6 +2520,10 @@ function drawGraph() {
 function renderInspector() {
   const section = document.getElementById('nodeSection');
   const node = graph?.byId.get(selectedNodeId);
+  if (node?.source?.type === 'sequence' && activeSequenceId !== node.id) {
+    activeSequenceId = node.id; // selecting a sequence focuses its timeline
+    refreshTimeline();
+  }
   section.hidden = !node;
   if (!node) {
     return;
