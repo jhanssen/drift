@@ -3406,6 +3406,10 @@ function drawGraph() {
     const text = JSON.stringify(v);
     return text.length > 12 ? text.slice(0, 11) + '…' : text;
   };
+  // Output pins follow the same contract as inputs: filled only when a
+  // wire actually leaves the port in this view.
+  const wiredOut = new Set(
+      graph.edges.map((e) => `${e.from}\n${e.fromPort}`));
   for (const node of graph.nodes) {
     const selected = node.id === selectedNodeId || selectedIds.has(node.id);
     const draft = graphDraftIds.has(node.id);
@@ -3468,9 +3472,9 @@ function drawGraph() {
     ctx.textAlign = 'left';
     ctx.restore();
 
-    // Pins: filled = wired (or an output), hollow = wireable but carrying
-    // a literal, a parameter, or nothing; hollow rings take the port's
-    // category color when the spec knows it.
+    // Pins: filled = a wire terminates or leaves here, hollow = wireable
+    // but carrying a literal, a parameter, or nothing; hollow rings take
+    // the port's category color when the spec knows it.
     node.inputs.forEach((input, i) => {
       const y = pinY(node, i);
       ctx.beginPath();
@@ -3486,7 +3490,8 @@ function drawGraph() {
     node.outputs.forEach(([name, category], i) => {
       ctx.beginPath();
       ctx.arc(node.x + node.w, pinY(node, i), 3, 0, Math.PI * 2);
-      if (node.dimPorts?.has(name)) {
+      if (node.dimPorts?.has(name) ||
+          !wiredOut.has(`${node.id}\n${name}`)) {
         ctx.strokeStyle = GRAPH_COLORS[category] ?? '#8a8f98';
         ctx.stroke();
       } else {
