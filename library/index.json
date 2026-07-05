@@ -2,6 +2,24 @@
   "version": 1,
   "packages": [
     {
+      "name": "bokeh",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/bokeh.json",
+          "sha256": "d7b7eb13ab2d9110a9e04f08393a7f71a2505d0741e02cdbbfc0b32d7a8ea360",
+          "size": 1249
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "04ae9ac52913889ee48f1e3dcaa41ddda26d606ee6fcadd128d8793a00095225",
+          "size": 256
+        }
+      ],
+      "hash": "1326b8868ecc323e35d21abb36ce2484262bb7f56257f907c51d73867b911a18",
+      "description": "A drifting field of soft discs: one particles + sprites block with the layer-defining knobs exported — tint gradient, spawn rate, size and depth ranges, parallax offset."
+    },
+    {
       "name": "sway",
       "version": "1.0.0",
       "files": [

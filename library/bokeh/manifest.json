@@ -1,0 +1,6 @@
+{
+  "name": "bokeh",
+  "version": "1.0.0",
+  "description": "A drifting field of soft discs: one particles + sprites block with the layer-defining knobs exported — tint gradient, spawn rate, size and depth ranges, parallax offset.",
+  "license": "MIT"
+}

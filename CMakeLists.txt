@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# First-party packages under library/ (§20.4): the web bundle ships them
+# as a store at /packages, and the test fixture installs them into a
+# build-dir store for the goldens.
+set(DRIFT_LIBRARY_PACKAGES sway bokeh)
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -81,8 +86,7 @@ if(EMSCRIPTEN)
     endforeach()
     # First-party packages ship as a store at /packages (§20.2); the web
     # runtime defaults DRIFT_PACKAGE_PATH there.
-    set(DRIFT_WEB_PACKAGES sway)
-    foreach(pkg IN LISTS DRIFT_WEB_PACKAGES)
+    foreach(pkg IN LISTS DRIFT_LIBRARY_PACKAGES)
         file(READ ${CMAKE_SOURCE_DIR}/library/${pkg}/manifest.json _manifest)
         string(JSON _pkg_version GET "${_manifest}" version)
         list(APPEND DRIFT_WEB_PRELOADS
@@ -176,12 +180,15 @@ if(BUILD_TESTING)
     # Goldens resolve library/ packages (§20) from a store the fixture
     # installs into the build dir — the repo→install→store→loader pipeline
     # is part of what they test.
-    add_test(NAME pkgstore_setup COMMAND
-        node ${CMAKE_SOURCE_DIR}/tools/driftpkg.mjs install sway
-        --repo ${CMAKE_SOURCE_DIR}/library
-        --store ${CMAKE_BINARY_DIR}/pkgstore
-    )
-    set_tests_properties(pkgstore_setup PROPERTIES FIXTURES_SETUP pkgstore)
+    foreach(pkg IN LISTS DRIFT_LIBRARY_PACKAGES)
+        add_test(NAME pkgstore_${pkg} COMMAND
+            node ${CMAKE_SOURCE_DIR}/tools/driftpkg.mjs install ${pkg}
+            --repo ${CMAKE_SOURCE_DIR}/library
+            --store ${CMAKE_BINARY_DIR}/pkgstore
+        )
+        set_tests_properties(pkgstore_${pkg} PROPERTIES
+            FIXTURES_SETUP pkgstore)
+    endforeach()
 
     function(drift_golden_test name)
         add_test(NAME golden_${name} COMMAND
