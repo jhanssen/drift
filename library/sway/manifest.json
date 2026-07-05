@@ -1,0 +1,6 @@
+{
+  "name": "sway",
+  "version": "1.0.0",
+  "description": "Living still: source pixels ride an animated wave field where the grayscale flex map is white and stay pinned where it is black.",
+  "license": "MIT"
+}

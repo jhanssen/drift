@@ -13,11 +13,14 @@ myscene.sceneproject/
   assets/             # images, videos
 ```
 
-`graphs/` holds subgraph definitions (§19). `modules/` (see DESIGN.md §6.1)
-is reserved for deferred features and ignored by the v1 runtime if present.
+`graphs/` holds subgraph definitions (§19). `packages/` holds project-local
+copies of installed packages (§20.2 — normally packages resolve from the
+shared store instead). `modules/` (see DESIGN.md §6.1) is reserved for
+deferred features and ignored by the v1 runtime if present.
 
 All paths inside `scene.json` are relative to the `.sceneproject` root. Paths
-must not escape the project root (`..` is rejected at load).
+must not escape the project root (`..` is rejected at load). Paths beginning
+`packages/` additionally resolve through the package store (§20.2).
 
 ## 2. `scene.json` Top Level
 
@@ -1382,7 +1385,134 @@ replaced by one instance bound to the same outer wires.
 
 ### 19.6 Effect on §15
 
-§1's `graphs/` reservation is discharged. Reserved growth: distributable
-node packages around graph files (DESIGN.md §8.2/§9), inline graph
-definitions in `scene.json`, and re-exporting a subgraph input as a
-scene parameter declaration in one step.
+§1's `graphs/` reservation is discharged. Distributable node packages
+around graph files are §20. Reserved growth: inline graph definitions in
+`scene.json`, and re-exporting a subgraph input as a scene parameter
+declaration in one step.
+
+## 20. Packages
+
+Status: **adopted 2026-07-05**. A package is a reusable, versioned bundle
+of subgraphs plus the shaders and assets they need (DESIGN.md §8.2/§9). A
+scene consumes a package by path — `packages/<name>/…` — resolved from
+the machine's package store; nothing is copied into the project. The
+future runtime distribution format (`.wallpkg`, DESIGN.md §6.2) is where
+a scene's packages get bundled into a single standalone artifact; the
+editable `.sceneproject` deliberately stays a thin reference.
+
+### 20.1 Package Layout
+
+```
+<name>/
+  manifest.json
+  graphs/             # ≥ 1 graph file (§19.1) — the package's nodes
+  shaders/            # WGSL referenced by the package's graphs
+  assets/             # images/videos referenced by the package's graphs
+```
+
+`manifest.json`:
+
+| Field         | Type     | Notes                                          |
+|---------------|----------|------------------------------------------------|
+| `name`        | string   | required; `[a-z0-9-]+`, must equal the directory name |
+| `version`     | string   | required; dotted decimal integers, e.g. `"1.0.0"` |
+| `description` | string   | optional; editor/repository label              |
+| `license`     | string   | optional; SPDX identifier                      |
+| `preview`     | string   | optional; package-relative image path          |
+
+A package is **self-contained**: paths inside its graph files resolve
+against the *package* root (amending §19.1's project-root rule, which
+continues to apply to project-local graph files), and may not begin with
+`packages/` — a package referencing another package is a load error
+(dependency metadata is reserved future growth, not implied). `$param`
+references stay banned inside graph files (§19.1); a package's knobs are
+its graphs' declared inputs.
+
+### 20.2 References and Resolution
+
+A scene references package content with ordinary §1 paths that begin
+with `packages/`:
+
+```json
+{ "id": "sway", "type": "graph", "graph": "packages/sway/graphs/sway.json" }
+```
+
+Any path position may use the form — `graph`, `shader`, `src` — so a
+package can also ship bare shaders or textures.
+
+Resolution order for `packages/<name>/<rest>`:
+
+1. `<project>/packages/<name>/<rest>` — a project-local copy always wins
+   (regardless of pins): it is the manual-vendor escape hatch and behaves
+   as ordinary project content.
+2. The package store: `<store>/<name>/<version>/<rest>`, where `<store>`
+   is each entry of `DRIFT_PACKAGE_PATH` (colon-separated) if set, else
+   `$XDG_DATA_HOME/drift/packages`, else `~/.local/share/drift/packages`.
+   Stores are searched in order; within the first store holding a version
+   that matches the pin (§20.3), the highest wins — versions compare as
+   dotted integer segments, missing segments zero.
+
+Store content is read-only to the runtime and tools. If no candidate
+resolves, the load fails with the ordinary missing-asset error naming the
+package and pin.
+
+### 20.3 Version Pinning
+
+Optional `scene.json` top level:
+
+```json
+"packages": { "sway": "1" }
+```
+
+Each entry pins one package name to a version *prefix*: `"1"` admits any
+installed `1.x…`, `"1.2"` admits `1.2.x…`, a full version is exact. Names
+not referenced by any `packages/` path produce a load warning (stale
+pin). Unpinned references take the newest installed version. The block is
+also the scene's dependency manifest: it is what a future resolver
+fetches and what the `.wallpkg` exporter bundles.
+
+### 20.4 Repositories
+
+A repository is a directory or static HTTP host:
+
+```
+index.json
+<name>/            # one directory per package, laid out as §20.1
+```
+
+`index.json`: `{ "version": 1, "packages": [ … ] }`, one entry per
+package version:
+
+| Field         | Type   | Notes                                            |
+|---------------|--------|--------------------------------------------------|
+| `name`        | string | matches the package `manifest.json`              |
+| `version`     | string | matches the package `manifest.json`              |
+| `description` | string | optional, from the manifest                      |
+| `files`       | array  | `{ "path", "sha256", "size" }` per file, sorted by path |
+| `hash`        | string | sha256 of the canonical file list (see below)    |
+
+The package `hash` is `sha256` over the text `"<sha256>  <path>\n"` for
+every file, sorted by path — computable from `files` alone, so a client
+can verify a package fetched file-by-file over HTTP without a tarball.
+Install verifies every file hash and the tree hash, then records
+`{ "repository", "hash" }` beside the package in the store
+(`.installed.json`, ignored by resolution). First-party packages live in
+this repository's top-level `library/`, which is itself a valid package
+repository.
+
+### 20.5 Validation Additions (§13)
+
+Package manifest missing/unparseable, `name` not matching its directory,
+or malformed `version`; a `packages/` path inside a package's own files;
+a `packages/` path whose `<rest>` does not name package content
+(`graphs/`, `shaders/`, `assets/`); a malformed `packages` pin block
+(non-object, non-string pin, or unknown-name warning per §20.3); a
+`packages/` reference that resolves to no installed version.
+
+### 20.6 Editor Mapping (non-normative)
+
+The add-node palette lists graphs from resolvable packages alongside the
+project's own `graphs/`. Drill-in (§19.5) into a package instance is
+read-only: the store is not project content, and `write-asset` cannot
+reach it — "edit a copy" is a future affordance built on the §20.2
+project-local override.

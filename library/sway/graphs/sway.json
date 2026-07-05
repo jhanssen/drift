@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "Sway",
+  "description": "Living still: source pixels ride an animated wave field where the grayscale flex map is white and stay pinned where it is black. Amplitude is in uv units; direction weights the x/y motion.",
+  "inputs": {
+    "source":    { "type": "texture", "bind": "@warp.source" },
+    "flex":      { "type": "texture", "bind": "@warp.flex" },
+    "amplitude": { "type": "scalar", "default": 0.008, "bind": "@warp.amplitude" },
+    "speed":     { "type": "scalar", "default": 1, "bind": "@warp.speed" },
+    "scale":     { "type": "scalar", "default": 5, "bind": "@warp.scale" },
+    "direction": { "type": "vec2", "default": [1, 0.4], "bind": "@warp.direction" }
+  },
+  "outputs": { "result": "@warp" },
+  "nodes": [
+    { "id": "warp", "type": "shader", "shader": "shaders/sway.wgsl",
+      "inputs": { "time": "@time.seconds" } }
+  ]
+}

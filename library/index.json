@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "packages": [
+    {
+      "name": "sway",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/sway.json",
+          "sha256": "17ecd3e22d2036a9b2c1f79f1719f85e608bbdcb5c3f38eeb471e37c7cf50e1f",
+          "size": 880
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "7469ad7581c45ff24691b523123222929db6178571c2bd15fbd1b745483e0f8f",
+          "size": 212
+        },
+        {
+          "path": "shaders/sway.wgsl",
+          "sha256": "cfa5d96923ce52dbc6a4884a1f309ff2d496ee9718ad1205e77f7670ce24bf64",
+          "size": 1250
+        }
+      ],
+      "hash": "0348a71afcff1383b5d871507d52bfaabf079caba039c24688d65745381bf027",
+      "description": "Living still: source pixels ride an animated wave field where the grayscale flex map is white and stay pinned where it is black."
+    }
+  ]
+}

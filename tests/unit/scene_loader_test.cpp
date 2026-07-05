@@ -184,6 +184,29 @@ const char* kBadBindGraph = R"({
     ]
 })";
 
+// §20 fixtures: the dim block shipped as a package, plus failure shapes.
+// The pin test's fixture exists ONLY under the pinned key, so a loader
+// that drops pins fails to resolve it.
+const char* kFxManifest = R"({ "name": "fx", "version": "1.2.0" })";
+const char* kPinnedManifest = R"({ "name": "pinned", "version": "2.0" })";
+const char* kMismatchManifest = R"({ "name": "other", "version": "1" })";
+const char* kXdepManifest = R"({ "name": "xdep", "version": "1" })";
+
+const char* kPicGraph = R"({
+    "version": 1,
+    "outputs": { "result": "@img" },
+    "nodes": [ { "id": "img", "type": "image", "src": "assets/tiny.png" } ]
+})";
+
+const char* kXdepGraph = R"({
+    "version": 1,
+    "outputs": { "result": "@d" },
+    "nodes": [
+        { "id": "d", "type": "graph",
+          "graph": "packages/fx/graphs/dim.json" }
+    ]
+})";
+
 // A valid 2x2 RGBA PNG.
 const unsigned char kTinyPng[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2,
@@ -355,6 +378,18 @@ LoadResult load(const std::string& json,
         { "graphs/hasoutput.json", kHasOutputGraph },
         { "graphs/noresult.json", kNoResultGraph },
         { "graphs/badbind.json", kBadBindGraph },
+        { "packages/fx/manifest.json", kFxManifest },
+        { "packages/fx/graphs/dim.json", kDimGraph },
+        { "packages/fx/graphs/pic.json", kPicGraph },
+        { "packages/fx/shaders/dim.wgsl", kDimWgsl },
+        { "packages/fx/assets/tiny.png",
+          std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
+        { "packages/pinned@2/manifest.json", kPinnedManifest },
+        { "packages/pinned@2/graphs/pulse.json", kPulseGraph },
+        { "packages/mismatch/manifest.json", kMismatchManifest },
+        { "packages/mismatch/graphs/dim.json", kDimGraph },
+        { "packages/xdep/manifest.json", kXdepManifest },
+        { "packages/xdep/graphs/x.json", kXdepGraph },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
         { "assets/tiny.webp",
@@ -1456,6 +1491,98 @@ TEST_CASE("subgraphs: interface, flattening, nesting (§19)")
         { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
     CHECK(r.scene == nullptr);
     CHECK(r.hasError("nesting deeper than 8"));
+}
+
+TEST_CASE("packages: references, pins, self-containment (§20)")
+{
+    auto scene = [&](const std::string& extra, const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", )" + extra +
+                    R"("nodes": [)" + nodes + "] }");
+    };
+
+    // A package graph instantiates like any subgraph; its inner shader
+    // path resolves against the package root (§20.1).
+    auto r = scene("", R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph",
+          "graph": "packages/fx/graphs/dim.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    CHECK(r.warnings.empty());
+
+    // Package-relative assets rewrite too.
+    r = scene("", R"(
+        { "id": "g", "type": "graph",
+          "graph": "packages/fx/graphs/pic.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    // A pin canonicalizes into every read: this fixture only exists
+    // under the pinned key (§20.3).
+    r = scene(R"("packages": { "pinned": "2" }, )", R"(
+        { "id": "p", "type": "graph",
+          "graph": "packages/pinned/graphs/pulse.json" },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@p" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    CHECK(r.warnings.empty());
+
+    // A stale pin warns (§20.3).
+    r = scene(R"("packages": { "pinned": "2" }, )", R"(
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("pin 'pinned' is unused"));
+
+    // Malformed pins are load errors (§20.3).
+    r = scene(R"("packages": { "fx": "one" }, )", R"(
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("version prefix"));
+
+    // A package may not reach into another package (§20.1).
+    r = scene("", R"(
+        { "id": "g", "type": "graph",
+          "graph": "packages/xdep/graphs/x.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("from inside a package"));
+
+    // Manifest name must match the referenced package (§20.1).
+    r = scene("", R"(
+        { "id": "g", "type": "graph",
+          "graph": "packages/mismatch/graphs/dim.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("does not match"));
+
+    // Unresolvable package (§20.2).
+    r = scene("", R"(
+        { "id": "g", "type": "graph",
+          "graph": "packages/ghost/graphs/g.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("package 'ghost' is not installed"));
+
+    // Only package content is addressable (§20.5).
+    r = scene("", R"(
+        { "id": "img", "type": "image",
+          "src": "packages/fx/manifest.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@img" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("must name graphs/, shaders/ or assets/"));
 }
 
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")

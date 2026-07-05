@@ -73,11 +73,20 @@ if(EMSCRIPTEN)
         SUFFIX ".html"
         LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
-                         comets fireworks bokeh)
+                         comets fireworks bokeh sway)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
             "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/examples/${scene}.sceneproject@/scenes/${scene}")
+    endforeach()
+    # First-party packages ship as a store at /packages (§20.2); the web
+    # runtime defaults DRIFT_PACKAGE_PATH there.
+    set(DRIFT_WEB_PACKAGES sway)
+    foreach(pkg IN LISTS DRIFT_WEB_PACKAGES)
+        file(READ ${CMAKE_SOURCE_DIR}/library/${pkg}/manifest.json _manifest)
+        string(JSON _pkg_version GET "${_manifest}" version)
+        list(APPEND DRIFT_WEB_PRELOADS
+            "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/library/${pkg}@/packages/${pkg}/${_pkg_version}")
     endforeach()
     target_link_options(drift_web PRIVATE
         "-sALLOW_MEMORY_GROWTH=1"
@@ -155,6 +164,7 @@ if(BUILD_TESTING)
         tests/unit/sequence_test.cpp
         tests/unit/ws_codec_test.cpp
         tests/unit/mp4_demux_test.cpp
+        tests/unit/package_store_test.cpp
         src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
@@ -163,12 +173,26 @@ if(BUILD_TESTING)
         PRIVATE DRIFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME unit COMMAND drift_tests)
 
+    # Goldens resolve library/ packages (§20) from a store the fixture
+    # installs into the build dir — the repo→install→store→loader pipeline
+    # is part of what they test.
+    add_test(NAME pkgstore_setup COMMAND
+        node ${CMAKE_SOURCE_DIR}/tools/driftpkg.mjs install sway
+        --repo ${CMAKE_SOURCE_DIR}/library
+        --store ${CMAKE_BINARY_DIR}/pkgstore
+    )
+    set_tests_properties(pkgstore_setup PROPERTIES FIXTURES_SETUP pkgstore)
+
     function(drift_golden_test name)
         add_test(NAME golden_${name} COMMAND
             ${CMAKE_SOURCE_DIR}/tests/golden.sh
             $<TARGET_FILE:drift> $<TARGET_FILE:imgcmp>
             ${CMAKE_SOURCE_DIR}/examples/${name}.sceneproject
             ${CMAKE_SOURCE_DIR}/tests/golden/${name}
+        )
+        set_tests_properties(golden_${name} PROPERTIES
+            ENVIRONMENT "DRIFT_PACKAGE_PATH=${CMAKE_BINARY_DIR}/pkgstore"
+            FIXTURES_REQUIRED pkgstore
         )
     endfunction()
     drift_golden_test(plasma)
@@ -183,4 +207,5 @@ if(BUILD_TESTING)
     drift_golden_test(comets)
     drift_golden_test(fireworks)
     drift_golden_test(bokeh)
+    drift_golden_test(sway)
 endif()

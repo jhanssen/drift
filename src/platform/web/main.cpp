@@ -11,10 +11,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -28,6 +30,7 @@ static std::string gLastLoadErrors;
 
 #include "core/Scene.h"
 #include "core/WgslInterface.h"
+#include "platform/PackageStore.h"
 #include "platform/ParamJson.h"
 #include "platform/web/VideoDecoderWebCodecs.h"
 
@@ -72,17 +75,12 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
 {
     namespace fs = std::filesystem;
 
+    // Project-root confinement plus §20.2 package-store resolution (in
+    // the browser only a project-local packages/ dir can resolve — there
+    // is no shared store on MEMFS unless the host mounts one).
     auto confined = [root](const std::string& relPath, fs::path& out) -> bool {
-        for (const auto& part : fs::path(relPath)) {
-            if (part == "..") {
-                return false;
-            }
-        }
-        if (fs::path(relPath).is_absolute()) {
-            return false;
-        }
-        out = fs::path(root) / relPath;
-        return true;
+        return drift::platform::resolveProjectPath(fs::path(root), relPath,
+                                                   out);
     };
 
     auto readAsset = [confined](const std::string& relPath, std::string& out) -> bool {
@@ -429,13 +427,66 @@ EMSCRIPTEN_KEEPALIVE const char* drift_scenes()
 // node palette and instance pins fill from this.
 EMSCRIPTEN_KEEPALIVE const char* drift_graphs()
 {
+    namespace fs = std::filesystem;
     static std::string json;
     std::vector<std::string> names;
     std::error_code ec;
-    for (const auto& entry : std::filesystem::directory_iterator(
-             std::filesystem::path(gApp.scenePath) / "graphs", ec)) {
+    for (const auto& entry : fs::directory_iterator(
+             fs::path(gApp.scenePath) / "graphs", ec)) {
         if (entry.is_regular_file() && entry.path().extension() == ".json") {
             names.push_back("graphs/" + entry.path().filename().string());
+        }
+    }
+
+    // §20.6: package graphs — project-local copies shadow the stores,
+    // and within the stores the newest installed version of each name.
+    std::set<std::string> seenPkgs;
+    const auto packageGraphs = [&names](const fs::path& root,
+                                        const std::string& pkg) {
+        std::error_code ec2;
+        for (const auto& g : fs::directory_iterator(root / "graphs", ec2)) {
+            if (g.is_regular_file() && g.path().extension() == ".json") {
+                names.push_back("packages/" + pkg + "/graphs/" +
+                                g.path().filename().string());
+            }
+        }
+    };
+    for (const auto& entry : fs::directory_iterator(
+             fs::path(gApp.scenePath) / "packages", ec)) {
+        if (entry.is_directory(ec) &&
+            seenPkgs.insert(entry.path().filename().string()).second) {
+            packageGraphs(entry.path(), entry.path().filename().string());
+        }
+    }
+    for (const fs::path& store : drift::platform::packageStores()) {
+        for (const auto& entry : fs::directory_iterator(store, ec)) {
+            if (!entry.is_directory(ec)) {
+                continue;
+            }
+            const std::string pkg = entry.path().filename().string();
+            if (seenPkgs.count(pkg)) {
+                continue;
+            }
+            std::vector<long> best;
+            fs::path bestPath;
+            std::error_code ec2;
+            for (const auto& v : fs::directory_iterator(entry.path(), ec2)) {
+                std::vector<long> segs;
+                if (!v.is_directory(ec2) ||
+                    !drift::platform::versionSegments(
+                        v.path().filename().string(), segs)) {
+                    continue;
+                }
+                if (best.empty() ||
+                    drift::platform::versionCompare(segs, best) > 0) {
+                    best = std::move(segs);
+                    bestPath = v.path();
+                }
+            }
+            if (!bestPath.empty()) {
+                seenPkgs.insert(pkg);
+                packageGraphs(bestPath, pkg);
+            }
         }
     }
     std::sort(names.begin(), names.end());
@@ -554,18 +605,18 @@ EMSCRIPTEN_KEEPALIVE const char* drift_reflect(const char* path)
     return json.c_str();
 }
 
-// Reads a project-relative text file (e.g. a shader into the editor pane).
+// Reads a project-relative text file (e.g. a shader into the editor
+// pane). packages/ paths resolve through the store (§20.6) so the editor
+// can drill into package graphs.
 EMSCRIPTEN_KEEPALIVE const char* drift_read_asset(const char* path)
 {
     static std::string contents;
     contents.clear();
-    const std::string rel(path);
-    if (rel.find("..") != std::string::npos ||
-        (!rel.empty() && rel[0] == '/')) {
+    std::filesystem::path full;
+    if (!drift::platform::resolveProjectPath(gApp.scenePath, path, full)) {
         return contents.c_str();
     }
-    std::ifstream in(std::filesystem::path(gApp.scenePath) / rel,
-                     std::ios::binary);
+    std::ifstream in(full, std::ios::binary);
     if (in) {
         std::ostringstream ss;
         ss << in.rdbuf();
@@ -631,6 +682,10 @@ EMSCRIPTEN_KEEPALIVE int drift_set_parameter(const char* name, double x,
 
 int main(int argc, char** argv)
 {
+    // The bundle ships first-party packages as a store at /packages
+    // (§20.2); a host page can still override the path.
+    setenv("DRIFT_PACKAGE_PATH", "/packages", /*overwrite=*/0);
+
     std::string name = argc > 1 ? argv[1] : "plasma";
     if (name.find('/') != std::string::npos ||
         !std::filesystem::exists("/scenes/" + name)) {

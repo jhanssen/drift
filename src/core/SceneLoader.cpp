@@ -2,6 +2,7 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <string_view>
 
 #include <glaze/glaze.hpp>
 
@@ -57,6 +58,10 @@ struct RawNode {
     std::string type;
     std::map<std::string, RawInput> inputs;
     const glz::generic* json = nullptr;
+    // §20.1: non-empty ("packages/<name>[@pin]/") for nodes that came from
+    // a package's graph file — their relative paths resolve against the
+    // package root.
+    std::string assetRoot;
 };
 
 struct Param {
@@ -69,6 +74,34 @@ struct Param {
     std::string label;
     std::string hint;
 };
+
+// §20.1: dotted decimal integers ("1", "1.2.0"); also the pin syntax,
+// which is a prefix of the same shape (§20.3).
+bool validVersion(const std::string& s)
+{
+    size_t start = 0;
+    while (start <= s.size()) {
+        const size_t dot = s.find('.', start);
+        const std::string seg =
+            s.substr(start, dot == std::string::npos ? dot : dot - start);
+        if (seg.empty() ||
+            seg.find_first_not_of("0123456789") != std::string::npos) {
+            return false;
+        }
+        if (dot == std::string::npos) {
+            return true;
+        }
+        start = dot + 1;
+    }
+    return false;
+}
+
+bool validPackageName(const std::string& s)
+{
+    return !s.empty() &&
+           s.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") ==
+               std::string::npos;
+}
 
 bool validId(const std::string& s)
 {
@@ -459,6 +492,7 @@ private:
         };
         std::string path;
         std::string name;
+        std::string assetRoot; // §20.1, "" for project-local graph files
         std::vector<std::pair<std::string, In>> inputs; // declaration order
         std::map<std::string, RawConn> outputs;
         std::vector<RawNode> nodes;
@@ -467,6 +501,15 @@ private:
     };
     GraphDef* graphDef(const std::string& path); // nullptr = failed (fail())
     std::map<std::string, std::unique_ptr<GraphDef>> mGraphDefs;
+
+    // §20: version pins from scene.json's "packages" block, canonicalized
+    // into every package reference as "packages/<name>@<pin>/…".
+    bool assetPath(const RawNode& raw, std::string& path, const char* what);
+    bool checkPackage(const std::string& nodeId, const std::string& name,
+                      const std::string& ref);
+    std::map<std::string, std::string> mPins;
+    std::set<std::string> mPinsUsed;
+    std::set<std::string> mPackagesChecked;
 
     std::vector<Param> mParams;
     std::map<std::string, int> mParamIndex;
@@ -822,6 +865,98 @@ bool Loader::parseEmitters(RawNode& raw, const glz::generic& json,
     return true;
 }
 
+// Canonicalize a node's path property (§20.2): package-root prefix for
+// nodes that came from a package's graph file, pin insertion and
+// self-containment checks for packages/ references.
+bool Loader::assetPath(const RawNode& raw, std::string& path,
+                       const char* what)
+{
+    constexpr std::string_view kPrefix = "packages/";
+    if (!path.starts_with(kPrefix)) {
+        if (!raw.assetRoot.empty()) {
+            path = raw.assetRoot + path;
+        }
+        return true;
+    }
+    if (!raw.assetRoot.empty()) {
+        fail("node '" + raw.id + "': " + what +
+             " may not reference another package from inside a package "
+             "(§20.1)");
+        return false;
+    }
+    const size_t nameStart = kPrefix.size();
+    const size_t slash = path.find('/', nameStart);
+    if (slash == std::string::npos || slash + 1 >= path.size()) {
+        fail("node '" + raw.id + "': malformed package path '" + path +
+             "' (§20.2)");
+        return false;
+    }
+    const std::string name = path.substr(nameStart, slash - nameStart);
+    const std::string rest = path.substr(slash + 1);
+    if (!validPackageName(name)) {
+        fail("node '" + raw.id + "': invalid package name '" + name +
+             "' (§20.1)");
+        return false;
+    }
+    if (!rest.starts_with("graphs/") && !rest.starts_with("shaders/") &&
+        !rest.starts_with("assets/")) {
+        fail("node '" + raw.id + "': package path '" + path +
+             "' must name graphs/, shaders/ or assets/ content (§20.5)");
+        return false;
+    }
+    std::string ref = name;
+    if (auto it = mPins.find(name); it != mPins.end()) {
+        ref += "@" + it->second;
+        mPinsUsed.insert(name);
+    }
+    if (!checkPackage(raw.id, name, ref)) {
+        return false;
+    }
+    path = std::string(kPrefix) + ref + "/" + rest;
+    return true;
+}
+
+// Validate a package's manifest the first time the package is referenced
+// (§20.1/§20.5). `ref` is the pin-canonicalized name.
+bool Loader::checkPackage(const std::string& nodeId, const std::string& name,
+                          const std::string& ref)
+{
+    if (mPackagesChecked.count(name)) {
+        return true;
+    }
+    std::string text;
+    if (!mReadAsset("packages/" + ref + "/manifest.json", text)) {
+        const auto pin = mPins.find(name);
+        fail("node '" + nodeId + "': package '" + name + "'" +
+             (pin != mPins.end() ? " (pin '" + pin->second + "')" : "") +
+             " is not installed (§20.2)");
+        return false;
+    }
+    glz::generic doc;
+    if (auto ec = glz::read_json(doc, text); ec || !doc.is_object()) {
+        fail("package '" + name + "': manifest.json is unreadable (§20.1)");
+        return false;
+    }
+    const auto& obj = doc.get_object();
+    auto nIt = obj.find("name");
+    if (nIt == obj.end() || !nIt->second.is_string() ||
+        nIt->second.get_string() != name) {
+        fail("package '" + name +
+             "': manifest 'name' does not match the package directory "
+             "(§20.1)");
+        return false;
+    }
+    auto vIt = obj.find("version");
+    if (vIt == obj.end() || !vIt->second.is_string() ||
+        !validVersion(vIt->second.get_string())) {
+        fail("package '" + name +
+             "': manifest 'version' must be dotted integers (§20.1)");
+        return false;
+    }
+    mPackagesChecked.insert(name);
+    return true;
+}
+
 Loader::GraphDef* Loader::graphDef(const std::string& path)
 {
     if (auto it = mGraphDefs.find(path); it != mGraphDefs.end()) {
@@ -836,6 +971,11 @@ Loader::GraphDef* Loader::graphDef(const std::string& path)
     }
     auto def = std::make_unique<GraphDef>();
     def->path = path;
+    if (path.starts_with("packages/")) {
+        // "packages/<name>[@pin]/" — the root the file's own paths
+        // resolve against (§20.1).
+        def->assetRoot = path.substr(0, path.find('/', 9) + 1);
+    }
     def->doc = std::make_unique<glz::generic>();
     if (auto ec = glz::read_json(*def->doc, text); ec) {
         fail("graph file '" + path + "': " + glz::format_error(ec, text));
@@ -1061,7 +1201,17 @@ bool Loader::expandGraphs()
                      "': 'graph' must be a graph file path (§19.3)");
                 return false;
             }
-            GraphDef* def = graphDef(gIt->second.get_string());
+            std::string gPath = gIt->second.get_string();
+            if (gPath.find("..") != std::string::npos ||
+                gPath.starts_with("/")) {
+                fail("node '" + raw.id +
+                     "': graph path escapes the project");
+                return false;
+            }
+            if (!assetPath(raw, gPath, "'graph'")) {
+                return false;
+            }
+            GraphDef* def = graphDef(gPath);
             if (!def) {
                 return false;
             }
@@ -1105,6 +1255,7 @@ bool Loader::expandGraphs()
                 copy.id = prefix + inner.id;
                 copy.type = inner.type;
                 copy.json = inner.json; // GraphDef::doc keeps this alive
+                copy.assetRoot = def->assetRoot;
                 copy.inputs = inner.inputs;
                 for (auto& [port, in] : copy.inputs) {
                     const auto ns = [&](RawConn& c) {
@@ -1605,9 +1756,12 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': shader node needs a string 'shader' path");
             return nullptr;
         }
-        const std::string& path = pathIt->second.get_string();
+        std::string path = pathIt->second.get_string();
         if (path.find("..") != std::string::npos || path.starts_with("/")) {
             fail("node '" + raw.id + "': shader path escapes the project");
+            return nullptr;
+        }
+        if (!assetPath(raw, path, "'shader'")) {
             return nullptr;
         }
         std::string source;
@@ -1661,9 +1815,12 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': compute node needs a string 'shader' path");
             return nullptr;
         }
-        const std::string& path = pathIt->second.get_string();
+        std::string path = pathIt->second.get_string();
         if (path.find("..") != std::string::npos || path.starts_with("/")) {
             fail("node '" + raw.id + "': shader path escapes the project");
+            return nullptr;
+        }
+        if (!assetPath(raw, path, "'shader'")) {
             return nullptr;
         }
         std::string source;
@@ -1786,9 +1943,12 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': image node needs a string 'src' path");
             return nullptr;
         }
-        const std::string& path = srcIt->second.get_string();
+        std::string path = srcIt->second.get_string();
         if (path.find("..") != std::string::npos || path.starts_with("/")) {
             fail("node '" + raw.id + "': image path escapes the project");
+            return nullptr;
+        }
+        if (!assetPath(raw, path, "'src'")) {
             return nullptr;
         }
         std::string bytes;
@@ -1813,9 +1973,12 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             fail("node '" + raw.id + "': video node needs a string 'src' path");
             return nullptr;
         }
-        const std::string& path = srcIt->second.get_string();
+        std::string path = srcIt->second.get_string();
         if (path.find("..") != std::string::npos || path.starts_with("/")) {
             fail("node '" + raw.id + "': video path escapes the project");
+            return nullptr;
+        }
+        if (!assetPath(raw, path, "'src'")) {
             return nullptr;
         }
         bool loop = true;
@@ -2354,8 +2517,29 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
             }
         } else if (key != "version" && key != "name" && key != "author" &&
                    key != "description" && key != "parameters" &&
-                   key != "nodes") {
+                   key != "packages" && key != "nodes") {
             warn("unknown top-level field '" + key + "' ignored");
+        }
+    }
+
+    if (auto pkgIt = top.find("packages"); pkgIt != top.end()) {
+        if (!pkgIt->second.is_object()) {
+            fail("'packages' must be an object of name → version pin "
+                 "(§20.3)");
+            return nullptr;
+        }
+        for (const auto& [name, pin] : pkgIt->second.get_object()) {
+            if (!validPackageName(name)) {
+                fail("'packages': invalid package name '" + name +
+                     "' (§20.1)");
+                return nullptr;
+            }
+            if (!pin.is_string() || !validVersion(pin.get_string())) {
+                fail("'packages': pin for '" + name +
+                     "' must be a version prefix string (§20.3)");
+                return nullptr;
+            }
+            mPins[name] = pin.get_string();
         }
     }
 
@@ -2397,6 +2581,11 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
     }
     if (!bindDeferred()) {
         return nullptr;
+    }
+    for (const auto& [name, pin] : mPins) {
+        if (!mPinsUsed.count(name)) {
+            warn("packages pin '" + name + "' is unused (§20.3)");
+        }
     }
     if (!mOutput) {
         fail("scene has no output node");

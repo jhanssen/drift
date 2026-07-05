@@ -1639,7 +1639,8 @@ function updateGraphChrome() {
   const crumb = document.getElementById('crumb');
   crumb.hidden = !showGraph || !view;
   crumb.textContent =
-      view ? 'scene' + viewStack.map((v) => ' ▸ ' + v.path).join('') : '';
+      view ? 'scene' + viewStack.map((v) => ' ▸ ' + v.path).join('') +
+             (viewReadOnly() ? ' (read-only)' : '') : '';
   document.getElementById('flattenBtn').hidden = !showGraph ||
       viewStack.length !== 1 || !view?.viaInstance;
   document.getElementById('makeSubBtn').hidden =
@@ -1691,9 +1692,24 @@ async function writeProjectFile(path, contents) {
   return null;
 }
 
+// §20.6: package graphs come from the store, not the project — the
+// drill-in view shows them but every edit path is refused.
+const viewReadOnly = () =>
+    viewStack.length > 0 &&
+    viewStack[viewStack.length - 1].path.startsWith('packages/');
+
 // Writes the edited graph file and reloads the scene (both runtimes) so
 // flattening picks the change up.
 async function commitSubgraph() {
+  if (viewReadOnly()) {
+    // Snap back whatever local mutation led here.
+    const top = viewStack[viewStack.length - 1];
+    graphDocs.delete(top.path);
+    top.doc = graphDoc(top.path);
+    refreshGraph();
+    setGraphStatus('package graphs are read-only (§20.6)');
+    return;
+  }
   const view = viewStack[viewStack.length - 1];
   const liveError = await writeProjectFile(
       view.path, JSON.stringify(view.doc, null, 2) + '\n');
@@ -3151,8 +3167,14 @@ function rebuildNodeMenu() {
       .map((type) => ({ label: type, type }));
   try {
     for (const path of JSON.parse(wasm?.graphs() ?? '[]')) {
+      // §20.6: package graphs list beside the project's own; the label
+      // collapses "packages/sway/graphs/sway.json" to "⬡ sway".
+      const pkg = path.match(/^packages\/([a-z0-9-]+)\/graphs\/(.+)\.json$/);
       items.push({
-        label: '▣ ' + path.replace(/^graphs\//, '').replace(/\.json$/, ''),
+        label: pkg ? '⬡ ' + (pkg[2] === pkg[1] ? pkg[1]
+                                               : `${pkg[1]}/${pkg[2]}`)
+                   : '▣ ' + path.replace(/^graphs\//, '')
+                                .replace(/\.json$/, ''),
         type: 'graph', graphPath: path,
       });
     }

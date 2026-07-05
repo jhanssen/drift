@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "Sway",
+  "description": "Living still, stage 1 (masked sway): a static meadow whose grass and canopy ride a wave field. The painted flex map decides what moves — no rig, one node from the sway package (§20).",
+  "packages": { "sway": "1" },
+  "parameters": {
+    "amount": { "type": "scalar", "default": 0.008, "min": 0, "max": 0.03, "label": "Sway amount" },
+    "speed":  { "type": "scalar", "default": 1, "min": 0, "max": 4, "label": "Wind speed" }
+  },
+  "nodes": [
+    { "id": "picture", "type": "image", "src": "assets/meadow.png" },
+    { "id": "flexmap", "type": "image", "src": "assets/meadow_flex.png" },
+
+    { "id": "sway", "type": "graph",
+      "graph": "packages/sway/graphs/sway.json",
+      "inputs": { "source": "@picture", "flex": "@flexmap",
+                  "amplitude": "$amount", "speed": "$speed" } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@sway" } }
+  ]
+}

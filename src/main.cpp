@@ -15,6 +15,7 @@
 
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/PackageStore.h"
 #include "platform/linux/ControlServer.h"
 #include "platform/linux/Gpu.h"
 #include "platform/linux/VideoDecoderFFmpeg.h"
@@ -107,17 +108,9 @@ std::unique_ptr<drift::core::Scene> loadScene(
     }
     const fs::path sceneFile = root / "scene.json";
 
+    // Project-root confinement plus §20.2 package-store resolution.
     auto confined = [root](const std::string& relPath, fs::path& out) -> bool {
-        for (const auto& part : fs::path(relPath)) {
-            if (part == "..") {
-                return false;
-            }
-        }
-        if (fs::path(relPath).is_absolute()) {
-            return false;
-        }
-        out = root / relPath;
-        return true;
+        return drift::platform::resolveProjectPath(root, relPath, out);
     };
 
     auto readAsset = [confined](const std::string& relPath, std::string& out) -> bool {
@@ -517,11 +510,23 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
             }
             return true;
         };
-        callbacks.readAsset = [confinedPath](const std::string& rel,
-                                             std::string& out,
-                                             std::string& error) {
-            std::filesystem::path full;
-            if (!confinedPath(rel, full, error)) {
+        // Reads also resolve through the package store (§20.6) so the
+        // editor can drill into package graphs; writes stay project-only.
+        callbacks.readAsset = [&scenePath](const std::string& rel,
+                                           std::string& out,
+                                           std::string& error) {
+            namespace fs = std::filesystem;
+            if (scenePath.empty()) {
+                error = "no scene loaded";
+                return false;
+            }
+            fs::path root(scenePath);
+            if (fs::is_regular_file(root)) {
+                root = root.parent_path();
+            }
+            fs::path full;
+            if (!drift::platform::resolveProjectPath(root, rel, full)) {
+                error = "cannot resolve '" + rel + "'";
                 return false;
             }
             std::ifstream in(full, std::ios::binary);
