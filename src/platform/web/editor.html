@@ -1461,31 +1461,51 @@ const IMPLICIT_OUTPUTS = {
   time: [['seconds', 'value'], ['delta', 'value']],
   mouse: [['position', 'value'], ['active', 'value']],
 };
-// Input ports per built-in type as [name, category, isArray] (§9), so ports
-// that are not bound in the document still get pins to drop wires on.
-// shader ports come from WGSL reflection instead (specInputsOf).
+// Input ports per built-in type as [name, category, isArray, default] (§9),
+// so ports that are not bound in the document still get pins to drop wires
+// on, showing the default they run at. shader ports come from WGSL
+// reflection instead (specInputsOf).
 const NODE_INPUTS = {
   image: [],
-  video: [['playing', 'value'], ['restart', 'event']],
-  particles: [['rate', 'value'], ['burst', 'event'], ['burstCount', 'value'],
-              ['origin', 'value'], ['extent', 'value'],
-              ['direction', 'value'], ['spread', 'value'], ['speed', 'value'],
-              ['lifetime', 'value'], ['size', 'value'], ['spin', 'value'],
-              ['colorStart', 'value'], ['colorEnd', 'value'],
-              ['fadeIn', 'value'], ['sizeEnd', 'value'], ['gravity', 'value'],
-              ['drag', 'value'], ['turbulence', 'value'],
-              ['turbulenceScale', 'value'], ['attractor', 'value'],
-              ['attract', 'value'], ['vortex', 'value'], ['time', 'value']],
+  video: [['playing', 'value', false, 1], ['restart', 'event']],
+  particles: [['rate', 'value', false, 10], ['burst', 'event'],
+              ['burstCount', 'value', false, 32],
+              ['origin', 'value', false, [0.5, 0.5]],
+              ['extent', 'value', false, [0, 0]],
+              ['direction', 'value', false, [0, -1]],
+              ['spread', 'value', false, 180],
+              ['speed', 'value', false, [0.05, 0.15]],
+              ['lifetime', 'value', false, [1, 3]],
+              ['size', 'value', false, [0.01, 0.03]],
+              ['spin', 'value', false, [0, 0]],
+              ['colorStart', 'value', false, [1, 1, 1, 1]],
+              ['colorEnd', 'value', false, [1, 1, 1, 0]],
+              ['fadeIn', 'value', false, 0.1],
+              ['sizeEnd', 'value', false, 1],
+              ['gravity', 'value', false, [0, 0]],
+              ['drag', 'value', false, 0],
+              ['turbulence', 'value', false, 0],
+              ['turbulenceScale', 'value', false, 4],
+              ['attractor', 'value', false, [0.5, 0.5]],
+              ['attract', 'value', false, 0],
+              ['vortex', 'value', false, 0],
+              ['time', 'value']],
   sprites: [['particles', 'buffer'], ['texture', 'texture']],
-  transform: [['source', 'texture'], ['position', 'value'],
-              ['rotation', 'value'], ['scale', 'value'], ['anchor', 'value'],
-              ['opacity', 'value']],
+  transform: [['source', 'texture'],
+              ['position', 'value', false, [0.5, 0.5]],
+              ['rotation', 'value', false, 0],
+              ['scale', 'value', false, [1, 1]],
+              ['anchor', 'value', false, [0.5, 0.5]],
+              ['opacity', 'value', false, 1]],
   compositor: [['layers', 'texture', true]],
   output: [['color', 'texture']],
-  remap: [['value', 'value'], ['inMin', 'value'], ['inMax', 'value'],
-          ['outMin', 'value'], ['outMax', 'value']],
-  wave: [['input', 'value'], ['frequency', 'value'], ['phase', 'value']],
-  combine: [['x', 'value'], ['y', 'value'], ['z', 'value'], ['w', 'value']],
+  remap: [['value', 'value'], ['inMin', 'value', false, 0],
+          ['inMax', 'value', false, 1], ['outMin', 'value', false, 0],
+          ['outMax', 'value', false, 1]],
+  wave: [['input', 'value'], ['frequency', 'value', false, 1],
+         ['phase', 'value', false, 0]],
+  combine: [['x', 'value', false, 0], ['y', 'value', false, 0],
+            ['z', 'value', false, 0], ['w', 'value', false, 0]],
   split: [['value', 'value']],
   sequence: [['time', 'value']],
 };
@@ -1592,7 +1612,7 @@ function buildGraph() {
     // does not know about (draft docs, unreflectable shaders) follow, but
     // only where the document binds them.
     const seen = new Set();
-    for (const [name, category, isArray] of
+    for (const [name, category, isArray, def] of
              (implicit ? [] : specInputsOf(source)) ?? []) {
       seen.add(name);
       const bound = source.inputs?.[name];
@@ -1601,7 +1621,7 @@ function buildGraph() {
       } else if (isArray) {
         inputs.push({ name: `${name}[+]`, append: name, category });
       } else {
-        inputs.push({ name, unbound: true, category });
+        inputs.push({ name, unbound: true, category, def });
       }
     }
     for (const [name, value] of Object.entries(source.inputs ?? {})) {
@@ -2478,6 +2498,8 @@ function drawGraph() {
       ctx.fillText(input.name, node.x + 8, y + 3);
       const binding = input.param ? (input.paramEdge ? null : '$' + input.param)
                     : input.literal !== undefined ? shortLit(input.literal)
+                    : input.unbound && input.def !== undefined
+                        ? shortLit(input.def)
                     : null;
       if (binding) {
         ctx.fillStyle = '#8a8f98';
@@ -2622,7 +2644,10 @@ function renderInspector() {
           ? `@${input.conn.node}.${input.conn.port ?? ''}`.replace(/\.$/, '') +
             (input.conn.previous ? ' (previous)' : '')
           : input.param ? '$' + input.param
-          : input.unbound ? '(default)' : fmt(input.literal));
+          : input.unbound
+              ? (input.def !== undefined
+                     ? `(default ${JSON.stringify(input.def)})` : '(default)')
+          : fmt(input.literal));
     }
   }
   if (node.outputs.length) {
