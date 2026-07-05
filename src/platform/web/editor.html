@@ -487,8 +487,31 @@ function applyParam(name, values, { fromRemote = false } = {}) {
     liveSend('set', { name, value: values.length === 1 ? values[0] : values })
         .catch((err) => console.log(`editor: set ${name}: ${err}`));
   }
+  // The editor is an authoring tool: a slider edit is a document edit —
+  // the declared default follows the value and persists like any other
+  // change (debounced; the runtimes already have the value via set).
+  // Consumer-side ephemeral overrides (§17.7) belong to the runtime's
+  // own future settings surface, not here. fromRemote skips persistence
+  // so two attached editors don't fight over the write.
+  if ((project || live) && !fromRemote &&
+      sceneSource?.parameters?.[name]) {
+    const decl = sceneSource.parameters[name];
+    decl.default = values.length === 1 ? values[0] : [...values];
+    clearTimeout(paramPersistTimer);
+    paramPersistTimer = setTimeout(() => {
+      const json = JSON.stringify(sceneSource, null, 2);
+      if (project) {
+        wasm?.writeAsset(projectRoot(), 'scene.json', json);
+        projectWriteThrough('scene.json', json + '\n');
+      } else if (live) {
+        liveSend('write-asset', { path: 'scene.json', contents: json + '\n' })
+            .catch((err) => console.log(`editor: persist ${name}: ${err}`));
+      }
+    }, 400);
+  }
   widgets.get(name)?.update(values);
 }
+let paramPersistTimer = null;
 
 // ---- scene document (the editor owns it; runtimes consume) ----------------
 
