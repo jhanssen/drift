@@ -267,6 +267,37 @@ const PortDef kVideoInputs[] = {
     { "playing", ValueType::Scalar, false, { 1, 0, 0, 0 } },
     { "restart", ValueType::Event, false },
 };
+// §18.3 particles — order must match ParticlesNode::Port exactly.
+const PortDef kParticlesInputs[] = {
+    { "rate", ValueType::Scalar, false, { 10 } },
+    { "burst", ValueType::Event, false },
+    { "burstCount", ValueType::Scalar, false, { 32 } },
+    { "origin", ValueType::Vec2, false, { 0.5, 0.5 } },
+    { "extent", ValueType::Vec2, false, { 0, 0 } },
+    { "direction", ValueType::Vec2, false, { 0, -1 } },
+    { "spread", ValueType::Scalar, false, { 180 } },
+    { "speed", ValueType::Vec2, false, { 0.05, 0.15 } },
+    { "lifetime", ValueType::Vec2, false, { 1, 3 } },
+    { "size", ValueType::Vec2, false, { 0.01, 0.03 } },
+    { "spin", ValueType::Vec2, false, { 0, 0 } },
+    { "colorStart", ValueType::Vec4, false, { 1, 1, 1, 1 } },
+    { "colorEnd", ValueType::Vec4, false, { 1, 1, 1, 0 } },
+    { "fadeIn", ValueType::Scalar, false, { 0.1 } },
+    { "sizeEnd", ValueType::Scalar, false, { 1 } },
+    { "gravity", ValueType::Vec2, false, { 0, 0 } },
+    { "drag", ValueType::Scalar, false, { 0 } },
+    { "turbulence", ValueType::Scalar, false, { 0 } },
+    { "turbulenceScale", ValueType::Scalar, false, { 4 } },
+    { "attractor", ValueType::Vec2, false, { 0.5, 0.5 } },
+    { "attract", ValueType::Scalar, false, { 0 } },
+    { "vortex", ValueType::Scalar, false, { 0 } },
+    { "time", ValueType::Scalar, true },
+};
+const PortDef kSpritesInputs[] = {
+    { "particles", ValueType::Buffer, true, {}, false,
+      ParticlesNode::kStride },
+    { "texture", ValueType::Texture, false },
+};
 
 struct OutputPortDef {
     const char* name;
@@ -517,6 +548,8 @@ bool Loader::parseNodes(const glz::generic& json)
             { "sequence", { "duration", "loop", "tracks" } },
             { "shader", { "shader", "size" } },
             { "compute", { "shader", "capacity", "dispatch" } },
+            { "particles", { "capacity", "emitter" } },
+            { "sprites", { "blend" } },
             { "image", { "src" } },
             { "video", { "src", "loop" } },
             { "transform", {} },
@@ -1204,6 +1237,70 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         }
         portsOut.assign(std::begin(kVideoInputs), std::end(kVideoInputs));
         return new VideoNode(std::move(decoder));
+    }
+
+    if (raw.type == "particles") {
+        const auto& obj = raw.json->get_object();
+        uint32_t capacity = 1000;
+        if (auto capIt = obj.find("capacity"); capIt != obj.end()) {
+            if (!capIt->second.is_number() || capIt->second.get_number() <= 0 ||
+                capIt->second.get_number() !=
+                    (double)(uint32_t)capIt->second.get_number()) {
+                fail("node '" + raw.id +
+                     "': 'capacity' must be a positive integer");
+                return nullptr;
+            }
+            capacity = (uint32_t)capIt->second.get_number();
+        }
+        ParticlesNode::Emitter emitter = ParticlesNode::Emitter::Point;
+        if (auto emitIt = obj.find("emitter"); emitIt != obj.end()) {
+            const std::string kind =
+                emitIt->second.is_string() ? emitIt->second.get_string() : "";
+            if (kind == "point") {
+                emitter = ParticlesNode::Emitter::Point;
+            } else if (kind == "box") {
+                emitter = ParticlesNode::Emitter::Box;
+            } else if (kind == "disc") {
+                emitter = ParticlesNode::Emitter::Disc;
+            } else {
+                fail("node '" + raw.id +
+                     "': 'emitter' must be \"point\", \"box\", or \"disc\"");
+                return nullptr;
+            }
+        }
+        // The emission window assumes a per-frame delta on 'time' (§18.3);
+        // an unbounded signal would emit rate×seconds every frame.
+        if (auto inputsIt = raw.inputs.find("time");
+            inputsIt != raw.inputs.end() &&
+            inputsIt->second.kind == RawInput::Kind::Conn &&
+            !(inputsIt->second.conn.node == "time" &&
+              inputsIt->second.conn.port == "delta")) {
+            warn("node '" + raw.id + "': 'time' should be wired from "
+                 "@time.delta (the per-frame simulation step)");
+        }
+        portsOut.assign(std::begin(kParticlesInputs),
+                        std::end(kParticlesInputs));
+        return new ParticlesNode(capacity, emitter);
+    }
+
+    if (raw.type == "sprites") {
+        const auto& obj = raw.json->get_object();
+        SpritesNode::Blend blend = SpritesNode::Blend::Add;
+        if (auto blendIt = obj.find("blend"); blendIt != obj.end()) {
+            const std::string mode =
+                blendIt->second.is_string() ? blendIt->second.get_string() : "";
+            if (mode == "add") {
+                blend = SpritesNode::Blend::Add;
+            } else if (mode == "over") {
+                blend = SpritesNode::Blend::Over;
+            } else {
+                fail("node '" + raw.id +
+                     "': 'blend' must be \"add\" or \"over\"");
+                return nullptr;
+            }
+        }
+        portsOut.assign(std::begin(kSpritesInputs), std::end(kSpritesInputs));
+        return new SpritesNode(blend);
     }
 
     if (raw.type == "transform") {

@@ -1735,6 +1735,492 @@ void ComputeNode::evaluate(FrameContext& ctx)
     }
 }
 
+// ---- ParticlesNode (§18.3) ----
+
+// The built-in emission + simulation kernel. Uniform fields split into the
+// wireable ports (matching ParticlesNode::Port names exactly) and the
+// CPU-computed emission window (dt, emitStart/emitCount/seedBase,
+// emitterKind). Reflection over this source is the uniform layout oracle —
+// no hand-maintained offsets.
+const char* kParticleSimWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, reserved: f32,
+}
+
+struct Params {
+    origin: vec2f, extent: vec2f,
+    direction: vec2f, gravity: vec2f,
+    attractor: vec2f, speed: vec2f,
+    lifetime: vec2f, size: vec2f,
+    spin: vec2f,
+    colorStart: vec4f, colorEnd: vec4f,
+    spread: f32, fadeIn: f32, sizeEnd: f32, drag: f32,
+    turbulence: f32, turbulenceScale: f32, attract: f32, vortex: f32,
+    dt: f32, emitStart: f32, emitCount: f32, seedBase: f32,
+    emitterKind: f32,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> prev: array<Particle>;
+@group(0) @binding(2) var<storage, read_write> state: array<Particle>;
+
+fn pcg(v: u32) -> u32 {
+    var x = v * 747796405u + 2891336453u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    return (x >> 22u) ^ x;
+}
+
+// Per-particle random streams keyed on the emission ordinal, so any
+// emission-time draw is recomputable in later frames from p.seed.
+fn rnd(n: u32, k: u32) -> f32 {
+    return f32(pcg(n ^ (k * 2654435769u))) / 4294967296.0;
+}
+
+// Life curves: premultiplied tint (§18.3 contract) with the fade-in ramp.
+fn shade(age: f32, lifetime: f32) -> vec4f {
+    let t = age / lifetime;
+    let c = mix(params.colorStart, params.colorEnd, t);
+    var a = c.a;
+    if (params.fadeIn > 0.0) {
+        a = a * clamp(age / params.fadeIn, 0.0, 1.0);
+    }
+    return vec4f(c.rgb * a, a);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    let cap = arrayLength(&state);
+    if (i >= cap) {
+        return;
+    }
+
+    // Emission ring window [emitStart, emitStart + emitCount) mod cap:
+    // the CPU advances the cursor, so the window is deterministic and the
+    // oldest slots recycle when the pool saturates.
+    let count = u32(params.emitCount);
+    let rel = (i + cap - (u32(params.emitStart) % cap)) % cap;
+    if (count > 0u && rel < count) {
+        let n = u32(params.seedBase) + rel;
+        var p: Particle;
+        var origin = params.origin;
+        let kind = u32(params.emitterKind);
+        if (kind == 1u) { // box
+            origin += (vec2f(rnd(n, 1u), rnd(n, 2u)) * 2.0 - 1.0) *
+                      params.extent;
+        } else if (kind == 2u) { // disc, area-uniform
+            let ang = rnd(n, 1u) * 6.2831853;
+            origin += sqrt(rnd(n, 2u)) * params.extent.x *
+                      vec2f(cos(ang), sin(ang));
+        }
+        let base = atan2(params.direction.y, params.direction.x);
+        let theta = base + radians(params.spread) * (rnd(n, 3u) - 0.5);
+        let speed = mix(params.speed.x, params.speed.y, rnd(n, 4u));
+        p.pos = vec3f(origin, 0.0);
+        p.vel = vec3f(cos(theta) * speed, sin(theta) * speed, 0.0);
+        p.age = 0.0;
+        p.lifetime = max(mix(params.lifetime.x, params.lifetime.y,
+                             rnd(n, 5u)), 0.001);
+        p.size = mix(params.size.x, params.size.y, rnd(n, 6u));
+        p.rotation = 360.0 * rnd(n, 9u);
+        p.seed = f32(n % 16777216u); // f32-exact emission ordinal
+        p.reserved = 0.0;
+        p.color = shade(0.0, p.lifetime);
+        state[i] = p;
+        return;
+    }
+
+    var p = prev[i];
+    if (p.lifetime == 0.0) {
+        state[i] = p;
+        return;
+    }
+    p.age += params.dt;
+    if (p.age >= p.lifetime) {
+        p.lifetime = 0.0; // dead slot (§18.3): renderers skip it
+        state[i] = p;
+        return;
+    }
+
+    let n = u32(p.seed);
+    var v = p.vel.xy;
+    v += params.gravity * params.dt;
+    v *= max(0.0, 1.0 - params.drag * params.dt);
+    if (params.turbulence != 0.0) {
+        let q = p.pos.xy * params.turbulenceScale;
+        let phase = rnd(n, 8u) * 6.2831853;
+        v += params.turbulence *
+             vec2f(sin(q.y * 6.2831853 + p.age + phase),
+                   cos(q.x * 6.2831853 - p.age + phase)) * params.dt;
+    }
+    if (params.attract != 0.0 || params.vortex != 0.0) {
+        let d = params.attractor - p.pos.xy;
+        let len = sqrt(max(dot(d, d), 1e-6));
+        v += (d / len) * params.attract * params.dt;
+        v += (vec2f(-d.y, d.x) / len) * params.vortex * params.dt;
+    }
+    p.vel = vec3f(v, 0.0);
+    p.pos += p.vel * params.dt;
+
+    let t = p.age / p.lifetime;
+    let emitSize = mix(params.size.x, params.size.y, rnd(n, 6u));
+    p.size = emitSize * mix(1.0, params.sizeEnd, t);
+    p.rotation += mix(params.spin.x, params.spin.y, rnd(n, 7u)) * params.dt;
+    p.color = shade(p.age, p.lifetime);
+    state[i] = p;
+}
+)";
+
+ParticlesNode::ParticlesNode(uint32_t capacity, Emitter emitter)
+    : mCapacity(capacity), mEmitter(emitter)
+{
+    std::string err;
+    WgslInterface::parse(kParticleSimWgsl, mIface, err); // own source: cannot fail
+
+    outputs.resize(1);
+    outputs[0].name = "result";
+    outputs[0].value.type = ValueType::Buffer;
+    outputs[0].value.bufStride = kStride;
+    outputs[0].value.bufCapacity = capacity;
+}
+
+bool ParticlesNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    wgpu::ShaderModule module = makeModule(ctx.device, kParticleSimWgsl);
+    if (!module) {
+        return false;
+    }
+    wgpu::ComputePipelineDescriptor desc{};
+    desc.compute.module = module;
+    desc.compute.entryPoint = "main";
+    mPipeline = ctx.device.CreateComputePipeline(&desc);
+
+    wgpu::BufferDescriptor ud{};
+    ud.size = mIface.uniformSize;
+    ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mUniforms = ctx.device.CreateBuffer(&ud);
+
+    for (int i = 0; i < 2; i++) {
+        wgpu::BufferDescriptor bd{};
+        bd.size = (uint64_t)kStride * mCapacity;
+        bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+        mState[i] = ctx.device.CreateBuffer(&bd); // zero-initialized: all dead
+    }
+    return mPipeline != nullptr;
+}
+
+void ParticlesNode::evaluate(FrameContext& ctx)
+{
+    if (!ensurePipeline(ctx)) {
+        return;
+    }
+
+    // Deterministic emission accounting: rate accumulates fractionally,
+    // bursts land whole, and the ring cursor maps the window onto slots.
+    const double dt = std::max(0.0, inputValue(PortTime).v[0]);
+    mAccum += std::max(0.0, inputValue(PortRate).v[0]) * dt;
+    uint32_t emit = (uint32_t)mAccum;
+    mAccum -= emit;
+    if (inputFired(PortBurst)) {
+        emit += (uint32_t)std::max(0.0, inputValue(PortBurstCount).v[0]);
+    }
+    emit = std::min(emit, mCapacity);
+    const uint32_t emitStart = mCursor;
+    mCursor = (mCursor + emit) % mCapacity;
+
+    std::vector<uint8_t> data(mIface.uniformSize, 0);
+    for (const auto& field : mIface.fields) {
+        Value v;
+        if (field.name == "dt") {
+            v.v[0] = dt;
+        } else if (field.name == "emitStart") {
+            v.v[0] = emitStart;
+        } else if (field.name == "emitCount") {
+            v.v[0] = emit;
+        } else if (field.name == "seedBase") {
+            v.v[0] = std::fmod(mEmitted, 16777216.0); // stays f32-exact
+        } else if (field.name == "emitterKind") {
+            v.v[0] = (double)(int)mEmitter;
+        } else {
+            // The kernel's port fields are named exactly like the input
+            // ports; Port enum order matches the loader's table.
+            static const std::map<std::string, Port> kByName = {
+                { "origin", PortOrigin }, { "extent", PortExtent },
+                { "direction", PortDirection }, { "gravity", PortGravity },
+                { "attractor", PortAttractor }, { "speed", PortSpeed },
+                { "lifetime", PortLifetime }, { "size", PortSize },
+                { "spin", PortSpin }, { "colorStart", PortColorStart },
+                { "colorEnd", PortColorEnd }, { "spread", PortSpread },
+                { "fadeIn", PortFadeIn }, { "sizeEnd", PortSizeEnd },
+                { "drag", PortDrag }, { "turbulence", PortTurbulence },
+                { "turbulenceScale", PortTurbulenceScale },
+                { "attract", PortAttract }, { "vortex", PortVortex },
+            };
+            v = inputValue(kByName.at(field.name));
+        }
+        const int n = componentCount(field.type);
+        float f[4];
+        for (int c = 0; c < n; ++c) {
+            f[c] = (float)v.v[c];
+        }
+        std::memcpy(data.data() + field.offset, f, n * sizeof(float));
+    }
+    mEmitted += emit;
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, data.data(), data.size());
+
+    const int back = 1 - mFront;
+    std::vector<wgpu::BindGroupEntry> entries(3);
+    entries[0].binding = 0;
+    entries[0].buffer = mUniforms;
+    entries[0].size = mIface.uniformSize;
+    entries[1].binding = 1;
+    entries[1].buffer = mState[mFront];
+    entries[1].size = (uint64_t)kStride * mCapacity;
+    entries[2].binding = 2;
+    entries[2].buffer = mState[back];
+    entries[2].size = (uint64_t)kStride * mCapacity;
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = mPipeline.GetBindGroupLayout(0);
+    bgd.entryCount = entries.size();
+    bgd.entries = entries.data();
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgd);
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+    pass.SetPipeline(mPipeline);
+    pass.SetBindGroup(0, group);
+    pass.DispatchWorkgroups((mCapacity + 63) / 64, 1, 1);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    mFront = back;
+    outputs[0].value.buffer = mState[mFront];
+    outputs[0].dirty = true; // §18.1: dirty whenever the node executes
+}
+
+// ---- SpritesNode (§18.3) ----
+
+// Instanced quads from the Particle contract: 4-vertex strip per instance,
+// dead slots collapse to a degenerate point. DISC/TEXTURED selects the
+// fragment via string replacement at pipeline build.
+const char* kSpritesWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, reserved: f32,
+}
+
+struct Params { aspect: f32 }
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> pts: array<Particle>;
+//TEXTURE_BINDINGS
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+    @location(1) color: vec4f,
+}
+
+@vertex
+fn drift_sprite_vs(@builtin(vertex_index) v: u32,
+                   @builtin(instance_index) i: u32) -> VsOut {
+    var out: VsOut;
+    let p = pts[i];
+    if (p.lifetime == 0.0) {
+        out.pos = vec4f(0.0, 0.0, 0.0, 1.0); // degenerate: nothing rastered
+        return out;
+    }
+    let corner = vec2f(f32(v & 1u), f32((v >> 1u) & 1u)) * 2.0 - 1.0;
+    let c = cos(radians(p.rotation));
+    let s = sin(radians(p.rotation));
+    // size is a fraction of output height (§18.3); x corrects for aspect.
+    let r = vec2f(c * corner.x - s * corner.y, s * corner.x + c * corner.y) *
+            p.size;
+    let pos = p.pos.xy + vec2f(r.x / params.aspect, r.y);
+    out.pos = vec4f(pos.x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
+    out.uv = corner * 0.5 + 0.5;
+    out.color = p.color;
+    return out;
+}
+
+@fragment
+fn drift_sprite_fs(@location(0) uv: vec2f,
+                   @location(1) color: vec4f) -> @location(0) vec4f {
+    //FRAGMENT
+}
+)";
+
+const char* kSpriteDiscFragment = R"(
+    let d2 = dot(uv * 2.0 - 1.0, uv * 2.0 - 1.0);
+    let a = max(0.0, 1.0 - d2);
+    return color * a * a;
+)";
+
+const char* kSpriteTexturedFragment = R"(
+    return textureSample(sprite, sprite_sampler, uv) * color;
+)";
+
+const char* kSpriteTextureBindings = R"(
+@group(0) @binding(2) var sprite: texture_2d<f32>;
+@group(0) @binding(3) var sprite_sampler: sampler;
+)";
+
+SpritesNode::SpritesNode(Blend blend)
+    : mBlend(blend)
+{
+    outputs.resize(1);
+    outputs[0].name = "result";
+    outputs[0].value.type = ValueType::Texture;
+}
+
+bool SpritesNode::ensurePipeline(FrameContext& ctx)
+{
+    // Bound-ness of the sprite texture is static after load.
+    mTextured = inputs.size() > 1 && inputs[1].srcNode != nullptr;
+    if (mPipeline) {
+        return true;
+    }
+    std::string source = kSpritesWgsl;
+    const auto replace = [&](const char* tag, const char* text) {
+        source.replace(source.find(tag), std::strlen(tag), text);
+    };
+    replace("//TEXTURE_BINDINGS", mTextured ? kSpriteTextureBindings : "");
+    replace("//FRAGMENT",
+            mTextured ? kSpriteTexturedFragment : kSpriteDiscFragment);
+    wgpu::ShaderModule module = makeModule(ctx.device, source);
+    if (!module) {
+        return false;
+    }
+
+    wgpu::BlendState blend{};
+    blend.color.srcFactor = wgpu::BlendFactor::One;
+    blend.color.dstFactor = mBlend == Blend::Add
+        ? wgpu::BlendFactor::One
+        : wgpu::BlendFactor::OneMinusSrcAlpha;
+    blend.alpha = blend.color;
+    wgpu::ColorTargetState color{};
+    color.format = wgpu::TextureFormat::RGBA16Float;
+    color.blend = &blend;
+
+    wgpu::FragmentState fragment{};
+    fragment.module = module;
+    fragment.entryPoint = "drift_sprite_fs";
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = "drift_sprite_vs";
+    desc.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
+    desc.fragment = &fragment;
+    mPipeline = ctx.device.CreateRenderPipeline(&desc);
+
+    wgpu::BufferDescriptor ud{};
+    ud.size = 16;
+    ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mUniforms = ctx.device.CreateBuffer(&ud);
+    if (mTextured) {
+        mSampler = makeLinearClampSampler(ctx.device);
+    }
+    return mPipeline != nullptr;
+}
+
+void SpritesNode::evaluate(FrameContext& ctx)
+{
+    if (!ensurePipeline(ctx)) {
+        return;
+    }
+    const Value particles = inputValue(0);
+    if (!particles.buffer) {
+        return; // the producer has not run yet
+    }
+    if (mTextured && !inputValue(1).texture) {
+        return;
+    }
+
+    const uint32_t width = ctx.targetWidth, height = ctx.targetHeight;
+    if (!mColor || width != mWidth || height != mHeight) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { width, height, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
+        mColor = ctx.device.CreateTexture(&desc);
+        mWidth = width;
+        mHeight = height;
+    }
+
+    const float aspect[4] = { (float)width / (float)height, 0, 0, 0 };
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, aspect, sizeof(aspect));
+
+    std::vector<wgpu::BindGroupEntry> entries;
+    {
+        wgpu::BindGroupEntry e{};
+        e.binding = 0;
+        e.buffer = mUniforms;
+        e.size = 16;
+        entries.push_back(e);
+    }
+    {
+        wgpu::BindGroupEntry e{};
+        e.binding = 1;
+        e.buffer = particles.buffer;
+        e.size = (uint64_t)particles.bufStride * particles.bufCapacity;
+        entries.push_back(e);
+    }
+    if (mTextured) {
+        wgpu::BindGroupEntry t{};
+        t.binding = 2;
+        t.textureView = inputValue(1).texture.CreateView();
+        entries.push_back(t);
+        wgpu::BindGroupEntry s{};
+        s.binding = 3;
+        s.sampler = mSampler;
+        entries.push_back(s);
+    }
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = mPipeline.GetBindGroupLayout(0);
+    bgd.entryCount = entries.size();
+    bgd.entries = entries.data();
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgd);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mColor.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+    wgpu::RenderPassDescriptor rpd{};
+    rpd.colorAttachmentCount = 1;
+    rpd.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rpd);
+    pass.SetPipeline(mPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(4, particles.bufCapacity);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mColor;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+}
+
 // ---- OutputNode ----
 
 OutputNode::OutputNode()

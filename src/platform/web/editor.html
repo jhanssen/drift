@@ -1447,6 +1447,8 @@ const NODE_OUTPUTS = {
   image: [['result', 'texture']],
   video: [['result', 'texture'], ['finished', 'event']],
   shader: [['result', 'texture']],
+  particles: [['result', 'buffer']],
+  sprites: [['result', 'texture']],
   transform: [['result', 'texture']],
   compositor: [['result', 'texture']],
   output: [],
@@ -1465,6 +1467,16 @@ const IMPLICIT_OUTPUTS = {
 const NODE_INPUTS = {
   image: [],
   video: [['playing', 'value'], ['restart', 'event']],
+  particles: [['rate', 'value'], ['burst', 'event'], ['burstCount', 'value'],
+              ['origin', 'value'], ['extent', 'value'],
+              ['direction', 'value'], ['spread', 'value'], ['speed', 'value'],
+              ['lifetime', 'value'], ['size', 'value'], ['spin', 'value'],
+              ['colorStart', 'value'], ['colorEnd', 'value'],
+              ['fadeIn', 'value'], ['sizeEnd', 'value'], ['gravity', 'value'],
+              ['drag', 'value'], ['turbulence', 'value'],
+              ['turbulenceScale', 'value'], ['attractor', 'value'],
+              ['attract', 'value'], ['vortex', 'value'], ['time', 'value']],
+  sprites: [['particles', 'buffer'], ['texture', 'texture']],
   transform: [['source', 'texture'], ['position', 'value'],
               ['rotation', 'value'], ['scale', 'value'], ['anchor', 'value'],
               ['opacity', 'value']],
@@ -2149,10 +2161,11 @@ window.addEventListener('mousedown', (e) => {
 // Defaults keep a fresh node valid where possible (wave/sequence tick along
 // immediately); nodes with required texture ports (transform, output-like)
 // stay a draft until wired — that is the expected add-then-wire flow.
-const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'transform',
-                      'compositor', 'sequence', 'wave', 'remap', 'combine',
-                      'split', 'parameter'];
+const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'particles',
+                      'sprites', 'transform', 'compositor', 'sequence',
+                      'wave', 'remap', 'combine', 'split', 'parameter'];
 const NODE_DEFAULT_INPUTS = {
+  particles: { time: '@time.delta' },
   wave: { input: '@time.seconds' },
   sequence: { time: '@time.seconds' },
   remap: { value: 0 },

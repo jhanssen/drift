@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "Sparks",
+  "description": "The §18.3 particle nodes: embers rise at a steady rate, erupt on sequence cues, and drift toward the pointer — all simulated on the GPU.",
+  "parameters": {
+    "intensity": { "type": "scalar", "default": 1, "min": 0, "max": 3,
+                   "label": "Ember rate" }
+  },
+  "nodes": [
+    { "id": "cues", "type": "sequence", "duration": 10, "loop": true,
+      "tracks": [
+        { "name": "boom", "kind": "event", "fires": [ 2, 7 ] },
+        { "name": "wind", "kind": "value", "type": "scalar", "interpolate": "smooth",
+          "keys": [ { "t": 0, "value": 0.05 }, { "t": 5, "value": 0.25 },
+                    { "t": 10, "value": 0.05 } ] }
+      ],
+      "inputs": { "time": "@time.seconds" } },
+
+    { "id": "emberRate", "type": "remap", "clamp": false,
+      "inputs": { "value": "$intensity", "inMin": 0, "inMax": 1,
+                  "outMin": 0, "outMax": 30 } },
+
+    { "id": "embers", "type": "particles", "capacity": 2000, "emitter": "box",
+      "inputs": { "time": "@time.delta",
+                  "rate": "@emberRate",
+                  "burst": "@cues.boom", "burstCount": 400,
+                  "origin": [0.5, 0.92], "extent": [0.35, 0.02],
+                  "direction": [0, -1], "spread": 40,
+                  "speed": [0.06, 0.22], "lifetime": [1.5, 3.5],
+                  "size": [0.006, 0.018], "sizeEnd": 0.4, "fadeIn": 0.15,
+                  "gravity": [0, -0.02], "drag": 0.35,
+                  "turbulence": "@cues.wind", "turbulenceScale": 5,
+                  "attractor": "@mouse.position", "attract": 0.05,
+                  "colorStart": [1.0, 0.75, 0.30, 1.0],
+                  "colorEnd": [0.9, 0.15, 0.05, 0.0] } },
+
+    { "id": "glitter", "type": "sprites", "inputs": { "particles": "@embers" } },
+
+    { "id": "bg", "type": "shader", "shader": "shaders/night.wgsl",
+      "inputs": { "shift": "@cues.wind" } },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@bg", "@glitter"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

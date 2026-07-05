@@ -83,6 +83,11 @@ const char* kNoOutputsWgsl = R"(
     @compute @workgroup_size(64) fn main() {}
 )";
 
+const char* kVec4ProducerWgsl = R"(
+    @group(0) @binding(0) var<storage, read_write> pts: array<vec4f>;
+    @compute @workgroup_size(64) fn main() {}
+)";
+
 // A valid 2x2 RGBA PNG.
 const unsigned char kTinyPng[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2,
@@ -243,6 +248,7 @@ LoadResult load(const std::string& json,
         { "shaders/paint.wgsl", kPaintWgsl },
         { "shaders/vec4consumer.wgsl", kVec4ConsumerWgsl },
         { "shaders/nooutputs.wgsl", kNoOutputsWgsl },
+        { "shaders/vec4producer.wgsl", kVec4ProducerWgsl },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
         { "assets/tiny.webp",
@@ -953,6 +959,84 @@ TEST_CASE("compute validation (§13 additions)")
                                 "previous": true } } })");
     CHECK(r.scene == nullptr);
     CHECK(r.hasError("'dispatch'"));
+}
+
+TEST_CASE("particles + sprites load with defaults and wired ports (§18.3)")
+{
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "nodes": [
+            { "id": "cues", "type": "sequence", "duration": 8, "loop": true,
+              "tracks": [ { "name": "boom", "kind": "event", "fires": [2] } ],
+              "inputs": { "time": "@time.seconds" } },
+            { "id": "p", "type": "particles", "capacity": 500,
+              "emitter": "disc",
+              "inputs": { "time": "@time.delta", "burst": "@cues.boom",
+                          "attractor": "@mouse.position", "rate": 25,
+                          "speed": [0.1, 0.3] } },
+            { "id": "s", "type": "sprites", "blend": "over",
+              "inputs": { "particles": "@p" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@s" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    CHECK(r.warnings.empty());
+    CHECK(r.scene->animated());
+}
+
+TEST_CASE("particles/sprites validation (§18.3)")
+{
+    const char* kOut = R"(,
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ] })";
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    kOut);
+    };
+
+    // sprites requires its particle buffer.
+    auto r = scene(R"(
+        { "id": "s", "type": "sprites" })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("required input 'particles' missing"));
+
+    // ...of the Particle stride: a vec4 buffer is refused.
+    r = scene(R"(
+        { "id": "gen", "type": "compute", "shader": "shaders/vec4producer.wgsl",
+          "capacity": 8 },
+        { "id": "s", "type": "sprites", "inputs": { "particles": "@gen" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("stride mismatch"));
+
+    // Property validation.
+    r = scene(R"(
+        { "id": "p", "type": "particles", "emitter": "cone",
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'emitter'"));
+    r = scene(R"(
+        { "id": "p", "type": "particles", "capacity": -5,
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'capacity'"));
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "s", "type": "sprites", "blend": "screen",
+          "inputs": { "particles": "@p" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'blend'"));
+
+    // The emission window wants a per-frame delta, not absolute time.
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.seconds" } })");
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("@time.delta"));
 }
 
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")

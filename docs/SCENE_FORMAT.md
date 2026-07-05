@@ -865,12 +865,16 @@ nodes" bullet is partially discharged by §17.7's arithmetic nodes.
 
 ## 18. Buffers, Compute, and Particles
 
-Status: **§18.1 and §18.2 adopted and implemented 2026-07-04** (see
-`examples/swarm.sceneproject` for the idioms, golden-tested; buffer
-feedback is realized as history copies exactly like textures). §18.3 (the
-particle nodes) remains a proposal. Simulation runs on the GPU: state lives
-in storage buffers, emission and update are compute passes, rendering is an
-instanced draw. The CPU contributes uniforms.
+Status: **fully adopted and implemented 2026-07-04** — §18.1/§18.2 with
+`examples/swarm.sceneproject` (raw compute idioms), §18.3 with
+`examples/sparks.sceneproject` (the stock particle nodes: cue-driven
+bursts, pointer attraction, life curves), both golden-tested. Buffer
+feedback is realized as history copies exactly like textures. Simulation
+runs on the GPU: state lives in storage buffers, emission and update are
+compute passes, rendering is an instanced draw. The CPU contributes
+uniforms — for `particles`, that is dt plus the deterministic emission
+window (rate accumulator and burst counts mapped onto a ring cursor, so
+the oldest slots recycle at capacity).
 
 Authoring note (non-normative): WGSL reserved words (`target`, `filter`,
 `sample`, …) are rejected by the compiler as binding names even though the
@@ -958,7 +962,7 @@ struct Particle {         // 64 bytes; the buffer contract for stock nodes.
     pos: vec3f,           // x/y in output space (§9 conventions); z is
                           // depth, reserved — the v1 simulation writes 0
     age: f32,             // seconds since emission
-    vel: vec3f,           // output-heights per second; z reserved
+    vel: vec3f,           // output-space units per second; z reserved
     lifetime: f32,        // seconds; 0 = dead slot (renderers skip it)
     color: vec4f,         // premultiplied tint
     size: f32,            // fraction of output height (§9.4 sizing spirit)

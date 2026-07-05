@@ -277,6 +277,67 @@ private:
     uint32_t mTexWidth = 0, mTexHeight = 0;
 };
 
+// §18.3 particles: GPU emission + simulation over one pool. The CPU's whole
+// contribution per frame is the uniform block: dt, the deterministic
+// emission window (rate accumulator + burst counts mapped onto a ring
+// cursor), and the current values of the wireable ports. Per-particle
+// randomness derives from a stored emission ordinal, so emission-time
+// quantities (size, spin) are recomputable in later frames without extra
+// state. Internally double-buffered; the §18.3 Particle contract is the
+// output.
+class ParticlesNode : public Node {
+public:
+    enum class Emitter { Point, Box, Disc };
+    // Input port order — the loader's port table must match.
+    enum Port : size_t {
+        PortRate, PortBurst, PortBurstCount, PortOrigin, PortExtent,
+        PortDirection, PortSpread, PortSpeed, PortLifetime, PortSize,
+        PortSpin, PortColorStart, PortColorEnd, PortFadeIn, PortSizeEnd,
+        PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
+        PortAttractor, PortAttract, PortVortex, PortTime, PortCount,
+    };
+    static constexpr uint32_t kStride = 64; // the Particle contract
+
+    ParticlesNode(uint32_t capacity, Emitter emitter);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    const uint32_t mCapacity;
+    const Emitter mEmitter;
+    WgslInterface mIface; // built-in kernel reflection: the layout oracle
+
+    wgpu::ComputePipeline mPipeline;
+    wgpu::Buffer mUniforms;
+    wgpu::Buffer mState[2]; // ping-pong pool
+    int mFront = 0;
+    double mAccum = 0.0;    // fractional emissions carried between frames
+    double mEmitted = 0.0;  // total emissions: the RNG ordinal base
+    uint32_t mCursor = 0;   // next emission slot (ring)
+};
+
+// §18.3 sprites: instanced draw of a Particle buffer into an output-sized
+// premultiplied layer — one quad per slot, dead slots degenerate. The
+// fragment is either a built-in soft disc or the optional sprite texture.
+class SpritesNode : public Node {
+public:
+    enum class Blend { Add, Over };
+    explicit SpritesNode(Blend blend);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    const Blend mBlend;
+    wgpu::RenderPipeline mPipeline;
+    bool mTextured = false;
+    wgpu::Buffer mUniforms;
+    wgpu::Sampler mSampler;
+    wgpu::Texture mColor;
+    uint32_t mWidth = 0, mHeight = 0;
+};
+
 // §9.6 output: blits the final linear texture to the platform target with
 // sRGB encoding.
 class OutputNode : public Node {
