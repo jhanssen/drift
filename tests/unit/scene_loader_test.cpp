@@ -1531,6 +1531,41 @@ TEST_CASE("fit node (§17.1)")
     CHECK(r.hasError("required input 'source' missing"));
 }
 
+TEST_CASE("compositor blend modes (§9.5)")
+{
+    auto scene = [&](const std::string& comp) {
+        return load(R"({
+            "version": 1, "name": "x",
+            "nodes": [
+                { "id": "a", "type": "shader", "shader": "shaders/minimal.wgsl",
+                  "inputs": { "phase": 0.2 } },
+                { "id": "b", "type": "shader", "shader": "shaders/minimal.wgsl",
+                  "inputs": { "phase": 0.8 } },
+                )" + comp + R"(,
+                { "id": "out", "type": "output", "inputs": { "color": "@c" } }
+            ]
+        })");
+    };
+    auto r = scene(R"({ "id": "c", "type": "compositor",
+                        "blend": ["over", "add"],
+                        "inputs": { "layers": ["@a", "@b"] } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    r = scene(R"({ "id": "c", "type": "compositor",
+                   "blend": ["burn"],
+                   "inputs": { "layers": ["@a", "@b"] } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("blend mode must be"));
+
+    r = scene(R"({ "id": "c", "type": "compositor",
+                   "blend": ["over", "add", "screen"],
+                   "inputs": { "layers": ["@a", "@b"] } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("more entries than layers"));
+}
+
 TEST_CASE("packages: references, pins, self-containment (§20)")
 {
     auto scene = [&](const std::string& extra, const std::string& nodes) {

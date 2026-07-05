@@ -2239,8 +2239,47 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
     }
 
     if (raw.type == "compositor") {
+        std::vector<CompositorNode::Blend> blends;
+        const auto& obj = raw.json->get_object();
+        if (auto blendIt = obj.find("blend"); blendIt != obj.end()) {
+            if (!blendIt->second.is_array()) {
+                fail("node '" + raw.id +
+                     "': 'blend' must be an array of modes, one per layer "
+                     "(§9.5)");
+                return nullptr;
+            }
+            size_t layerCount = 0;
+            if (auto it = raw.inputs.find("layers");
+                it != raw.inputs.end()) {
+                layerCount = it->second.elements.size();
+            }
+            const auto& arr = blendIt->second.get_array();
+            if (arr.size() > layerCount) {
+                fail("node '" + raw.id +
+                     "': 'blend' has more entries than layers (§9.5)");
+                return nullptr;
+            }
+            for (const auto& entry : arr) {
+                const std::string m =
+                    entry.is_string() ? entry.get_string() : std::string();
+                if (m == "over") {
+                    blends.push_back(CompositorNode::Blend::Over);
+                } else if (m == "add") {
+                    blends.push_back(CompositorNode::Blend::Add);
+                } else if (m == "multiply") {
+                    blends.push_back(CompositorNode::Blend::Multiply);
+                } else if (m == "screen") {
+                    blends.push_back(CompositorNode::Blend::Screen);
+                } else {
+                    fail("node '" + raw.id + "': blend mode must be "
+                         "\"over\", \"add\", \"multiply\" or \"screen\" "
+                         "(§9.5)");
+                    return nullptr;
+                }
+            }
+        }
         portsOut.assign(std::begin(kCompositorInputs), std::end(kCompositorInputs));
-        return new CompositorNode();
+        return new CompositorNode(std::move(blends));
     }
 
     if (raw.type == "output") {

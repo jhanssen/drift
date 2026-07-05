@@ -287,16 +287,33 @@ mode is reserved for a future version.
 
 ### 9.5 `compositor`
 
-Stacks layers bottom-to-top with premultiplied source-over blending.
+Stacks layers bottom-to-top; each layer blends with what is beneath it
+per its declared mode.
 
-| Kind   | Name     | Type        | Default | Notes                          |
-|--------|----------|-------------|---------|--------------------------------|
-| input  | `layers` | `texture[]` | —       | array of texture references, bottom first |
-| output | `result`†| `texture`   |         |                                |
+| Kind     | Name     | Type        | Default | Notes                          |
+|----------|----------|-------------|---------|--------------------------------|
+| property | `blend`  | `string[]`  | `[]`    | per-layer modes, aligned with `layers`; missing entries are `over` |
+| input    | `layers` | `texture[]` | —       | array of texture references, bottom first |
+| output   | `result`†| `texture`   |         |                                |
 
 `texture[]` is an array-valued port: its JSON value is an array whose elements
-each follow the reference grammar. v1 supports only source-over; per-layer
-blend modes are reserved.
+each follow the reference grammar.
+
+Blend modes, over premultiplied linear values (s = layer, d = beneath); a
+fully transparent source pixel leaves the destination unchanged in every
+mode:
+
+| Mode       | Color                | Notes                              |
+|------------|----------------------|------------------------------------|
+| `over`     | `s + d·(1−sa)`       | default; ordinary layering        |
+| `add`      | `s + d`              | light: glows, particles, flares    |
+| `multiply` | `d·(s + (1−sa))`     | darken: shadows, vignettes, masks  |
+| `screen`   | `s + d·(1−s)`        | brighten without add's blow-out    |
+
+Alpha composites source-over in every mode except `add`, which accumulates
+it. `blend` longer than `layers` is a load error. The stack starts from
+transparent black, so a `multiply` bottom layer multiplies with nothing —
+put it above the content it darkens.
 
 ### 9.6 `output`
 

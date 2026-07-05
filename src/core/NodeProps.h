@@ -49,6 +49,7 @@ inline constexpr NodePropDef kNodeProps[] = {
     { "sprites", "sheet", "json", false, nullptr, nullptr },
     { "trails", "blend", "enum", false, "\"add\"", "add over" },
     { "trails", "length", "int", false, "16", nullptr },
+    { "compositor", "blend", "json", false, nullptr, nullptr },
     { "fit", "mode", "enum", false, "\"cover\"", "cover contain stretch" },
     { "graph", "graph", "asset", true, nullptr, nullptr },
 };

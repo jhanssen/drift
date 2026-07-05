@@ -220,16 +220,21 @@ private:
 };
 
 // §9.5 compositor: stacks its inputs (all texture layers, bottom first) into
-// a scene-output-sized target with premultiplied source-over blending.
+// a scene-output-sized target. Each layer blends with what is beneath it
+// per its declared mode (premultiplied, linear): over (default), add,
+// multiply, screen.
 class CompositorNode : public Node {
 public:
-    CompositorNode();
+    enum class Blend { Over, Add, Multiply, Screen };
+    explicit CompositorNode(std::vector<Blend> blends); // per layer; short
+                                                        // list ⇒ over
     void evaluate(FrameContext& ctx) override;
 
 private:
     bool ensurePipeline(FrameContext& ctx);
 
-    wgpu::RenderPipeline mPipeline;
+    std::vector<Blend> mBlends;
+    wgpu::RenderPipeline mPipelines[4];
     wgpu::Sampler mSampler;
     wgpu::Texture mColor;
     uint32_t mWidth = 0, mHeight = 0;

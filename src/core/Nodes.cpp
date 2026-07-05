@@ -1368,7 +1368,8 @@ fn composite_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
 
 } // namespace
 
-CompositorNode::CompositorNode()
+CompositorNode::CompositorNode(std::vector<Blend> blends)
+    : mBlends(std::move(blends))
 {
     outputs.resize(1);
     outputs[0].value.type = ValueType::Texture;
@@ -1376,7 +1377,7 @@ CompositorNode::CompositorNode()
 
 bool CompositorNode::ensurePipeline(FrameContext& ctx)
 {
-    if (mPipeline) {
+    if (mPipelines[0]) {
         return true;
     }
     const std::string source = std::string(kVertexPrelude) + kCompositeShader;
@@ -1385,30 +1386,54 @@ bool CompositorNode::ensurePipeline(FrameContext& ctx)
         return false;
     }
 
-    // Premultiplied source-over (§9.5).
-    wgpu::BlendState blend{};
-    blend.color.srcFactor = wgpu::BlendFactor::One;
-    blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
-    blend.alpha.srcFactor = wgpu::BlendFactor::One;
-    blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+    // Per-mode blend states over premultiplied linear layers (§9.5).
+    // Transparent source pixels leave the destination unchanged in every
+    // mode; the formulas are the premultiplied forms.
+    const auto make = [&](Blend mode) {
+        wgpu::BlendState blend{};
+        blend.alpha.srcFactor = wgpu::BlendFactor::One;
+        blend.alpha.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+        switch (mode) {
+        case Blend::Over: // s + d(1-sa)
+            blend.color.srcFactor = wgpu::BlendFactor::One;
+            blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+            break;
+        case Blend::Add: // s + d
+            blend.color.srcFactor = wgpu::BlendFactor::One;
+            blend.color.dstFactor = wgpu::BlendFactor::One;
+            blend.alpha.dstFactor = wgpu::BlendFactor::One;
+            break;
+        case Blend::Multiply: // d(s + (1-sa))
+            blend.color.srcFactor = wgpu::BlendFactor::Dst;
+            blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+            break;
+        case Blend::Screen: // s + d(1-s)
+            blend.color.srcFactor = wgpu::BlendFactor::One;
+            blend.color.dstFactor = wgpu::BlendFactor::OneMinusSrc;
+            break;
+        }
 
-    wgpu::ColorTargetState color{};
-    color.format = wgpu::TextureFormat::RGBA16Float;
-    color.blend = &blend;
+        wgpu::ColorTargetState color{};
+        color.format = wgpu::TextureFormat::RGBA16Float;
+        color.blend = &blend;
 
-    wgpu::FragmentState fragment{};
-    fragment.module = module;
-    fragment.entryPoint = "composite_fs";
-    fragment.targetCount = 1;
-    fragment.targets = &color;
+        wgpu::FragmentState fragment{};
+        fragment.module = module;
+        fragment.entryPoint = "composite_fs";
+        fragment.targetCount = 1;
+        fragment.targets = &color;
 
-    wgpu::RenderPipelineDescriptor desc{};
-    desc.vertex.module = module;
-    desc.vertex.entryPoint = "drift_vs";
-    desc.fragment = &fragment;
-    mPipeline = ctx.device.CreateRenderPipeline(&desc);
-    if (!mPipeline) {
-        return false;
+        wgpu::RenderPipelineDescriptor desc{};
+        desc.vertex.module = module;
+        desc.vertex.entryPoint = "drift_vs";
+        desc.fragment = &fragment;
+        return ctx.device.CreateRenderPipeline(&desc);
+    };
+    for (int i = 0; i < 4; ++i) {
+        mPipelines[i] = make((Blend)i);
+        if (!mPipelines[i]) {
+            return false;
+        }
     }
     mSampler = makeLinearClampSampler(ctx.device);
     return true;
@@ -1444,19 +1469,21 @@ void CompositorNode::evaluate(FrameContext& ctx)
 
     wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
     wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
-    pass.SetPipeline(mPipeline);
     for (size_t i = 0; i < inputs.size(); ++i) {
         const Value layer = inputValue(i);
         if (!layer.texture) {
             continue;
         }
+        const Blend mode = i < mBlends.size() ? mBlends[i] : Blend::Over;
+        const wgpu::RenderPipeline& pipeline = mPipelines[(int)mode];
+        pass.SetPipeline(pipeline);
         wgpu::BindGroupEntry entries[2] = {};
         entries[0].binding = 0;
         entries[0].textureView = layer.texture.CreateView();
         entries[1].binding = 1;
         entries[1].sampler = mSampler;
         wgpu::BindGroupDescriptor bgDesc{};
-        bgDesc.layout = mPipeline.GetBindGroupLayout(0);
+        bgDesc.layout = pipeline.GetBindGroupLayout(0);
         bgDesc.entryCount = 2;
         bgDesc.entries = entries;
         pass.SetBindGroup(0, ctx.device.CreateBindGroup(&bgDesc));
