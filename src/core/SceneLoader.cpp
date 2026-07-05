@@ -281,6 +281,38 @@ const PortDef kCombineInputs[] = {
 const PortDef kSplitInputs[] = {
     { "value", kPoly, true },
 };
+const PortDef kAddInputs[] = {
+    { "a", kPoly, true },
+    { "b", kPoly, false, { 0, 0, 0, 0 } },
+};
+const PortDef kMultiplyInputs[] = {
+    { "a", kPoly, true },
+    { "b", kPoly, false, { 1, 1, 1, 1 } },
+};
+const PortDef kMixInputs[] = {
+    { "a", kPoly, true },
+    { "b", kPoly, true },
+    { "t", ValueType::Scalar, false, { 0.5, 0, 0, 0 } },
+};
+const PortDef kClampInputs[] = {
+    { "value", kPoly, true },
+    { "lo", kPoly, false, { 0, 0, 0, 0 } },
+    { "hi", kPoly, false, { 1, 1, 1, 1 } },
+};
+const PortDef kNoiseInputs[] = {
+    { "input", ValueType::Scalar, true },
+    { "frequency", ValueType::Scalar, false, { 1, 0, 0, 0 } },
+    { "seed", ValueType::Scalar, false, { 0, 0, 0, 0 } },
+};
+const PortDef kDampInputs[] = {
+    { "value", kPoly, true },
+    { "time", ValueType::Scalar, true },
+    { "halflife", ValueType::Scalar, false, { 0.2, 0, 0, 0 } },
+};
+const PortDef kEdgeInputs[] = {
+    { "value", ValueType::Scalar, true },
+    { "threshold", ValueType::Scalar, false, { 0.5, 0, 0, 0 } },
+};
 const PortDef kOutputInputs[] = {
     { "color", ValueType::Texture, true },
 };
@@ -1506,6 +1538,91 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         auto* node = new RemapNode(clamp);
         node->outputs[0].value.type = t;
         return node;
+    }
+
+    const bool isArithmetic = raw.type == "add" || raw.type == "multiply" ||
+                              raw.type == "mix" || raw.type == "clamp";
+    if (isArithmetic || raw.type == "damp") {
+        // Resolve T from the first input (§4 polymorphic ports), like
+        // remap; scalar-typed ports (mix.t, damp.time/halflife) stay
+        // scalar.
+        const char* first =
+            raw.type == "clamp" || raw.type == "damp" ? "value" : "a";
+        auto firstIt = raw.inputs.find(first);
+        if (firstIt == raw.inputs.end()) {
+            fail("node '" + raw.id + "': required input '" +
+                 std::string(first) + "' missing");
+            return nullptr;
+        }
+        ValueType t;
+        if (!resolveInputType(raw, firstIt->second, t)) {
+            return nullptr;
+        }
+        if (t == ValueType::Texture || t == ValueType::Event) {
+            fail("node '" + raw.id + "': '" + std::string(first) +
+                 "' must be a value");
+            return nullptr;
+        }
+        if (raw.type == "add") {
+            portsOut.assign(std::begin(kAddInputs), std::end(kAddInputs));
+        } else if (raw.type == "multiply") {
+            portsOut.assign(std::begin(kMultiplyInputs),
+                            std::end(kMultiplyInputs));
+        } else if (raw.type == "mix") {
+            portsOut.assign(std::begin(kMixInputs), std::end(kMixInputs));
+        } else if (raw.type == "clamp") {
+            portsOut.assign(std::begin(kClampInputs),
+                            std::end(kClampInputs));
+        } else {
+            portsOut.assign(std::begin(kDampInputs), std::end(kDampInputs));
+        }
+        for (auto& p : portsOut) {
+            if (p.type == kPoly) {
+                p.type = t;
+            }
+        }
+        Node* node;
+        if (raw.type == "add") {
+            node = new ArithmeticNode(ArithmeticNode::Op::Add);
+        } else if (raw.type == "multiply") {
+            node = new ArithmeticNode(ArithmeticNode::Op::Multiply);
+        } else if (raw.type == "mix") {
+            node = new ArithmeticNode(ArithmeticNode::Op::Mix);
+        } else if (raw.type == "clamp") {
+            node = new ArithmeticNode(ArithmeticNode::Op::Clamp);
+        } else {
+            node = new DampNode();
+        }
+        node->outputs[0].value.type = t;
+        return node;
+    }
+
+    if (raw.type == "noise") {
+        portsOut.assign(std::begin(kNoiseInputs), std::end(kNoiseInputs));
+        return new NoiseNode();
+    }
+
+    if (raw.type == "edge") {
+        EdgeNode::Mode mode = EdgeNode::Mode::Rise;
+        if (auto it = raw.json->get_object().find("mode");
+            it != raw.json->get_object().end()) {
+            const std::string m =
+                it->second.is_string() ? it->second.get_string()
+                                       : std::string();
+            if (m == "rise") {
+                mode = EdgeNode::Mode::Rise;
+            } else if (m == "fall") {
+                mode = EdgeNode::Mode::Fall;
+            } else if (m == "both") {
+                mode = EdgeNode::Mode::Both;
+            } else {
+                fail("node '" + raw.id + "': 'mode' must be \"rise\", "
+                     "\"fall\" or \"both\" (§9.9)");
+                return nullptr;
+            }
+        }
+        portsOut.assign(std::begin(kEdgeInputs), std::end(kEdgeInputs));
+        return new EdgeNode(mode);
     }
 
     if (raw.type == "combine") {

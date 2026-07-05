@@ -176,6 +176,7 @@ if(BUILD_TESTING)
         tests/unit/ws_codec_test.cpp
         tests/unit/mp4_demux_test.cpp
         tests/unit/package_store_test.cpp
+        tests/unit/value_nodes_test.cpp
         src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)

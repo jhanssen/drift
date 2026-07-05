@@ -293,6 +293,148 @@ void SplitNode::evaluate(FrameContext&)
     }
 }
 
+// ---- ArithmeticNode ----
+
+ArithmeticNode::ArithmeticNode(Op op)
+    : mOp(op)
+{
+    outputs.resize(1);
+}
+
+void ArithmeticNode::evaluate(FrameContext&)
+{
+    const Value a = inputValue(0);
+    const Value b = inputValue(1);
+    Value out{};
+    out.type = a.type;
+    const int n = componentCount(a.type);
+    switch (mOp) {
+    case Op::Add:
+        for (int i = 0; i < n; ++i) {
+            out.v[i] = a.v[i] + b.v[i];
+        }
+        break;
+    case Op::Multiply:
+        for (int i = 0; i < n; ++i) {
+            out.v[i] = a.v[i] * b.v[i];
+        }
+        break;
+    case Op::Mix: {
+        const double t = inputValue(2).v[0]; // unclamped (§9.9)
+        for (int i = 0; i < n; ++i) {
+            out.v[i] = a.v[i] + (b.v[i] - a.v[i]) * t;
+        }
+        break;
+    }
+    case Op::Clamp: {
+        const Value hi = inputValue(2); // a=value, b=lo
+        for (int i = 0; i < n; ++i) {
+            out.v[i] = std::min(std::max(a.v[i], b.v[i]), hi.v[i]);
+        }
+        break;
+    }
+    }
+    writeOutput(outputs[0], out);
+}
+
+// ---- NoiseNode ----
+
+namespace {
+
+// Deterministic lattice hash → [0, 1) (SplitMix64 finalizer): golden
+// runs must reproduce across machines and uptimes.
+double noiseHash(int64_t cell, int64_t seed)
+{
+    uint64_t x = (uint64_t)cell * 0x9E3779B97F4A7C15ull ^
+                 (uint64_t)seed * 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 30;
+    x *= 0xBF58476D1CE4E5B9ull;
+    x ^= x >> 27;
+    x *= 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return (double)(x >> 11) / (double)(1ull << 53);
+}
+
+} // namespace
+
+NoiseNode::NoiseNode()
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Scalar;
+}
+
+void NoiseNode::evaluate(FrameContext&)
+{
+    // 1D value noise: smoothstep-interpolated lattice hashes — C1, one
+    // feature per unit of input × frequency, [-1, 1].
+    const double x = inputValue(0).v[0] * inputValue(1).v[0];
+    const int64_t seed =
+        (int64_t)std::llround(inputValue(2).v[0] * 1024.0);
+    const double fl = std::floor(x);
+    const double f = x - fl;
+    const double u = f * f * (3.0 - 2.0 * f);
+    const double a = noiseHash((int64_t)fl, seed);
+    const double b = noiseHash((int64_t)fl + 1, seed);
+    Value out{};
+    out.type = ValueType::Scalar;
+    out.v[0] = (a + (b - a) * u) * 2.0 - 1.0;
+    writeOutput(outputs[0], out);
+}
+
+// ---- DampNode ----
+
+DampNode::DampNode()
+{
+    outputs.resize(1);
+}
+
+void DampNode::evaluate(FrameContext&)
+{
+    const Value value = inputValue(0);
+    const double dt = std::max(inputValue(1).v[0], 0.0);
+    const double halflife = std::max(inputValue(2).v[0], 1e-6);
+    if (!mPrimed) {
+        mState = value; // snap, don't glide in from zero
+        mPrimed = true;
+    } else {
+        // Framerate-independent: closes half the remaining gap every
+        // halflife seconds regardless of dt slicing.
+        const double k = 1.0 - std::exp2(-dt / halflife);
+        const int n = componentCount(value.type);
+        for (int i = 0; i < n; ++i) {
+            mState.v[i] += (value.v[i] - mState.v[i]) * k;
+        }
+        mState.type = value.type;
+    }
+    writeOutput(outputs[0], mState);
+}
+
+// ---- EdgeNode ----
+
+EdgeNode::EdgeNode(Mode mode)
+    : mMode(mode)
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Event;
+}
+
+void EdgeNode::evaluate(FrameContext&)
+{
+    const double value = inputValue(0).v[0];
+    const double threshold = inputValue(1).v[0];
+    const bool above = value > threshold;
+    if (mPrimed) {
+        const bool wasAbove = mPrev > threshold;
+        const bool rise = !wasAbove && above;
+        const bool fall = wasAbove && !above;
+        if ((rise && mMode != Mode::Fall) || (fall && mMode != Mode::Rise)) {
+            outputs[0].dirty = true; // fire (§16)
+        }
+    }
+    mPrev = value;
+    mPrimed = true;
+}
+
 // ---- SequenceNode ----
 
 SequenceNode::SequenceNode(double duration, bool loop, std::vector<Track> tracks)

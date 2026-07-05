@@ -68,6 +68,54 @@ public:
     void evaluate(FrameContext& ctx) override;
 };
 
+// §9.9 arithmetic: add/multiply/mix/clamp, T-polymorphic. Input order:
+// add/multiply (a, b), mix (a, b, t), clamp (value, lo, hi).
+class ArithmeticNode : public Node {
+public:
+    enum class Op { Add, Multiply, Mix, Clamp };
+    explicit ArithmeticNode(Op op);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    Op mOp;
+};
+
+// §9.9 noise: band-limited value noise over the input axis — C1-smooth,
+// deterministic, [-1, 1]. Input order: input, frequency, seed.
+class NoiseNode : public Node {
+public:
+    NoiseNode();
+    void evaluate(FrameContext& ctx) override;
+};
+
+// §9.9 damp: framerate-independent smoothed follow (exponential, halflife
+// seconds); snaps to the input on the first evaluation. Input order:
+// value, time (delta), halflife.
+class DampNode : public Node {
+public:
+    DampNode();
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    Value mState{};
+    bool mPrimed = false;
+};
+
+// §9.9 edge: level→event — fires when value crosses threshold in the
+// armed direction; the first evaluation arms without firing. Input
+// order: value, threshold.
+class EdgeNode : public Node {
+public:
+    enum class Mode { Rise, Fall, Both };
+    explicit EdgeNode(Mode mode);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    Mode mMode;
+    double mPrev = 0.0;
+    bool mPrimed = false;
+};
+
 // §9.9 sequence: a timeline — maps a scalar input through named keyframe
 // tracks, one output port per track in declaration order. Value tracks only
 // (event tracks are reserved, §16). Local-time reduction happens in double

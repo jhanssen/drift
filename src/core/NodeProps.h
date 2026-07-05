@@ -50,6 +50,7 @@ inline constexpr NodePropDef kNodeProps[] = {
     { "trails", "blend", "enum", false, "\"add\"", "add over" },
     { "trails", "length", "int", false, "16", nullptr },
     { "compositor", "blend", "json", false, nullptr, nullptr },
+    { "edge", "mode", "enum", false, "\"rise\"", "rise fall both" },
     { "fit", "mode", "enum", false, "\"cover\"", "cover contain stretch" },
     { "graph", "graph", "asset", true, nullptr, nullptr },
 };
@@ -58,6 +59,7 @@ inline constexpr NodePropDef kNodeProps[] = {
 // warns on unknown properties for all of them.
 inline constexpr const char* kNodeTypes[] = {
     "image", "video",  "shader",    "compute", "wave",   "remap",
+    "add", "multiply", "mix", "clamp", "noise", "damp", "edge",
     "combine", "split", "sequence", "particles", "sprites", "trails",
     "transform", "fit", "compositor", "output", "graph",
 };

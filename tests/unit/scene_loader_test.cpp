@@ -1531,6 +1531,50 @@ TEST_CASE("fit node (§17.1)")
     CHECK(r.hasError("required input 'source' missing"));
 }
 
+TEST_CASE("value nodes load: arithmetic, noise, damp, edge (§9.9)")
+{
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    "] }");
+    };
+    auto r = scene(R"(
+        { "id": "n", "type": "noise",
+          "inputs": { "input": "@time.seconds" } },
+        { "id": "d", "type": "damp",
+          "inputs": { "value": "@n", "time": "@time.delta" } },
+        { "id": "sum", "type": "add", "inputs": { "a": "@d", "b": 0.5 } },
+        { "id": "gain", "type": "multiply",
+          "inputs": { "a": "@sum", "b": 2 } },
+        { "id": "blend", "type": "mix",
+          "inputs": { "a": "@gain", "b": 0, "t": 0.5 } },
+        { "id": "cap", "type": "clamp", "inputs": { "value": "@blend" } },
+        { "id": "e", "type": "edge", "mode": "both",
+          "inputs": { "value": "@n" } },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@cap" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    r = scene(R"(
+        { "id": "e", "type": "edge", "mode": "sideways",
+          "inputs": { "value": 0 } },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'mode' must be"));
+
+    r = scene(R"(
+        { "id": "sum", "type": "add", "inputs": { "b": 1 } },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@sum" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("required input 'a' missing"));
+}
+
 TEST_CASE("compositor blend modes (§9.5)")
 {
     auto scene = [&](const std::string& comp) {

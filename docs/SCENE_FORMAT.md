@@ -355,7 +355,7 @@ Pointer input is inherently intermittent on Wayland (only delivered while the
 cursor is over the bare desktop); scenes should treat `position` as
 last-known-value and use `active` to fade effects out rather than snap.
 
-### 9.9 Value nodes: `remap`, `wave`, `combine`, `split`
+### 9.9 Value nodes: `remap`, `wave`, arithmetic, `noise`, `damp`, `edge`, `combine`, `split`
 
 CPU-evaluated per-frame value plumbing. `T` is polymorphic (§4).
 
@@ -405,6 +405,55 @@ beyond the input's arity (e.g. `.z` of a `vec2`) is a load error:
 | output | `y`     | `scalar`             |          |
 | output | `z`     | `scalar`             |          |
 | output | `w`     | `scalar`             |          |
+
+**Arithmetic** (adopted 2026-07-05 from §17.7, all `T`-polymorphic per §4
+with `T` resolved from the first input; scalars splat to vectors):
+
+| Node       | Inputs (name: default)          | Result                     |
+|------------|---------------------------------|----------------------------|
+| `add`      | `a` (required), `b`: `0`        | `a + b`                    |
+| `multiply` | `a` (required), `b`: `1`        | `a × b`                    |
+| `mix`      | `a`, `b` (required), `t`: `0.5` | `a + (b − a) × t` (`t` is `scalar`, unclamped) |
+| `clamp`    | `value` (required), `lo`: `0`, `hi`: `1` | `min(max(value, lo), hi)` per component |
+
+`multiply` is the correct way to scale an unbounded input (`remap` clamps
+by default — scaling `@time.seconds` through it silently saturates).
+
+`noise` (adopted 2026-07-05) — band-limited value noise, `wave`'s organic
+sibling: C1-smooth, deterministic, `[-1, 1]`:
+
+| Kind   | Name        | Type     | Default | Notes                        |
+|--------|-------------|----------|---------|------------------------------|
+| input  | `input`     | `scalar` | —       | required; typically `@time.seconds` |
+| input  | `frequency` | `scalar` | `1`     | features per unit of input   |
+| input  | `seed`      | `scalar` | `0`     | decorrelates instances       |
+| output | `result`†   | `scalar` |         |                              |
+
+`damp` (adopted 2026-07-05) — framerate-independent smoothed follow:
+`state += (value − state) × (1 − 2^(−dt/halflife))`, snapping to `value`
+on the first evaluation:
+
+| Kind   | Name       | Type     | Default | Notes                          |
+|--------|------------|----------|---------|--------------------------------|
+| input  | `value`    | `T`      | —       | required                       |
+| input  | `time`     | `scalar` | —       | required; wire `@time.delta`   |
+| input  | `halflife` | `scalar` | `0.2`   | seconds to close half the gap  |
+| output | `result`†  | `T`      |         |                                |
+
+`edge` (adopted 2026-07-05, discharging §15's reservation) — level→event:
+fires on the frame `value` crosses `threshold` in the armed direction.
+The first evaluation arms without firing:
+
+| Kind     | Name        | Type     | Default  | Notes                      |
+|----------|-------------|----------|----------|----------------------------|
+| property | `mode`      | `string` | `"rise"` | `rise`, `fall`, `both`     |
+| input    | `value`     | `scalar` | —        | required                   |
+| input    | `threshold` | `scalar` | `0.5`    |                            |
+| output   | `result`†   | `event`  |          |                            |
+
+The motivating idiom: a `sequence` hold gate driving both a video's
+`playing` (level) and, through `edge`, its `restart` (event at the window
+start) — one track instead of a track plus a hand-aligned cue.
 
 `sequence` — a timeline: maps one scalar input (typically `@time.seconds`)
 through named **tracks**, each of which becomes an output port. Value
@@ -660,14 +709,15 @@ fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 Collected from the sections above — features the format's structure already
 accounts for but v1 does not implement:
 
-- Event payloads, and event→level `latch`/`toggle` value nodes (§4, §9.9)
+- Event payloads, and event→level `latch`/`toggle` value nodes (§4, §9.9);
+  level→event `edge` is discharged (§9.9)
 - Per-key easing and wake-until-next-key scheduling hints (§9.9)
 - Inline references inside vector literals, as sugar desugaring to `combine` (§7, §9.9)
-- Per-layer blend modes on `compositor` (§9.5)
+- Per-layer blend modes on `compositor`: discharged (§9.5)
 - Pixel-exact `fit` mode on `transform` (§9.4)
-- Custom sampler configuration for shader texture ports (§9.10)
+- Sampler configuration beyond `_sampler_repeat` for shader texture ports (§9.10)
 - Damage-rectangle dirty granularity for textures (§11)
-- Additional value nodes (add/multiply/mix/clamp, …) (§9.9)
+- Arithmetic value nodes: discharged (§9.9); further growth reserved
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
 - `modules/` (WASM logic) project directory (§1); `graphs/` is discharged
   by §19
@@ -875,12 +925,8 @@ already does; adopting them is purely a documentation change:
   overrides live in runtime-managed per-scene settings storage outside the
   project directory; at load the runtime clamps stored values to the declared
   `min`/`max` and drops overrides whose parameter or type no longer exists.
-- **Arithmetic value nodes** (§9.9 growth, all `T`-polymorphic per §4):
-  `add` (`a + b`), `multiply` (`a × b`), `mix` (`a + (b − a) × t`, `t` is
-  `scalar`), `clamp` (`min(max(value, lo), hi)`). Motivating footgun: today
-  the only way to scale a value is `remap`, whose `clamp` property defaults to
-  `true` — scaling an unbounded input like `@time.seconds` silently saturates
-  at `outMax`. `multiply` is the correct tool; docs should point at it.
+- **Arithmetic value nodes**: adopted 2026-07-05 into §9.9 (`add`,
+  `multiply`, `mix`, `clamp`), alongside `noise`, `damp`, and `edge`.
 
 ### 17.8 Effect on §15
 
