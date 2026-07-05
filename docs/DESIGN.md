@@ -135,6 +135,13 @@ Host writes inputs → WASM update() → outputs written → host applies change
   - shader hot reload
   - module recompilation
   - live preview updates (<100ms target)
+- **Undo/redo (planned, not yet implemented):** document snapshots
+  captured at the editor's two write chokepoints (the scene-document
+  push and graph-file writes), so Ctrl+Z restores the previous document
+  and writes through — undoing the project folder too, which §5.4's
+  continuous save makes necessary. Runtime-only state (parameter slider
+  values) and the WGSL pane's own text history are deliberately outside
+  it.
 
 ### 5.4 Project Storage Providers
 
