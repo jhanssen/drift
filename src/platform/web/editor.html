@@ -1488,6 +1488,7 @@ const NODE_OUTPUTS = {
   sprites: [['result', 'texture']],
   trails: [['result', 'texture']],
   transform: [['result', 'texture']],
+  fit: [['result', 'texture']],
   compositor: [['result', 'texture']],
   output: [],
   remap: [['result', 'value']],
@@ -1550,6 +1551,7 @@ const NODE_INPUTS = {
               ['scale', 'value', false, [1, 1]],
               ['anchor', 'value', false, [0.5, 0.5]],
               ['opacity', 'value', false, 1]],
+  fit: [['source', 'texture']],
   compositor: [['layers', 'texture', true]],
   output: [['color', 'texture']],
   remap: [['value', 'value'], ['inMin', 'value', false, 0],
@@ -2753,7 +2755,7 @@ window.addEventListener('mousedown', (e) => {
 // immediately); nodes with required texture ports (transform, output-like)
 // stay a draft until wired — that is the expected add-then-wire flow.
 const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'particles',
-                      'sprites', 'trails', 'transform', 'compositor',
+                      'sprites', 'trails', 'transform', 'fit', 'compositor',
                       'sequence', 'wave', 'remap', 'combine', 'split',
                       'parameter'];
 const NODE_DEFAULT_INPUTS = {

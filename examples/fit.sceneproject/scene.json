@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "Fit",
+  "description": "§17.1 fit: a portrait test card contained on a landscape output — uniform scale, centered, transparent pillars showing the backdrop. Flip 'mode' to cover (crops top/bottom) or stretch (rings go oval).",
+  "nodes": [
+    { "id": "bg", "type": "shader", "shader": "shaders/backdrop.wgsl",
+      "inputs": { "level": 1 } },
+
+    { "id": "card", "type": "image", "src": "assets/card.png" },
+    { "id": "fitted", "type": "fit", "mode": "contain",
+      "inputs": { "source": "@card" } },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@bg", "@fitted"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

@@ -294,6 +294,9 @@ const PortDef kTransformInputs[] = {
 const PortDef kCompositorInputs[] = {
     { "layers", ValueType::Texture, true, {}, true },
 };
+const PortDef kFitInputs[] = {
+    { "source", ValueType::Texture, true },
+};
 const PortDef kSequenceInputs[] = {
     { "time", ValueType::Scalar, true },
 };
@@ -714,6 +717,7 @@ bool Loader::parseRawNode(const glz::generic& entry, RawNode& raw,
         { "image", { "src" } },
         { "video", { "src", "loop" } },
         { "transform", {} },
+        { "fit", { "mode" } },
         { "compositor", {} },
         { "output", {} },
         { "graph", { "graph" } },
@@ -2217,6 +2221,28 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
     if (raw.type == "transform") {
         portsOut.assign(std::begin(kTransformInputs), std::end(kTransformInputs));
         return new TransformNode();
+    }
+
+    if (raw.type == "fit") {
+        FitNode::Mode mode = FitNode::Mode::Cover;
+        const auto& obj = raw.json->get_object();
+        if (auto modeIt = obj.find("mode"); modeIt != obj.end()) {
+            const std::string m = modeIt->second.is_string()
+                ? modeIt->second.get_string() : std::string();
+            if (m == "cover") {
+                mode = FitNode::Mode::Cover;
+            } else if (m == "contain") {
+                mode = FitNode::Mode::Contain;
+            } else if (m == "stretch") {
+                mode = FitNode::Mode::Stretch;
+            } else {
+                fail("node '" + raw.id + "': 'mode' must be \"cover\", "
+                     "\"contain\" or \"stretch\" (§17.1)");
+                return nullptr;
+            }
+        }
+        portsOut.assign(std::begin(kFitInputs), std::end(kFitInputs));
+        return new FitNode(mode);
     }
 
     if (raw.type == "compositor") {

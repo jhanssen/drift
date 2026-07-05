@@ -1493,6 +1493,44 @@ TEST_CASE("subgraphs: interface, flattening, nesting (§19)")
     CHECK(r.hasError("nesting deeper than 8"));
 }
 
+TEST_CASE("fit node (§17.1)")
+{
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    "] }");
+    };
+    auto r = scene(R"(
+        { "id": "img", "type": "image", "src": "assets/tiny.png" },
+        { "id": "f", "type": "fit", "mode": "contain",
+          "inputs": { "source": "@img" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@f" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    // mode defaults to cover.
+    r = scene(R"(
+        { "id": "img", "type": "image", "src": "assets/tiny.png" },
+        { "id": "f", "type": "fit", "inputs": { "source": "@img" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@f" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+
+    r = scene(R"(
+        { "id": "img", "type": "image", "src": "assets/tiny.png" },
+        { "id": "f", "type": "fit", "mode": "fill",
+          "inputs": { "source": "@img" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@f" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'mode' must be"));
+
+    r = scene(R"(
+        { "id": "f", "type": "fit" },
+        { "id": "out", "type": "output", "inputs": { "color": "@f" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("required input 'source' missing"));
+}
+
 TEST_CASE("packages: references, pins, self-containment (§20)")
 {
     auto scene = [&](const std::string& extra, const std::string& nodes) {

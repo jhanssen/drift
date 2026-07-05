@@ -198,6 +198,27 @@ private:
     uint32_t mWidth = 0, mHeight = 0;
 };
 
+// §17.1 fit: maps source onto a scene-output-sized canvas — cover (uniform
+// scale to fill, centered, overflow cropped), contain (uniform scale to fit
+// entirely, centered, uncovered area transparent), or stretch (non-uniform
+// fill).
+class FitNode : public Node {
+public:
+    enum class Mode { Cover, Contain, Stretch };
+    explicit FitNode(Mode mode);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+
+    Mode mMode;
+    wgpu::RenderPipeline mPipeline;
+    wgpu::Buffer mUniforms;
+    wgpu::Sampler mSampler;
+    wgpu::Texture mColor;
+    uint32_t mWidth = 0, mHeight = 0;
+};
+
 // §9.5 compositor: stacks its inputs (all texture layers, bottom first) into
 // a scene-output-sized target with premultiplied source-over blending.
 class CompositorNode : public Node {

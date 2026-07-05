@@ -1168,6 +1168,178 @@ void TransformNode::evaluate(FrameContext& ctx)
     outputs[0].dirty = true;
 }
 
+// ---- FitNode ----
+
+namespace {
+
+// A centered quad whose uv-space extent is precomputed per §17.1: cover
+// overflows the canvas (clipped), contain leaves transparent bars,
+// stretch is the identity quad.
+const char* kFitShader = R"(
+struct FitParams {
+    extent: vec2f,
+}
+@group(0) @binding(0) var<uniform> params: FitParams;
+@group(0) @binding(1) var src: texture_2d<f32>;
+@group(0) @binding(2) var src_sampler: sampler;
+
+struct FitVsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+}
+
+@vertex
+fn fit_vs(@builtin(vertex_index) i: u32) -> FitVsOut {
+    var corners = array<vec2f, 4>(
+        vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(1.0, 1.0));
+    let c = corners[i];
+    let uvPos = vec2f(0.5) + (c - vec2f(0.5)) * params.extent;
+    var out: FitVsOut;
+    out.pos = vec4f(uvPos.x * 2.0 - 1.0, 1.0 - uvPos.y * 2.0, 0.0, 1.0);
+    out.uv = c;
+    return out;
+}
+
+@fragment
+fn fit_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    return textureSample(src, src_sampler, uv);
+}
+)";
+
+struct FitUniforms {
+    float extent[2];
+    float pad[2];
+};
+static_assert(sizeof(FitUniforms) == 16);
+
+} // namespace
+
+FitNode::FitNode(Mode mode)
+    : mMode(mode)
+{
+    outputs.resize(1);
+    outputs[0].value.type = ValueType::Texture;
+}
+
+bool FitNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    wgpu::ShaderModule module = makeModule(ctx.device, kFitShader);
+    if (!module) {
+        return false;
+    }
+
+    wgpu::ColorTargetState color{};
+    color.format = wgpu::TextureFormat::RGBA16Float;
+
+    wgpu::FragmentState fragment{};
+    fragment.module = module;
+    fragment.entryPoint = "fit_fs";
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = "fit_vs";
+    desc.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
+    desc.fragment = &fragment;
+    mPipeline = ctx.device.CreateRenderPipeline(&desc);
+    if (!mPipeline) {
+        return false;
+    }
+
+    wgpu::BufferDescriptor bd{};
+    bd.size = sizeof(FitUniforms);
+    bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mUniforms = ctx.device.CreateBuffer(&bd);
+    mSampler = makeLinearClampSampler(ctx.device);
+    return true;
+}
+
+void FitNode::evaluate(FrameContext& ctx)
+{
+    const Value source = inputValue(0);
+    if (!source.texture || !ensurePipeline(ctx)) {
+        return;
+    }
+
+    if (!mColor || mWidth != ctx.targetWidth || mHeight != ctx.targetHeight) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { ctx.targetWidth, ctx.targetHeight, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
+        mColor = ctx.device.CreateTexture(&desc);
+        mWidth = ctx.targetWidth;
+        mHeight = ctx.targetHeight;
+    }
+
+    const float srcAspect =
+        source.texHeight ? (float)source.texWidth / source.texHeight : 1.0f;
+    const float outAspect = mHeight ? (float)mWidth / mHeight : 1.0f;
+    FitUniforms u{};
+    u.extent[0] = 1.0f;
+    u.extent[1] = 1.0f;
+    if (mMode == Mode::Cover) {
+        if (srcAspect > outAspect) {
+            u.extent[0] = srcAspect / outAspect;
+        } else {
+            u.extent[1] = outAspect / srcAspect;
+        }
+    } else if (mMode == Mode::Contain) {
+        if (srcAspect > outAspect) {
+            u.extent[1] = outAspect / srcAspect;
+        } else {
+            u.extent[0] = srcAspect / outAspect;
+        }
+    }
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, &u, sizeof(u));
+
+    wgpu::BindGroupEntry entries[3] = {};
+    entries[0].binding = 0;
+    entries[0].buffer = mUniforms;
+    entries[0].size = sizeof(FitUniforms);
+    entries[1].binding = 1;
+    entries[1].textureView = source.texture.CreateView();
+    entries[2].binding = 2;
+    entries[2].sampler = mSampler;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = mPipeline.GetBindGroupLayout(0);
+    bgDesc.entryCount = 3;
+    bgDesc.entries = entries;
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgDesc);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mColor.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+
+    wgpu::RenderPassDescriptor desc{};
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
+    pass.SetPipeline(mPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(4);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mColor;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+}
+
 // ---- CompositorNode ----
 
 namespace {

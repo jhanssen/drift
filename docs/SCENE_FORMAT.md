@@ -711,7 +711,9 @@ Amendment to §9.5: a `compositor` layer whose texture size differs from the
 output is scaled to the output size (non-uniformly if aspect differs), linear
 filtering. This codifies current runtime behavior (each layer draws as a
 fullscreen pass). It is rarely what an author wants; aspect-correct placement
-goes through `fit` (not yet implemented):
+goes through `fit`.
+
+Implementation status: **adopted and implemented 2026-07-05.**
 
 New node type `fit` — maps a source texture onto an output-sized canvas:
 
