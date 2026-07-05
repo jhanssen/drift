@@ -73,10 +73,6 @@ if(EMSCRIPTEN)
         src/platform/web/VideoDecoderWebCodecs.cpp
     )
     target_link_libraries(drift_web PRIVATE drift_core)
-    set_target_properties(drift_web PROPERTIES
-        OUTPUT_NAME drift
-        SUFFIX ".html"
-        LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
                          comets fireworks bokeh sway fit)
     set(DRIFT_WEB_PRELOADS)
@@ -84,6 +80,17 @@ if(EMSCRIPTEN)
         list(APPEND DRIFT_WEB_PRELOADS
             "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/examples/${scene}.sceneproject@/scenes/${scene}")
     endforeach()
+    # Preloaded content is baked into drift.data at link time — editing a
+    # scene or library file must relink or the bundle serves stale files.
+    # The glob re-runs at configure time; adding a NEW file needs a cmake
+    # rerun, which adding it to a preload list above forces anyway.
+    file(GLOB_RECURSE DRIFT_WEB_CONTENT CONFIGURE_DEPENDS
+        ${CMAKE_SOURCE_DIR}/examples/* ${CMAKE_SOURCE_DIR}/library/*)
+    set_target_properties(drift_web PROPERTIES
+        OUTPUT_NAME drift
+        SUFFIX ".html"
+        LINK_DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html;${DRIFT_WEB_CONTENT}")
     # First-party packages ship as a store at /packages (§20.2); the web
     # runtime defaults DRIFT_PACKAGE_PATH there.
     foreach(pkg IN LISTS DRIFT_LIBRARY_PACKAGES)
