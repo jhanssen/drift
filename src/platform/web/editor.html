@@ -1881,8 +1881,18 @@ function buildGraph() {
       }
     }
     const outputs = implicit ? IMPLICIT_OUTPUTS[source.id] : outputsOf(source);
+    // Instances label with their block's name (palette markers: ⬡ =
+    // package, ▣ = project graph) instead of the generic "graph".
+    let typeLabel = null;
+    if (!implicit && source.type === 'graph' &&
+        typeof source.graph === 'string') {
+      const path = resolveDocPath(source.graph, activeDocRoot());
+      typeLabel = (path.startsWith('packages/') ? '⬡ ' : '▣ ') +
+                  (graphInterface(path)?.name ?? source.graph);
+    }
     const node = {
       id: source.id, type: implicit ? '(implicit)' : source.type,
+      typeLabel,
       source, implicit: !!implicit, inputs, outputs, w: G.W,
       h: G.HEAD + Math.max(inputs.length, outputs.length, 1) * G.ROW + G.PAD,
       x: 0, y: 0,
@@ -3433,7 +3443,8 @@ function drawGraph() {
     ctx.fillStyle = '#8a8f98';
     ctx.font = '9px system-ui';
     ctx.textAlign = 'right';
-    ctx.fillText(node.type, node.x + node.w - 8, node.y + 15);
+    ctx.fillText(node.typeLabel ?? node.type, node.x + node.w - 8,
+                 node.y + 15);
     ctx.textAlign = 'left';
     ctx.strokeStyle = '#2c3038';
     ctx.beginPath();
