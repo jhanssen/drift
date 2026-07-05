@@ -1023,7 +1023,9 @@ and is the wallpaper workhorse).
 
 ### 18.4 Example
 
-Sparks that erupt on a sequence cue and drift toward the pointer:
+Sparks that erupt on a sequence cue and drift toward the pointer (a
+complete, runnable variation ships as `examples/sparks.sceneproject`,
+adding a parameter-driven rate and sequence-driven turbulence):
 
 ```json
 { "id": "cues", "type": "sequence", "duration": 10, "loop": true,
