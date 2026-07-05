@@ -11,9 +11,14 @@
     { "id": "picture", "type": "image", "src": "assets/meadow.png" },
     { "id": "flexmap", "type": "image", "src": "assets/meadow_flex.png" },
 
+    { "id": "fitPicture", "type": "fit",
+      "inputs": { "source": "@picture" } },
+    { "id": "fitFlex", "type": "fit",
+      "inputs": { "source": "@flexmap" } },
+
     { "id": "sway", "type": "graph",
       "graph": "packages/sway/graphs/sway.json",
-      "inputs": { "source": "@picture", "flex": "@flexmap",
+      "inputs": { "source": "@fitPicture", "flex": "@fitFlex",
                   "amplitude": "$amount", "speed": "$speed" } },
 
     { "id": "out", "type": "output", "inputs": { "color": "@sway" } }
