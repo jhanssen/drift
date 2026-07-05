@@ -1564,6 +1564,13 @@ const NODE_INPUTS = {
   split: [['value', 'value']],
   sequence: [['time', 'value']],
 };
+// Declared properties per type with their defaults (§9) — the inspector
+// shows unset ones the way unbound pins show the default they run at.
+const NODE_PROPS = {
+  video: { loop: true },
+  shader: { size: 'auto' },
+  fit: { mode: 'cover' },
+};
 const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d',
                        buffer: '#b48ade' };
 const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
@@ -3601,10 +3608,15 @@ function renderInspector() {
   row('type', node.type);
   const props = Object.entries(node.source)
       .filter(([key]) => key !== 'id' && key !== 'type' && key !== 'inputs');
-  if (props.length) {
+  const unsetProps = Object.entries(NODE_PROPS[node.source.type] ?? {})
+      .filter(([key]) => !(key in node.source));
+  if (props.length || unsetProps.length) {
     heading('properties');
     for (const [key, value] of props) {
       row(key, fmt(value), JSON.stringify(value));
+    }
+    for (const [key, def] of unsetProps) {
+      row(key, `(default ${JSON.stringify(def)})`);
     }
   }
   const inputs = node.inputs.filter((input) => !input.append);
