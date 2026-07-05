@@ -1978,6 +1978,43 @@ function buildGraph() {
              ({ name, unbound: true, category: 'value' })),
          { name: '+', unbound: true, category: 'value' }],
         []);
+    // §19.5: the boundary shows the wiring of the instance we entered
+    // through — a declared port draws wired only when the parent doc
+    // actually supplies (inputs) or consumes (outputs) it there.
+    const parentDoc = viewStack.length > 1
+        ? viewStack[viewStack.length - 2].doc : sceneSource;
+    const inst = parentDoc?.nodes?.find(
+        (n) => n.id === viewStack[viewStack.length - 1]?.viaInstance);
+    inFace.dimPorts = new Set(['+']);
+    for (const name of Object.keys(doc.inputs ?? {})) {
+      if (inst && !(name in (inst.inputs ?? {}))) {
+        inFace.dimPorts.add(name);
+      }
+    }
+    const consumedInParent = (port) => {
+      if (!inst) {
+        return true; // unknown instance: keep the mapped look
+      }
+      for (const n of parentDoc.nodes ?? []) {
+        if (n.id === inst.id) {
+          continue;
+        }
+        let hit = false;
+        for (const value of Object.values(n.inputs ?? {})) {
+          mapRefs(value, (conn) => {
+            if (conn.node === inst.id &&
+                (conn.port ?? 'result') === port) {
+              hit = true;
+            }
+            return null;
+          });
+        }
+        if (hit) {
+          return true;
+        }
+      }
+      return false;
+    };
     for (const [name, decl] of Object.entries(doc.inputs ?? {})) {
       const binds = Array.isArray(decl?.bind) ? decl.bind : [decl?.bind];
       for (const bind of binds) {
@@ -2004,14 +2041,17 @@ function buildGraph() {
       if (from) {
         const fromPort = conn.port ?? from.outputs[0]?.[0];
         const found = from.outputs.find(([n]) => n === fromPort);
-        // A mapped output is wired, not an open slot: filled pin, bright
-        // label, the inner port's category — its consumers live in the
-        // parent graph.
+        // A mapped output draws wired (filled pin, bright label, the
+        // inner port's category) only when the parent consumes it there;
+        // otherwise it stays an open slot.
         const entry = outFace.inputs.find((i) => i.name === name);
         if (entry) {
-          entry.unbound = false;
-          entry.conn = { node: from.id, port: fromPort, previous: false };
           entry.category = found ? found[1] : 'value';
+          if (consumedInParent(name)) {
+            entry.unbound = false;
+            entry.conn = { node: from.id, port: fromPort,
+                           previous: false };
+          }
         }
         edges.push({ from: from.id, fromPort, to: '#outputs', toPort: name,
                      category: found ? found[1] : 'value', previous: false });
@@ -3413,7 +3453,8 @@ function drawGraph() {
     }
     ctx.textAlign = 'right';
     node.outputs.forEach(([name, category], i) => {
-      ctx.fillStyle = GRAPH_COLORS[category];
+      ctx.fillStyle = node.dimPorts?.has(name) ? '#8a8f98'
+                                               : GRAPH_COLORS[category];
       ctx.fillText(name, node.x + node.w - 8, pinY(node, i) + 3);
     });
     ctx.textAlign = 'left';
@@ -3434,11 +3475,16 @@ function drawGraph() {
         ctx.stroke();
       }
     });
-    node.outputs.forEach(([, category], i) => {
+    node.outputs.forEach(([name, category], i) => {
       ctx.beginPath();
       ctx.arc(node.x + node.w, pinY(node, i), 3, 0, Math.PI * 2);
-      ctx.fillStyle = GRAPH_COLORS[category];
-      ctx.fill();
+      if (node.dimPorts?.has(name)) {
+        ctx.strokeStyle = GRAPH_COLORS[category] ?? '#8a8f98';
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = GRAPH_COLORS[category];
+        ctx.fill();
+      }
     });
   }
 
