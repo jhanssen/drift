@@ -318,6 +318,19 @@ index.json
 - Fast shader hot reload (<100ms target)
 - Minimal CPU overhead for idle scenes
 - Scales down gracefully on low-end hardware
+- **Transient texture pooling (planned):** today every texture-producing
+  node owns a persistent intermediate; an animated effects chain holds
+  N output-sized float16 targets that are dead after the frame's last
+  read. The dirty semantics (SCENE_FORMAT.md §11) identify which targets
+  truly persist — only nodes whose output may be read in a later frame
+  without re-evaluating (static/intermittent sources). Every-frame-dirty
+  nodes can lease targets from a per-frame pool, with lifetimes from the
+  existing topological order; ports feeding `previous:` edges and the
+  scene output are excluded. Pure runtime change, no format impact,
+  golden-verifiable. A later, narrower second step: fusing consecutive
+  *pointwise* fullscreen passes (adjust/tint/threshold — not
+  neighborhood passes like blur) into one shader, trading WGSL interface
+  composition for the intermediate and its bandwidth.
 
 ## 11. Security Model
 
