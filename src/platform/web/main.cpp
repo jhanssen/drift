@@ -425,6 +425,28 @@ EMSCRIPTEN_KEEPALIVE const char* drift_scenes()
     return json.c_str();
 }
 
+// Graph files under the active project's graphs/ (§19) — the editor's
+// node palette and instance pins fill from this.
+EMSCRIPTEN_KEEPALIVE const char* drift_graphs()
+{
+    static std::string json;
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::path(gApp.scenePath) / "graphs", ec)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json") {
+            names.push_back("graphs/" + entry.path().filename().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    json = "[";
+    for (size_t i = 0; i < names.size(); ++i) {
+        json += (i ? ",\"" : "\"") + names[i] + "\"";
+    }
+    json += "]";
+    return json.c_str();
+}
+
 // The running scene document, for the editor.
 EMSCRIPTEN_KEEPALIVE const char* drift_source()
 {

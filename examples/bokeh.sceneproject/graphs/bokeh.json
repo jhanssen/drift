@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "Bokeh layer",
+  "description": "A drifting field of soft discs: one particles + sprites block with the layer-defining knobs exported (§19).",
+  "inputs": {
+    "tint":     { "type": "vec4", "default": [1, 1, 1, 0.8],
+                  "bind": "@p.colorStart" },
+    "tintEnd":  { "type": "vec4", "default": [1, 1, 1, 0],
+                  "bind": "@p.colorEnd" },
+    "rate":     { "type": "scalar", "default": 8, "bind": "@p.rate" },
+    "size":     { "type": "vec2", "default": [0.02, 0.06],
+                  "bind": "@p.size" },
+    "depth":    { "type": "vec2", "default": [0, 0], "bind": "@p.depth" },
+    "parallax": { "type": "vec2", "default": [0, 0], "bind": "@s.parallax" }
+  },
+  "outputs": { "result": "@s" },
+  "nodes": [
+    { "id": "p", "type": "particles", "capacity": 400, "emitter": "box",
+      "inputs": { "time": "@time.delta",
+                  "origin": [0.5, 0.55], "extent": [0.55, 0.5],
+                  "direction": [0, -1], "spread": 35,
+                  "speed": [0.008, 0.035], "lifetime": [7, 12],
+                  "fadeIn": 2, "sizeEnd": 1.3,
+                  "turbulence": 0.01, "turbulenceScale": 2 } },
+    { "id": "s", "type": "sprites", "inputs": { "particles": "@p" } }
+  ]
+}

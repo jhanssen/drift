@@ -88,6 +88,102 @@ const char* kVec4ProducerWgsl = R"(
     @compute @workgroup_size(64) fn main() {}
 )";
 
+// §19 fixtures: a texture-in/texture-out shader for graph files.
+const char* kDimWgsl = R"(
+    struct Params { amount: f32 }
+    @group(0) @binding(0) var<uniform> params: Params;
+    @group(0) @binding(1) var src: texture_2d<f32>;
+    @group(0) @binding(2) var src_sampler: sampler;
+    @fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+        return textureSample(src, src_sampler, uv) * params.amount;
+    }
+)";
+
+const char* kDimGraph = R"({
+    "version": 1, "name": "Dim",
+    "inputs": {
+        "source": { "type": "texture", "bind": "@d.src" },
+        "amount": { "type": "scalar", "default": 0.5, "bind": "@d.amount" }
+    },
+    "outputs": { "result": "@d" },
+    "nodes": [
+        { "id": "d", "type": "shader", "shader": "shaders/dim.wgsl" }
+    ]
+})";
+
+const char* kPulseGraph = R"({
+    "version": 1, "name": "Pulse",
+    "inputs": {
+        "frequency": { "type": "scalar", "default": 1,
+                       "bind": "@w.frequency" }
+    },
+    "outputs": { "result": "@r" },
+    "nodes": [
+        { "id": "w", "type": "wave",
+          "inputs": { "input": "@time.seconds" } },
+        { "id": "r", "type": "remap",
+          "inputs": { "value": "@w", "inMin": -1, "inMax": 1 } }
+    ]
+})";
+
+const char* kNestedGraph = R"({
+    "version": 1, "name": "Nested",
+    "inputs": {
+        "source": { "type": "texture", "bind": "@inner.source" }
+    },
+    "outputs": { "result": "@inner" },
+    "nodes": [
+        { "id": "inner", "type": "graph", "graph": "graphs/dim.json",
+          "inputs": { "amount": 0.25 } }
+    ]
+})";
+
+const char* kCycleAGraph = R"({
+    "version": 1,
+    "inputs": { "source": { "type": "texture", "bind": "@b.source" } },
+    "outputs": { "result": "@b" },
+    "nodes": [ { "id": "b", "type": "graph", "graph": "graphs/cycleb.json" } ]
+})";
+
+const char* kCycleBGraph = R"({
+    "version": 1,
+    "inputs": { "source": { "type": "texture", "bind": "@a.source" } },
+    "outputs": { "result": "@a" },
+    "nodes": [ { "id": "a", "type": "graph", "graph": "graphs/cyclea.json" } ]
+})";
+
+const char* kParamRefGraph = R"({
+    "version": 1,
+    "outputs": { "result": "@w" },
+    "nodes": [ { "id": "w", "type": "wave", "inputs": { "input": "$speed" } } ]
+})";
+
+const char* kHasOutputGraph = R"({
+    "version": 1,
+    "outputs": { "result": "@d" },
+    "nodes": [
+        { "id": "d", "type": "shader", "shader": "shaders/dim.wgsl" },
+        { "id": "out", "type": "output", "inputs": { "color": "@d" } }
+    ]
+})";
+
+const char* kNoResultGraph = R"({
+    "version": 1,
+    "outputs": { "final": "@d" },
+    "nodes": [
+        { "id": "d", "type": "shader", "shader": "shaders/dim.wgsl" }
+    ]
+})";
+
+const char* kBadBindGraph = R"({
+    "version": 1,
+    "inputs": { "source": { "type": "texture", "bind": "@ghost.src" } },
+    "outputs": { "result": "@d" },
+    "nodes": [
+        { "id": "d", "type": "shader", "shader": "shaders/dim.wgsl" }
+    ]
+})";
+
 // A valid 2x2 RGBA PNG.
 const unsigned char kTinyPng[] = {
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2,
@@ -249,6 +345,16 @@ LoadResult load(const std::string& json,
         { "shaders/vec4consumer.wgsl", kVec4ConsumerWgsl },
         { "shaders/nooutputs.wgsl", kNoOutputsWgsl },
         { "shaders/vec4producer.wgsl", kVec4ProducerWgsl },
+        { "shaders/dim.wgsl", kDimWgsl },
+        { "graphs/dim.json", kDimGraph },
+        { "graphs/pulse.json", kPulseGraph },
+        { "graphs/nested.json", kNestedGraph },
+        { "graphs/cyclea.json", kCycleAGraph },
+        { "graphs/cycleb.json", kCycleBGraph },
+        { "graphs/paramref.json", kParamRefGraph },
+        { "graphs/hasoutput.json", kHasOutputGraph },
+        { "graphs/noresult.json", kNoResultGraph },
+        { "graphs/badbind.json", kBadBindGraph },
         { "assets/tiny.png",
           std::string((const char*)kTinyPng, sizeof(kTinyPng)) },
         { "assets/tiny.webp",
@@ -1212,6 +1318,144 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());
+}
+
+TEST_CASE("subgraphs: interface, flattening, nesting (§19)")
+{
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    "] }");
+    };
+
+    // Texture through a subgraph, one input from a scene parameter, the
+    // other from the declared default.
+    auto r = load(R"({
+        "version": 1, "name": "x",
+        "parameters": {
+            "level": { "type": "scalar", "default": 0.8 }
+        },
+        "nodes": [
+            { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "soft", "type": "graph", "graph": "graphs/dim.json",
+              "inputs": { "source": "@bg", "amount": "$level" } },
+            { "id": "softer", "type": "graph", "graph": "graphs/dim.json",
+              "inputs": { "source": "@soft" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@softer" } }
+        ]
+    })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    CHECK(r.warnings.empty());
+
+    // A value subgraph with implicit @time inside keeps the scene animated.
+    r = scene(R"(
+        { "id": "p", "type": "graph", "graph": "graphs/pulse.json" },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@p" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.scene->animated());
+
+    // Nested instantiation flattens through.
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "n", "type": "graph", "graph": "graphs/nested.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@n" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    // Feedback through an instance: previous-edge self loop.
+    r = scene(R"(
+        { "id": "loop", "type": "graph", "graph": "graphs/dim.json",
+          "inputs": { "source": { "node": "loop", "previous": true } } },
+        { "id": "out", "type": "output", "inputs": { "color": "@loop" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    // Interface enforcement at the instance.
+    r = scene(R"(
+        { "id": "g", "type": "graph", "graph": "graphs/dim.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("required input 'source' missing"));
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/dim.json",
+          "inputs": { "source": "@bg", "bogus": 1 } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("not an input of graph"));
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/dim.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g.bogus" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("has no output 'bogus'"));
+
+    // Types still check across the boundary (on the flattened inner port).
+    r = scene(R"(
+        { "id": "g", "type": "graph", "graph": "graphs/dim.json",
+          "inputs": { "source": 0.5 } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("type mismatch"));
+
+    // Graph file validation.
+    r = scene(R"(
+        { "id": "g", "type": "graph", "graph": "graphs/nope.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("cannot open graph file"));
+    r = scene(R"(
+        { "id": "g", "type": "graph", "graph": "graphs/paramref.json" },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@g" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("$parameter references are not allowed"));
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/hasoutput.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("produces ports, not the frame"));
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/noresult.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("must include 'result'"));
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/badbind.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("not a node in this file"));
+
+    // Instantiation cycles bottom out at the depth cap.
+    r = scene(R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph", "graph": "graphs/cyclea.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("nesting deeper than 8"));
 }
 
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")

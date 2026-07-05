@@ -13,8 +13,8 @@ myscene.sceneproject/
   assets/             # images, videos
 ```
 
-`modules/` and `graphs/` (see DESIGN.md §6.1) are reserved for deferred features
-and ignored by the v1 runtime if present.
+`graphs/` holds subgraph definitions (§19). `modules/` (see DESIGN.md §6.1)
+is reserved for deferred features and ignored by the v1 runtime if present.
 
 All paths inside `scene.json` are relative to the `.sceneproject` root. Paths
 must not escape the project root (`..` is rejected at load).
@@ -647,7 +647,8 @@ accounts for but v1 does not implement:
 - Damage-rectangle dirty granularity for textures (§11)
 - Additional value nodes (add/multiply/mix/clamp, …) (§9.9)
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
-- `modules/` (WASM logic) and `graphs/` project directories (§1)
+- `modules/` (WASM logic) project directory (§1); `graphs/` is discharged
+  by §19
 
 ## 16. Events & Sequencing (adopted)
 
@@ -1269,3 +1270,119 @@ for inapplicable emission inputs and ignored `capacity`.
 spritesheets, sub-emitters, multi-emitters, parallax depth, and sorted
 draws are adopted (§18.5); the audio node and compute event ports remain
 on the reserved list (§18.6).
+
+## 19. Subgraphs
+
+Status: **adopted 2026-07-05**. Reusable building blocks composed from
+nodes: a subgraph is a graph file under `graphs/` with a declared port
+interface, and an instance of it is an ordinary node in any graph. The
+runtime never sees subgraphs — instances flatten at load — so every
+semantic of §10, §11, §16, and §18 applies to the inner nodes exactly as
+if they were authored inline, at zero runtime cost.
+
+### 19.1 Graph Files
+
+One subgraph per file, `graphs/<name>.json`:
+
+```json
+{
+  "version": 1,
+  "name": "Glow",
+  "description": "Threshold + two-pass blur, added back over the source.",
+  "inputs": {
+    "source":   { "type": "texture", "bind": "@thresh.source" },
+    "strength": { "type": "scalar", "default": 0.6,
+                  "bind": ["@blurX.amount", "@blurY.amount"] }
+  },
+  "outputs": { "result": "@mix" },
+  "nodes": [ /* §8 nodes, unchanged */ ]
+}
+```
+
+- `version` (required): 1.
+- `name`/`description` (optional): editor labels; `name` defaults to the
+  file stem.
+- `nodes` (required): exactly §8. All built-in types are legal except
+  `output` (a subgraph produces ports, not the frame). Implicit `@time`
+  and `@mouse` references work as usual — they are global inputs.
+- `$parameter` references are **not** allowed inside graph files: a
+  subgraph's knobs are its declared inputs, so the file is self-contained
+  and reusable across scenes. (The *instance* may bind its inputs to the
+  scene's parameters.)
+- Graph files may instantiate other subgraphs (§19.3). The instantiation
+  depth is capped at 8 and cycles among graph files are a load error.
+- Shader/asset paths inside a graph file resolve against the project root
+  (§1), same as everywhere else.
+
+### 19.2 The Interface
+
+`inputs` — object, exported name → declaration:
+
+| Field     | Type            | Notes                                        |
+|-----------|-----------------|----------------------------------------------|
+| `type`    | §4 type name    | required; `texture`, `event`, `buffer` allowed |
+| `bind`    | ref or [refs]   | required; inner *input* port(s) this feeds    |
+| `default` | literal         | value types only; absent ⇒ the input is required at the instance |
+
+- Every `bind` target must be an input port of an inner node whose port
+  type equals the declared `type` (a scalar declaration may bind to a
+  vecN inner port; it splats per §4). One exported input may feed several
+  inner ports.
+- A `buffer` input's element stride is the bound inner port's declared
+  stride; several binds must agree.
+- An inner input port fed by an exported input cannot also be set in the
+  inner node's own `inputs` (load error — one writer per port).
+
+`outputs` — object, exported name → an inner `@node` / `@node.port`
+reference. The exported port's type (and buffer stride) is the inner
+port's. `result` must be present; it is the default output (§7's bare
+`@instance` form). Exported names follow §3 identifiers in both tables.
+
+### 19.3 The `graph` Node (instances)
+
+| Kind     | Name    | Type     | Default | Notes                          |
+|----------|---------|----------|---------|--------------------------------|
+| property | `graph` | `string` | —       | path to the graph file         |
+| input    | *(interface)* |    |         | the file's declared `inputs`   |
+| output   | *(interface)* |    |         | the file's declared `outputs`  |
+
+Instances participate in the outer graph like any node: interface inputs
+accept the full §7 grammar (literals, `$param`, connections, `previous:
+true` feedback edges), and interface outputs are wireable, including as
+feedback sources.
+
+**Flattening.** At load, each instance is replaced by its inner nodes
+with namespaced ids — `<instance>/<inner>` (unambiguous: §3 ids cannot
+contain `/`). Outer references to `@instance.port` rewrite to the mapped
+inner node's port; exported inputs apply the instance's bindings (or the
+declared defaults) to the bound inner ports. Diagnostics about inner
+nodes use the namespaced id, so errors and warnings point into the right
+instance. Two instances of one file share nothing at runtime — each gets
+its own nodes, state, and dirty tracking.
+
+### 19.4 Validation Additions (§13)
+
+Graph file missing, unparseable, or wrong `version`; an `output` node or
+`$parameter` reference inside a graph file; unknown `type` in an input
+declaration; `bind` naming an unknown inner node/port, mismatching the
+declared type, or colliding with the inner node's own binding; `default`
+on a non-value type; missing `outputs.result`; an output reference to an
+unknown inner node/port; an instance binding an input not in the
+interface, or omitting a required one; nesting deeper than 8;
+instantiation cycles among graph files.
+
+### 19.5 Editor Mapping (non-normative)
+
+An instance draws as a single node with the declared pins. Double- or
+middle-click enters the subgraph's own canvas; a breadcrumb returns to
+the parent. A connected multi-node selection collapses into a new graph
+file via "make subgraph": boundary-crossing wires become the interface
+(incoming → declared inputs, outgoing → outputs), and the selection is
+replaced by one instance bound to the same outer wires.
+
+### 19.6 Effect on §15
+
+§1's `graphs/` reservation is discharged. Reserved growth: distributable
+node packages around graph files (DESIGN.md §8.2/§9), inline graph
+definitions in `scene.json`, and re-exporting a subgraph input as a
+scene parameter declaration in one step.

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <set>
 
 #include <glaze/glaze.hpp>
 
@@ -391,10 +392,21 @@ private:
 
     bool parseParameters(const glz::generic& json);
     bool parseNodes(const glz::generic& json);
+    // One §8 node entry → RawNode. Shared by scene.json and graph files
+    // (§19.1); inside a graph file `output` nodes and `$param` references
+    // are rejected, and particle emitter specs key under specKey so two
+    // instances of one file don't collide.
+    bool parseRawNode(const glz::generic& entry, RawNode& raw,
+                      const std::string& specKey, bool inGraphFile);
     // §18.5.3: validates the 'emitters' property, injects entry fields into
     // raw.inputs as "emitters[i].<field>" ports (so topo sort, parameters,
     // and type checking see them), and records shapes + override masks.
-    bool parseEmitters(RawNode& raw, const glz::generic& json);
+    bool parseEmitters(RawNode& raw, const glz::generic& json,
+                       const std::string& specKey);
+    // §19.3: replaces every `graph` instance with its inner nodes
+    // (namespaced ids), applies interface bindings, and rewrites
+    // references — level by level until none remain.
+    bool expandGraphs();
     bool topoSort();
     bool instantiate(const RawNode& raw);
     Node* makeNode(const RawNode& raw, std::vector<PortDef>& portsOut);
@@ -427,12 +439,34 @@ private:
     std::vector<std::string>& mWarnings;
 
     // §18.5.3 parsed emitter entries per particles node: shape (-1 =
-    // inherit the node-level 'emitter' property) and override mask.
+    // inherit the node-level 'emitter' property) and override mask. Keyed
+    // by node id for scene nodes, "<path>\n<id>" for graph-file nodes
+    // (copied to the namespaced id at expansion).
     struct EmitterSpec {
         std::vector<int> kinds;
         std::vector<uint32_t> masks;
     };
     std::map<std::string, EmitterSpec> mEmitterSpecs;
+
+    // §19.1 parsed graph files, cached by project-relative path. The doc
+    // keeps every inner RawNode::json pointer alive through load.
+    struct GraphDef {
+        struct In {
+            ValueType type;
+            bool hasDefault = false;
+            Value def;
+            std::vector<RawConn> binds;
+        };
+        std::string path;
+        std::string name;
+        std::vector<std::pair<std::string, In>> inputs; // declaration order
+        std::map<std::string, RawConn> outputs;
+        std::vector<RawNode> nodes;
+        std::set<std::string> nodeIds;
+        std::unique_ptr<glz::generic> doc;
+    };
+    GraphDef* graphDef(const std::string& path); // nullptr = failed (fail())
+    std::map<std::string, std::unique_ptr<GraphDef>> mGraphDefs;
 
     std::vector<Param> mParams;
     std::map<std::string, int> mParamIndex;
@@ -572,113 +606,13 @@ bool Loader::parseNodes(const glz::generic& json)
         return false;
     }
     for (const auto& entry : json.get_array()) {
-        if (!entry.is_object()) {
-            fail("node entries must be objects");
-            return false;
-        }
-        const auto& obj = entry.get_object();
         RawNode raw;
-        raw.json = &entry;
-
-        auto idIt = obj.find("id");
-        auto typeIt = obj.find("type");
-        if (idIt == obj.end() || !idIt->second.is_string() ||
-            typeIt == obj.end() || !typeIt->second.is_string()) {
-            fail("every node needs string 'id' and 'type'");
-            return false;
-        }
-        raw.id = idIt->second.get_string();
-        raw.type = typeIt->second.get_string();
-        if (!validId(raw.id)) {
-            fail("invalid node id '" + raw.id + "'");
-            return false;
-        }
-        if (raw.id == "time" || raw.id == "mouse") {
-            fail("node id '" + raw.id + "' is reserved (implicit input node)");
+        if (!parseRawNode(entry, raw, /*specKey=*/"", /*inGraphFile=*/false)) {
             return false;
         }
         if (mRawIndex.count(raw.id)) {
             fail("duplicate node id '" + raw.id + "'");
             return false;
-        }
-
-        // Unknown properties are a warning, not an error (§13) — but a
-        // typo'd property silently changing behavior is the worst authoring
-        // footgun, so say something.
-        static const std::map<std::string, std::vector<std::string>> kProps = {
-            { "wave", { "shape" } },
-            { "remap", { "clamp" } },
-            { "combine", {} },
-            { "split", {} },
-            { "sequence", { "duration", "loop", "tracks" } },
-            { "shader", { "shader", "size" } },
-            { "compute", { "shader", "capacity", "dispatch" } },
-            { "particles",
-              { "capacity", "emitter", "emitters", "spawnCount" } },
-            { "sprites", { "blend", "sheet" } },
-            { "trails", { "blend", "length" } },
-            { "image", { "src" } },
-            { "video", { "src", "loop" } },
-            { "transform", {} },
-            { "compositor", {} },
-            { "output", {} },
-        };
-        if (auto propsIt = kProps.find(raw.type); propsIt != kProps.end()) {
-            for (const auto& [key, value] : obj) {
-                if (key == "id" || key == "type" || key == "inputs") {
-                    continue;
-                }
-                const auto& known = propsIt->second;
-                if (std::find(known.begin(), known.end(), key) == known.end()) {
-                    warn("node '" + raw.id + "': unknown property '" + key +
-                         "' ignored");
-                }
-            }
-        }
-
-        if (auto inputsIt = obj.find("inputs"); inputsIt != obj.end()) {
-            if (!inputsIt->second.is_object()) {
-                fail("node '" + raw.id + "': 'inputs' must be an object");
-                return false;
-            }
-            for (const auto& [port, value] : inputsIt->second.get_object()) {
-                RawInput in;
-                std::string err;
-                if (!parseRawInput(value, in, err)) {
-                    fail("node '" + raw.id + "' input '" + port + "': " + err);
-                    return false;
-                }
-                forEachConn(in, [&](const RawConn& conn) {
-                    if (conn.node == "time") {
-                        mNeedsTime = true;
-                    } else if (conn.node == "mouse") {
-                        mNeedsMouse = true;
-                    }
-                });
-                raw.inputs[port] = std::move(in);
-            }
-        }
-        if (raw.type == "particles") {
-            if (auto emIt = obj.find("emitters"); emIt != obj.end()) {
-                if (!parseEmitters(raw, emIt->second)) {
-                    return false;
-                }
-            }
-            // §18.5.4: death detection compares the spawn source against
-            // its previous tick — wire the hidden feedback edge here so
-            // the history machinery (§10) picks it up.
-            if (auto spIt = raw.inputs.find("spawn");
-                spIt != raw.inputs.end()) {
-                if (spIt->second.kind != RawInput::Kind::Conn ||
-                    spIt->second.conn.previous) {
-                    fail("node '" + raw.id + "': 'spawn' must be a direct "
-                         "(non-feedback) connection (§18.5.4)");
-                    return false;
-                }
-                RawInput prev = spIt->second;
-                prev.conn.previous = true;
-                raw.inputs["spawnPrev"] = std::move(prev);
-            }
         }
         mRawIndex[raw.id] = mRawNodes.size();
         mRawNodes.push_back(std::move(raw));
@@ -686,7 +620,138 @@ bool Loader::parseNodes(const glz::generic& json)
     return true;
 }
 
-bool Loader::parseEmitters(RawNode& raw, const glz::generic& json)
+bool Loader::parseRawNode(const glz::generic& entry, RawNode& raw,
+                          const std::string& specKey, bool inGraphFile)
+{
+    if (!entry.is_object()) {
+        fail("node entries must be objects");
+        return false;
+    }
+    const auto& obj = entry.get_object();
+    raw.json = &entry;
+
+    auto idIt = obj.find("id");
+    auto typeIt = obj.find("type");
+    if (idIt == obj.end() || !idIt->second.is_string() ||
+        typeIt == obj.end() || !typeIt->second.is_string()) {
+        fail("every node needs string 'id' and 'type'");
+        return false;
+    }
+    raw.id = idIt->second.get_string();
+    raw.type = typeIt->second.get_string();
+    if (!validId(raw.id)) {
+        fail("invalid node id '" + raw.id + "'");
+        return false;
+    }
+    if (raw.id == "time" || raw.id == "mouse") {
+        fail("node id '" + raw.id + "' is reserved (implicit input node)");
+        return false;
+    }
+    if (inGraphFile && raw.type == "output") {
+        fail("graph file node '" + raw.id +
+             "': a subgraph produces ports, not the frame (§19.1)");
+        return false;
+    }
+
+    // Unknown properties are a warning, not an error (§13) — but a
+    // typo'd property silently changing behavior is the worst authoring
+    // footgun, so say something.
+    static const std::map<std::string, std::vector<std::string>> kProps = {
+        { "wave", { "shape" } },
+        { "remap", { "clamp" } },
+        { "combine", {} },
+        { "split", {} },
+        { "sequence", { "duration", "loop", "tracks" } },
+        { "shader", { "shader", "size" } },
+        { "compute", { "shader", "capacity", "dispatch" } },
+        { "particles",
+          { "capacity", "emitter", "emitters", "spawnCount" } },
+        { "sprites", { "blend", "sheet" } },
+        { "trails", { "blend", "length" } },
+        { "image", { "src" } },
+        { "video", { "src", "loop" } },
+        { "transform", {} },
+        { "compositor", {} },
+        { "output", {} },
+        { "graph", { "graph" } },
+    };
+    if (auto propsIt = kProps.find(raw.type); propsIt != kProps.end()) {
+        for (const auto& [key, value] : obj) {
+            if (key == "id" || key == "type" || key == "inputs") {
+                continue;
+            }
+            const auto& known = propsIt->second;
+            if (std::find(known.begin(), known.end(), key) == known.end()) {
+                warn("node '" + raw.id + "': unknown property '" + key +
+                     "' ignored");
+            }
+        }
+    }
+
+    if (auto inputsIt = obj.find("inputs"); inputsIt != obj.end()) {
+        if (!inputsIt->second.is_object()) {
+            fail("node '" + raw.id + "': 'inputs' must be an object");
+            return false;
+        }
+        for (const auto& [port, value] : inputsIt->second.get_object()) {
+            RawInput in;
+            std::string err;
+            if (!parseRawInput(value, in, err)) {
+                fail("node '" + raw.id + "' input '" + port + "': " + err);
+                return false;
+            }
+            forEachConn(in, [&](const RawConn& conn) {
+                if (conn.node == "time") {
+                    mNeedsTime = true;
+                } else if (conn.node == "mouse") {
+                    mNeedsMouse = true;
+                }
+            });
+            raw.inputs[port] = std::move(in);
+        }
+    }
+    if (raw.type == "particles") {
+        if (auto emIt = obj.find("emitters"); emIt != obj.end()) {
+            if (!parseEmitters(raw, emIt->second, specKey + raw.id)) {
+                return false;
+            }
+        }
+        // §18.5.4: death detection compares the spawn source against
+        // its previous tick — wire the hidden feedback edge here so
+        // the history machinery (§10) picks it up.
+        if (auto spIt = raw.inputs.find("spawn"); spIt != raw.inputs.end()) {
+            if (spIt->second.kind != RawInput::Kind::Conn ||
+                spIt->second.conn.previous) {
+                fail("node '" + raw.id + "': 'spawn' must be a direct "
+                     "(non-feedback) connection (§18.5.4)");
+                return false;
+            }
+            RawInput prev = spIt->second;
+            prev.conn.previous = true;
+            raw.inputs["spawnPrev"] = std::move(prev);
+        }
+    }
+    if (inGraphFile) {
+        // §19.1: a subgraph's knobs are its declared inputs — scene
+        // parameters do not reach inside.
+        for (const auto& [port, in] : raw.inputs) {
+            bool param = in.kind == RawInput::Kind::Param;
+            for (const auto& e : in.elements) {
+                param = param || e.kind == RawInput::Kind::Param;
+            }
+            if (param) {
+                fail("graph file node '" + raw.id + "' input '" + port +
+                     "': $parameter references are not allowed in graph "
+                     "files (§19.1)");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool Loader::parseEmitters(RawNode& raw, const glz::generic& json,
+                           const std::string& specKey)
 {
     if (!json.is_array() || json.get_array().empty() ||
         json.get_array().size() > ParticlesNode::kMaxEmitters) {
@@ -753,8 +818,384 @@ bool Loader::parseEmitters(RawNode& raw, const glz::generic& json)
         spec.masks.push_back(mask);
         ++index;
     }
-    mEmitterSpecs[raw.id] = std::move(spec);
+    mEmitterSpecs[specKey] = std::move(spec);
     return true;
+}
+
+Loader::GraphDef* Loader::graphDef(const std::string& path)
+{
+    if (auto it = mGraphDefs.find(path); it != mGraphDefs.end()) {
+        return it->second.get(); // null = a previous parse already failed
+    }
+    auto& slot = mGraphDefs[path]; // stays null on every failure path
+
+    std::string text;
+    if (!mReadAsset(path, text)) {
+        fail("cannot open graph file '" + path + "' (§19.1)");
+        return nullptr;
+    }
+    auto def = std::make_unique<GraphDef>();
+    def->path = path;
+    def->doc = std::make_unique<glz::generic>();
+    if (auto ec = glz::read_json(*def->doc, text); ec) {
+        fail("graph file '" + path + "': " + glz::format_error(ec, text));
+        return nullptr;
+    }
+    if (!def->doc->is_object()) {
+        fail("graph file '" + path + "': top level must be an object");
+        return nullptr;
+    }
+    const auto& top = def->doc->get_object();
+
+    auto versionIt = top.find("version");
+    if (versionIt == top.end() || !versionIt->second.is_number() ||
+        (int)versionIt->second.get_number() != 1) {
+        fail("graph file '" + path +
+             "': unsupported or missing 'version' (expected 1)");
+        return nullptr;
+    }
+    def->name = path; // editor label; falls back to the path
+    if (auto nameIt = top.find("name");
+        nameIt != top.end() && nameIt->second.is_string()) {
+        def->name = nameIt->second.get_string();
+    }
+
+    auto nodesIt = top.find("nodes");
+    if (nodesIt == top.end() || !nodesIt->second.is_array()) {
+        fail("graph file '" + path + "': 'nodes' must be an array");
+        return nullptr;
+    }
+    for (const auto& entry : nodesIt->second.get_array()) {
+        RawNode raw;
+        if (!parseRawNode(entry, raw, path + "\n", /*inGraphFile=*/true)) {
+            mErrors.back() = "graph file '" + path + "': " + mErrors.back();
+            return nullptr;
+        }
+        if (def->nodeIds.count(raw.id)) {
+            fail("graph file '" + path + "': duplicate node id '" + raw.id +
+                 "'");
+            return nullptr;
+        }
+        def->nodeIds.insert(raw.id);
+        def->nodes.push_back(std::move(raw));
+    }
+
+    // The interface (§19.2). One writer per inner port: an exported input
+    // cannot bind a port the inner node sets itself, nor one another
+    // exported input already binds.
+    std::set<std::pair<std::string, std::string>> bound;
+    const auto innerNode = [&](const std::string& id) -> RawNode* {
+        for (auto& n : def->nodes) {
+            if (n.id == id) {
+                return &n;
+            }
+        }
+        return nullptr;
+    };
+    if (auto inIt = top.find("inputs"); inIt != top.end()) {
+        if (!inIt->second.is_object()) {
+            fail("graph file '" + path + "': 'inputs' must be an object");
+            return nullptr;
+        }
+        for (const auto& [name, decl] : inIt->second.get_object()) {
+            const std::string where =
+                "graph file '" + path + "' input '" + name + "'";
+            if (!validId(name)) {
+                fail(where + ": invalid name (§3)");
+                return nullptr;
+            }
+            if (!decl.is_object()) {
+                fail(where + ": declaration must be an object (§19.2)");
+                return nullptr;
+            }
+            const auto& d = decl.get_object();
+            GraphDef::In in;
+            auto typeIt = d.find("type");
+            std::string typeName = typeIt != d.end() &&
+                                       typeIt->second.is_string()
+                ? typeIt->second.get_string()
+                : "";
+            if (typeName == "texture") {
+                in.type = ValueType::Texture;
+            } else if (typeName == "event") {
+                in.type = ValueType::Event;
+            } else if (typeName == "buffer") {
+                in.type = ValueType::Buffer;
+            } else if (!parseValueType(typeName, in.type)) {
+                fail(where + ": unknown 'type' (§19.2)");
+                return nullptr;
+            }
+            if (auto defIt = d.find("default"); defIt != d.end()) {
+                if (componentCount(in.type) == 0) {
+                    fail(where + ": 'default' is for value types (§19.2)");
+                    return nullptr;
+                }
+                if (!parseLiteral(defIt->second, in.def) ||
+                    (in.def.type != in.type &&
+                     in.def.type != ValueType::Scalar)) {
+                    fail(where + ": invalid 'default' literal");
+                    return nullptr;
+                }
+                in.hasDefault = true;
+            }
+            auto bindIt = d.find("bind");
+            std::vector<const glz::generic*> binds;
+            if (bindIt != d.end() && bindIt->second.is_array()) {
+                for (const auto& b : bindIt->second.get_array()) {
+                    binds.push_back(&b);
+                }
+            } else if (bindIt != d.end()) {
+                binds.push_back(&bindIt->second);
+            }
+            if (binds.empty()) {
+                fail(where + ": 'bind' is required (§19.2)");
+                return nullptr;
+            }
+            for (const glz::generic* b : binds) {
+                RawInput ref;
+                std::string err;
+                if (!b->is_string() || !parseRawInput(*b, ref, err) ||
+                    ref.kind != RawInput::Kind::Conn || ref.conn.previous ||
+                    ref.conn.port.empty()) {
+                    fail(where + ": 'bind' entries must be \"@node.port\" "
+                         "references (§19.2)");
+                    return nullptr;
+                }
+                RawNode* target = innerNode(ref.conn.node);
+                if (!target) {
+                    fail(where + ": bind target '" + ref.conn.node +
+                         "' is not a node in this file");
+                    return nullptr;
+                }
+                if (target->inputs.count(ref.conn.port)) {
+                    fail(where + ": '" + ref.conn.node + "." +
+                         ref.conn.port +
+                         "' is already set by the node itself (§19.2)");
+                    return nullptr;
+                }
+                if (!bound.insert({ ref.conn.node, ref.conn.port }).second) {
+                    fail(where + ": '" + ref.conn.node + "." +
+                         ref.conn.port +
+                         "' is already bound by another input (§19.2)");
+                    return nullptr;
+                }
+                in.binds.push_back(ref.conn);
+            }
+            def->inputs.emplace_back(name, std::move(in));
+        }
+    }
+
+    auto outIt = top.find("outputs");
+    if (outIt == top.end() || !outIt->second.is_object() ||
+        outIt->second.get_object().empty()) {
+        fail("graph file '" + path +
+             "': 'outputs' must be a non-empty object (§19.2)");
+        return nullptr;
+    }
+    for (const auto& [name, ref] : outIt->second.get_object()) {
+        const std::string where =
+            "graph file '" + path + "' output '" + name + "'";
+        if (!validId(name)) {
+            fail(where + ": invalid name (§3)");
+            return nullptr;
+        }
+        RawInput parsed;
+        std::string err;
+        if (!ref.is_string() || !parseRawInput(ref, parsed, err) ||
+            parsed.kind != RawInput::Kind::Conn || parsed.conn.previous) {
+            fail(where + ": must be an \"@node\" or \"@node.port\" "
+                 "reference (§19.2)");
+            return nullptr;
+        }
+        if (!def->nodeIds.count(parsed.conn.node)) {
+            fail(where + ": '" + parsed.conn.node +
+                 "' is not a node in this file");
+            return nullptr;
+        }
+        def->outputs[name] = parsed.conn;
+    }
+    if (!def->outputs.count("result")) {
+        fail("graph file '" + path +
+             "': 'outputs' must include 'result' (§19.2)");
+        return nullptr;
+    }
+
+    slot = std::move(def);
+    return slot.get();
+}
+
+bool Loader::expandGraphs()
+{
+    for (int depth = 0;; ++depth) {
+        if (std::none_of(mRawNodes.begin(), mRawNodes.end(),
+                         [](const RawNode& n) { return n.type == "graph"; })) {
+            return true;
+        }
+        if (depth >= 8) {
+            fail("subgraph nesting deeper than 8 — instantiation cycle? "
+                 "(§19.1)");
+            return false;
+        }
+
+        // One level of expansion: instances become namespaced copies of
+        // their file's nodes, and everything that referenced an instance
+        // is rewritten to the mapped inner port afterwards.
+        std::vector<RawNode> out;
+        std::map<std::string, std::map<std::string, RawConn>> exports;
+        struct Apply {
+            std::string node; // namespaced inner id
+            std::string port;
+            RawInput value;
+        };
+        std::vector<Apply> applies;
+
+        for (RawNode& raw : mRawNodes) {
+            if (raw.type != "graph") {
+                out.push_back(std::move(raw));
+                continue;
+            }
+            const auto& obj = raw.json->get_object();
+            auto gIt = obj.find("graph");
+            if (gIt == obj.end() || !gIt->second.is_string()) {
+                fail("node '" + raw.id +
+                     "': 'graph' must be a graph file path (§19.3)");
+                return false;
+            }
+            GraphDef* def = graphDef(gIt->second.get_string());
+            if (!def) {
+                return false;
+            }
+            const std::string prefix = raw.id + "/";
+
+            // Instance bindings against the declared interface.
+            for (const auto& [name, in] : raw.inputs) {
+                const bool known = std::any_of(
+                    def->inputs.begin(), def->inputs.end(),
+                    [&](const auto& p) { return p.first == name; });
+                if (!known) {
+                    fail("node '" + raw.id + "': '" + name +
+                         "' is not an input of graph '" + def->name +
+                         "' (§19.2)");
+                    return false;
+                }
+            }
+            for (const auto& [name, decl] : def->inputs) {
+                const auto vIt = raw.inputs.find(name);
+                if (vIt == raw.inputs.end() && !decl.hasDefault) {
+                    fail("node '" + raw.id + "': required input '" + name +
+                         "' missing (§19.2)");
+                    return false;
+                }
+                RawInput value;
+                if (vIt != raw.inputs.end()) {
+                    value = vIt->second;
+                } else {
+                    value.kind = RawInput::Kind::Literal;
+                    value.literal = decl.def;
+                }
+                for (const RawConn& bind : decl.binds) {
+                    applies.push_back({ prefix + bind.node, bind.port,
+                                        value });
+                }
+            }
+
+            // Namespaced copies of the file's nodes.
+            for (const RawNode& inner : def->nodes) {
+                RawNode copy;
+                copy.id = prefix + inner.id;
+                copy.type = inner.type;
+                copy.json = inner.json; // GraphDef::doc keeps this alive
+                copy.inputs = inner.inputs;
+                for (auto& [port, in] : copy.inputs) {
+                    const auto ns = [&](RawConn& c) {
+                        if (def->nodeIds.count(c.node)) {
+                            c.node = prefix + c.node;
+                        }
+                    };
+                    ns(in.conn);
+                    for (auto& e : in.elements) {
+                        ns(e.conn);
+                    }
+                }
+                if (auto sIt =
+                        mEmitterSpecs.find(def->path + "\n" + inner.id);
+                    sIt != mEmitterSpecs.end()) {
+                    mEmitterSpecs[copy.id] = sIt->second;
+                }
+                out.push_back(std::move(copy));
+            }
+
+            for (const auto& [name, conn] : def->outputs) {
+                RawConn mapped = conn;
+                mapped.node = prefix + mapped.node;
+                exports[raw.id][name] = mapped;
+            }
+        }
+
+        std::map<std::string, size_t> index;
+        for (size_t i = 0; i < out.size(); ++i) {
+            index[out[i].id] = i;
+        }
+        for (const Apply& a : applies) {
+            RawNode& target = out[index.at(a.node)];
+            target.inputs[a.port] = a.value;
+            // §18.5.4's hidden feedback edge, for spawn arriving through
+            // the interface (the file-parse injection only covers spawn
+            // set on the inner node itself).
+            if (a.port == "spawn" && target.type == "particles") {
+                if (a.value.kind != RawInput::Kind::Conn ||
+                    a.value.conn.previous) {
+                    fail("node '" + a.node + "': 'spawn' must be a direct "
+                         "(non-feedback) connection (§18.5.4)");
+                    return false;
+                }
+                RawInput prev = a.value;
+                prev.conn.previous = true;
+                target.inputs["spawnPrev"] = std::move(prev);
+            }
+        }
+
+        // Rewrite references to the instances this round expanded.
+        for (RawNode& raw : out) {
+            for (auto& [port, in] : raw.inputs) {
+                const auto rewrite = [&](RawConn& c) -> bool {
+                    auto eIt = exports.find(c.node);
+                    if (eIt == exports.end()) {
+                        return true;
+                    }
+                    const std::string want =
+                        c.port.empty() ? "result" : c.port;
+                    auto pIt = eIt->second.find(want);
+                    if (pIt == eIt->second.end()) {
+                        fail("node '" + raw.id + "' input '" + port +
+                             "': graph instance '" + c.node +
+                             "' has no output '" + want + "' (§19.2)");
+                        return false;
+                    }
+                    const bool prev = c.previous;
+                    c = pIt->second;
+                    c.previous = prev;
+                    return true;
+                };
+                bool ok = true;
+                if (in.kind == RawInput::Kind::Conn) {
+                    ok = rewrite(in.conn);
+                }
+                for (auto& e : in.elements) {
+                    ok = ok && rewrite(e.conn);
+                }
+                if (!ok) {
+                    return false;
+                }
+            }
+        }
+
+        mRawNodes = std::move(out);
+        mRawIndex.clear();
+        for (size_t i = 0; i < mRawNodes.size(); ++i) {
+            mRawIndex[mRawNodes[i].id] = i;
+        }
+    }
 }
 
 bool Loader::topoSort()
@@ -1928,6 +2369,9 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
         if (nodesIt == top.end()) {
             fail("missing 'nodes'");
         }
+        return nullptr;
+    }
+    if (!expandGraphs()) {
         return nullptr;
     }
     if (!topoSort()) {

@@ -130,7 +130,13 @@
   <div id="viewTabs">
     <button id="tabPreview" class="active">Preview</button>
     <button id="tabGraph">Graph</button>
+    <button id="backBtn" hidden title="back to the parent graph">←</button>
+    <span id="crumb" class="dim" hidden></span>
     <button id="addNodeBtn" hidden>+ node</button>
+    <button id="makeSubBtn" hidden
+        title="collapse the selected nodes into a graphs/ file (§19)">make subgraph</button>
+    <button id="flattenBtn" hidden
+        title="inline this subgraph's nodes into the parent scene">flatten</button>
     <span id="graphStatus"></span>
     <span id="graphHint" class="dim" hidden>drag pins to wire (drop on
       nothing disconnects) · click inspects · Del removes ·
@@ -272,10 +278,12 @@ var Module = {
     const open = Module.cwrap('drift_open', 'number', ['string']);
     const reflect = Module.cwrap('drift_reflect', 'string', ['string']);
     const scenes = Module.cwrap('drift_scenes', 'string', []);
+    const graphs = Module.cwrap('drift_graphs', 'string', []);
     wasm = {
       describe,
       reflect,
       scenes,
+      graphs,
       time,
       seek,
       pause,
@@ -480,6 +488,8 @@ async function fetchSource() {
     sceneSource = null;
   }
   priorBindings.clear(); // a fresh document invalidates remembered bindings
+  viewStack = [];        // ...and any drilled-in subgraph view (§19.5)
+  graphDocs.clear();
   refreshGraph(); // callers refresh the panel before the source arrives
 }
 
@@ -600,6 +610,8 @@ function newScene() {
   currentValues.clear();
   setGraphStatus(null);
   priorBindings.clear();
+  viewStack = [];
+  graphDocs.clear();
   wasmManifest = JSON.parse(wasm.describe());
   sceneSource = JSON.parse(wasm.source());
   graphNeedsFit = true; // a whole new graph deserves a fresh framing
@@ -657,6 +669,25 @@ async function saveToFolder() {
       const wgslWritable = await wgslFile.createWritable();
       await wgslWritable.write(document.getElementById('wgsl').value);
       await wgslWritable.close();
+    }
+    // Subgraph files (§19) ride along with the scene.
+    const graphPaths = (() => {
+      try {
+        return JSON.parse(wasm?.graphs() ?? '[]');
+      } catch {
+        return [];
+      }
+    })();
+    if (graphPaths.length) {
+      const graphsDir = await dir.getDirectoryHandle('graphs',
+                                                     { create: true });
+      for (const path of graphPaths) {
+        const file = await graphsDir.getFileHandle(
+            path.replace(/^graphs\//, ''), { create: true });
+        const writable = await file.createWritable();
+        await writable.write(wasm.readAsset(path));
+        await writable.close();
+      }
     }
     console.log(`editor: saved to '${dir.name}'`);
     setStatus('wasmStatus',
@@ -1427,12 +1458,18 @@ const seqPrevLocal = new Map(); // seq id -> previous local time
 
 const graphCanvas = document.getElementById('graphCanvas');
 
+// Drill-in navigation state (§19.5), declared before the first setView so
+// updateGraphChrome can run from the deep-link path.
+let viewStack = []; // { path, doc, viaInstance }
+let selectedIds = new Set(); // multi-selection; selectedNodeId is primary
+
 function setView(showGraph) {
   document.body.classList.toggle('graph-mode', showGraph);
   document.getElementById('tabPreview').classList.toggle('active', !showGraph);
   document.getElementById('tabGraph').classList.toggle('active', showGraph);
   document.getElementById('graphHint').hidden = !showGraph;
   document.getElementById('addNodeBtn').hidden = !showGraph;
+  updateGraphChrome();
 }
 document.getElementById('tabPreview').onclick = () => setView(false);
 document.getElementById('tabGraph').onclick = () => setView(true);
@@ -1529,7 +1566,145 @@ const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d',
                        buffer: '#b48ade' };
 const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
 
+// ---- subgraphs (§19): interfaces, the drill-in view stack ------------------
+
+const projectRoot = () =>
+    scratchActive ? SCRATCH_ROOT : '/scenes/' + sceneName;
+
+// path -> parsed graph file (null while unreadable); dropped whenever the
+// underlying file may have changed.
+const graphDocs = new Map();
+
+function graphDoc(path) {
+  if (!graphDocs.has(path)) {
+    let doc = null;
+    try {
+      const text = wasm?.readAsset(path);
+      doc = text ? JSON.parse(text) : null;
+    } catch (err) {
+      console.log(`editor: graph file ${path}: ${err}`);
+    }
+    graphDocs.set(path, doc);
+  }
+  return graphDocs.get(path);
+}
+
+const typeCategory = (t) =>
+    t === 'texture' || t === 'event' || t === 'buffer' ? t : 'value';
+
+// The declared interface (§19.2) as editor pin lists; null while the file
+// is unreadable. The visiting set keeps a (never-valid) instantiation
+// cycle from hanging the page.
+const ifaceVisiting = new Set();
+
+function graphInterface(path) {
+  if (ifaceVisiting.has(path)) {
+    return null;
+  }
+  ifaceVisiting.add(path);
+  try {
+    const doc = graphDoc(path);
+    if (!doc) {
+      return null;
+    }
+    const inputs = Object.entries(doc.inputs ?? {}).map(([name, decl]) => [
+      name, typeCategory(decl?.type), false, decl?.default,
+    ]);
+    const outputs = Object.entries(doc.outputs ?? {}).map(([name, ref]) => {
+      const conn = parseConnection(ref);
+      const inner = doc.nodes?.find((n) => n.id === conn?.node);
+      const ports = inner ? outputsOf(inner) : [];
+      const port = ports.find(
+          ([n]) => n === (conn?.port ?? ports[0]?.[0]));
+      return [name, port ? port[1] : 'value'];
+    });
+    outputs.sort((a, b) => (b[0] === 'result') - (a[0] === 'result'));
+    return { inputs, outputs, name: doc.name ?? path };
+  } finally {
+    ifaceVisiting.delete(path);
+  }
+}
+
+// Drill-in navigation (§19.5): the canvas edits the top of the stack (the
+// state itself is declared up by setView); an empty stack is the scene
+// document itself.
+const activeDoc = () =>
+    viewStack.length ? viewStack[viewStack.length - 1].doc : sceneSource;
+const inSubgraph = () => viewStack.length > 0;
+
+function updateGraphChrome() {
+  const showGraph = document.body.classList.contains('graph-mode');
+  const view = viewStack[viewStack.length - 1];
+  document.getElementById('backBtn').hidden = !showGraph || !view;
+  const crumb = document.getElementById('crumb');
+  crumb.hidden = !showGraph || !view;
+  crumb.textContent =
+      view ? 'scene' + viewStack.map((v) => ' ▸ ' + v.path).join('') : '';
+  document.getElementById('flattenBtn').hidden = !showGraph ||
+      viewStack.length !== 1 || !view?.viaInstance;
+  document.getElementById('makeSubBtn').hidden =
+      !showGraph || !!view || selectedIds.size < 2 || !wasm;
+}
+
+function enterSubgraph(path, viaInstance) {
+  if (!wasm) {
+    setGraphStatus('the subgraph view needs the preview runtime');
+    return;
+  }
+  graphDocs.delete(path); // fresh read — the file may have changed
+  const doc = graphDoc(path);
+  if (!doc) {
+    setGraphStatus(`cannot read ${path}`);
+    return;
+  }
+  viewStack.push({ path, doc, viaInstance });
+  selectedNodeId = null;
+  selectedIds.clear();
+  graphNeedsFit = true;
+  refreshGraph();
+  updateGraphChrome();
+}
+
+function leaveSubgraph() {
+  viewStack.pop();
+  selectedNodeId = null;
+  selectedIds.clear();
+  graphNeedsFit = true;
+  refreshGraph();
+  updateGraphChrome();
+}
+
+// Writes the edited graph file and reloads the scene so flattening picks
+// the change up. File edits have no live-runtime channel (yet): the wall
+// keeps its scene until it reloads from disk.
+async function commitSubgraph() {
+  const view = viewStack[viewStack.length - 1];
+  wasm.writeAsset(projectRoot(), view.path,
+                  JSON.stringify(view.doc, null, 2) + '\n');
+  graphDocs.delete(view.path);
+  if (wasm.load(JSON.stringify(sceneSource))) {
+    for (const [name, values] of currentValues) {
+      wasm.set(name, values);
+    }
+    const manifest = JSON.parse(wasm.describe());
+    if (manifest.scene) {
+      wasmManifest = manifest;
+    }
+    setGraphStatus(live
+        ? `${view.path} saved — preview only until the live scene reloads`
+        : null);
+  } else {
+    setGraphStatus(
+        `draft — ${(wasm.errors() || 'load failed').split('\n')[0]}`);
+  }
+  refreshPanel();
+}
+
 function specInputsOf(source) {
+  if (source.type === 'graph') {
+    // §19.3: pins are the graph file's declared interface.
+    return graphInterface(source.graph)?.inputs ?? null;
+  }
   if (source.type === 'shader' || source.type === 'compute') {
     // The WGSL is the port declaration (§9.10/§18.2); the wasm runtime
     // reflects it. Without a preview runtime only bound ports get pins.
@@ -1555,6 +1730,9 @@ function reflectPorts(source, dir) {
 }
 
 function outputsOf(node) {
+  if (node.type === 'graph') {
+    return graphInterface(node.graph)?.outputs ?? [['result', 'value']];
+  }
   if (node.type === 'sequence') {
     return (node.tracks ?? []).filter((t) => t?.name).map((t) =>
         [t.name, t.kind === 'event' ? 'event' : 'value']);
@@ -1598,7 +1776,8 @@ let selectedNodeId = null;
 let graphNeedsFit = true;
 
 function buildGraph() {
-  if (!sceneSource?.nodes) {
+  const doc = activeDoc();
+  if (!doc?.nodes) {
     return null;
   }
   const nodes = [];
@@ -1656,15 +1835,17 @@ function buildGraph() {
     byId.set(node.id, node);
     return node;
   };
-  for (const source of sceneSource.nodes) {
+  for (const source of doc.nodes) {
     if (source?.id && !byId.has(source.id)) {
       add(source, false);
     }
   }
   // Parameters draw as source nodes (Unreal-style): "$name" bindings become
   // visible wires, and a declared-but-unused parameter stays grabbable.
-  // Graph ids are '$name' — a namespace no §3 node id can enter.
-  for (const [name, decl] of Object.entries(sceneSource.parameters ?? {})) {
+  // Graph ids are '$name' — a namespace no §3 node id can enter. Graph
+  // files have no parameters (§19.1), so the subgraph view skips this.
+  for (const [name, decl] of Object.entries(
+           (inSubgraph() ? null : doc.parameters) ?? {})) {
     if (typeof decl !== 'object' || decl === null) {
       continue;
     }
@@ -1714,6 +1895,52 @@ function buildGraph() {
       edges.push(edge);
     }
   }
+  // Subgraph view (§19.5): the declared interface draws as two boundary
+  // boxes, with its binds and output mappings as (read-only) wires.
+  if (inSubgraph()) {
+    const face = (id, inputs, outputs) => {
+      const node = {
+        id, type: 'interface', boundary: true,
+        source: { id, type: 'interface' }, implicit: false,
+        inputs, outputs, w: G.W,
+        h: G.HEAD + Math.max(inputs.length, outputs.length, 1) * G.ROW +
+            G.PAD,
+        x: 0, y: 0,
+      };
+      nodes.push(node);
+      byId.set(id, node);
+      return node;
+    };
+    const inFace = face('#inputs', [],
+        Object.entries(doc.inputs ?? {}).map(([name, decl]) =>
+            [name, typeCategory(decl?.type)]));
+    face('#outputs',
+        Object.keys(doc.outputs ?? {}).map((name) =>
+            ({ name, unbound: true, category: 'value' })),
+        []);
+    for (const [name, decl] of Object.entries(doc.inputs ?? {})) {
+      const binds = Array.isArray(decl?.bind) ? decl.bind : [decl?.bind];
+      for (const bind of binds) {
+        const conn = typeof bind === 'string' ? parseConnection(bind) : null;
+        const to = conn && byId.get(conn.node);
+        if (to) {
+          edges.push({ from: inFace.id, fromPort: name, to: to.id,
+                       toPort: conn.port, category: typeCategory(decl?.type),
+                       previous: false });
+        }
+      }
+    }
+    for (const [name, ref] of Object.entries(doc.outputs ?? {})) {
+      const conn = typeof ref === 'string' ? parseConnection(ref) : null;
+      const from = conn && byId.get(conn.node);
+      if (from) {
+        const fromPort = conn.port ?? from.outputs[0]?.[0];
+        const found = from.outputs.find(([n]) => n === fromPort);
+        edges.push({ from: from.id, fromPort, to: '#outputs', toPort: name,
+                     category: found ? found[1] : 'value', previous: false });
+      }
+    }
+  }
   layoutGraph(nodes, byId, edges);
   return { nodes, byId, edges };
 }
@@ -1754,7 +1981,7 @@ function layoutGraph(nodes, byId, edges) {
       y += node.h + G.GAP;
     }
   });
-  const positions = sceneSource?.editor?.positions;
+  const positions = activeDoc()?.editor?.positions;
   for (const [id, pos] of Object.entries(positions ?? {})) {
     const node = byId.get(id);
     if (node && Array.isArray(pos) && pos.length === 2 &&
@@ -1774,7 +2001,9 @@ function refreshGraph() {
   if (selectedNodeId && !graph?.byId.has(selectedNodeId)) {
     selectedNodeId = null;
   }
+  selectedIds = new Set([...selectedIds].filter((id) => graph?.byId.has(id)));
   renderInspector();
+  updateGraphChrome();
 }
 
 // ---- graph view: pin geometry (shared by drawing and hit tests) ------------
@@ -1851,9 +2080,31 @@ graphCanvas.onmousedown = (e) => {
   const hit = [...(graph?.nodes ?? [])].reverse().find((n) =>
       wx >= n.x && wx <= n.x + n.w && wy >= n.y && wy <= n.y + n.h);
   if (hit) {
-    selectedNodeId = hit.id;
+    if (e.shiftKey) {
+      // Shift toggles membership in the multi-selection (§19.5's
+      // make-subgraph source).
+      if (selectedIds.has(hit.id)) {
+        selectedIds.delete(hit.id);
+        if (selectedNodeId === hit.id) {
+          selectedNodeId = [...selectedIds].pop() ?? null;
+        }
+      } else {
+        selectedIds.add(hit.id);
+        selectedNodeId = hit.id;
+      }
+    } else {
+      if (!selectedIds.has(hit.id)) {
+        selectedIds = new Set([hit.id]); // clicking a member keeps the group
+      }
+      selectedNodeId = hit.id;
+    }
     renderInspector();
-    graphDrag = { kind: 'node', node: hit,
+    updateGraphChrome();
+    // Dragging any selected node moves the whole selection.
+    const group = selectedIds.has(hit.id)
+        ? [...selectedIds].map((id) => graph.byId.get(id)).filter(Boolean)
+        : [hit];
+    graphDrag = { kind: 'node', node: hit, nodes: group,
                   lastX: e.clientX, lastY: e.clientY, moved: false };
   } else {
     graphDrag = { kind: 'pan', lastX: e.clientX, lastY: e.clientY,
@@ -1875,8 +2126,10 @@ window.addEventListener('mousemove', (e) => {
   graphDrag.lastX = e.clientX;
   graphDrag.lastY = e.clientY;
   if (graphDrag.kind === 'node') {
-    graphDrag.node.x += dx;
-    graphDrag.node.y += dy;
+    for (const node of graphDrag.nodes ?? [graphDrag.node]) {
+      node.x += dx;
+      node.y += dy;
+    }
   } else {
     graphView.x += dx;
     graphView.y += dy;
@@ -1894,17 +2147,21 @@ window.addEventListener('mouseup', (e) => {
   if (!graphDrag) {
     return;
   }
-  if (graphDrag.kind === 'node' && graphDrag.moved && sceneSource) {
-    // Dropped position → the §2.1 editor block. Editor-only metadata, so
-    // the document is not pushed; Save… and the next real edit carry it.
-    const node = graphDrag.node;
-    node.x = Math.round(node.x);
-    node.y = Math.round(node.y);
-    ((sceneSource.editor ??= {}).positions ??= {})[node.id] =
-        [node.x, node.y];
+  if (graphDrag.kind === 'node' && graphDrag.moved && activeDoc()) {
+    // Dropped positions → the §2.1 editor block (of whichever document is
+    // in view). Editor-only metadata, so the document is not pushed;
+    // Save… and the next real edit carry it.
+    for (const node of graphDrag.nodes ?? [graphDrag.node]) {
+      node.x = Math.round(node.x);
+      node.y = Math.round(node.y);
+      ((activeDoc().editor ??= {}).positions ??= {})[node.id] =
+          [node.x, node.y];
+    }
   } else if (graphDrag.kind === 'pan' && !graphDrag.moved) {
     selectedNodeId = null; // background click clears the selection
+    selectedIds.clear();
     renderInspector();
+    updateGraphChrome();
   }
   graphDrag = null;
 });
@@ -1918,8 +2175,11 @@ window.addEventListener('mouseup', (e) => {
 // runtimes stay the validation authority: an invalid document keeps the old
 // scene running and the editor shows a draft status until the push takes.
 function startWireDrag(pin) {
-  if (!sceneSource) {
+  if (!activeDoc()) {
     return null;
+  }
+  if (pin.node.boundary) {
+    return null; // §19.5: interface binds are edited in the file (for now)
   }
   if (pin.side === 'out') {
     return { seek: 'in',
@@ -2072,6 +2332,9 @@ function applyWireDrop(drag, pin) {
 // then re-describe an accepting preview so the timeline and params follow
 // along (a live accept re-describes itself via its reload event).
 async function pushFromGraph() {
+  if (inSubgraph()) {
+    return commitSubgraph(); // §19.5: edits write the graph file instead
+  }
   const { wasmError } = await pushDocument() ?? {};
   if (wasm && !wasmError) {
     const manifest = JSON.parse(wasm.describe());
@@ -2212,7 +2475,7 @@ const NODE_DEFAULT_INPUTS = {
 };
 
 function freeNodeId(type) {
-  const taken = new Set(sceneSource.nodes.map((n) => n.id));
+  const taken = new Set(activeDoc().nodes.map((n) => n.id));
   for (let i = 1; ; i++) {
     const id = i === 1 ? type : `${type}${i}`;
     if (!taken.has(id)) {
@@ -2224,7 +2487,7 @@ function freeNodeId(type) {
 function placeAtViewCenter(key) {
   const cx = graphCanvas.clientWidth / 2 / graphView.scale - graphView.x;
   const cy = graphCanvas.clientHeight / 2 / graphView.scale - graphView.y;
-  ((sceneSource.editor ??= {}).positions ??= {})[key] =
+  ((activeDoc().editor ??= {}).positions ??= {})[key] =
       [Math.round(cx - G.W / 2), Math.round(cy - 30)];
 }
 
@@ -2254,8 +2517,9 @@ function addParameter(anchor) {
   });
 }
 
-function addNodeOfType(type, anchor) {
-  if (!sceneSource?.nodes) {
+function addNodeOfType(type, anchor, graphPath) {
+  const doc = activeDoc();
+  if (!doc?.nodes) {
     return;
   }
   anchor ??= document.getElementById('addNodeBtn').getBoundingClientRect();
@@ -2272,10 +2536,13 @@ function addNodeOfType(type, anchor) {
   if (type === 'compute') {
     fields.push({ key: 'capacity', label: 'capacity', value: '1000' });
   }
-  fields.push({ key: 'id', label: 'id', value: freeNodeId(type) });
-  openQuickForm(anchor, `add ${type}`, fields, (v) => {
+  const baseId = graphPath
+      ? graphPath.replace(/^graphs\//, '').replace(/\.json$/, '')
+      : type;
+  fields.push({ key: 'id', label: 'id', value: freeNodeId(baseId) });
+  openQuickForm(anchor, `add ${graphPath ?? type}`, fields, (v) => {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.id) || v.id === 'time' ||
-        v.id === 'mouse' || sceneSource.nodes.some((n) => n.id === v.id)) {
+        v.id === 'mouse' || doc.nodes.some((n) => n.id === v.id)) {
       return 'invalid, reserved, or duplicate id (§3)';
     }
     if ((fields[0].key === 'src' && !v.src) ||
@@ -2286,6 +2553,9 @@ function addNodeOfType(type, anchor) {
       return 'capacity must be a positive integer (§18.2)';
     }
     const node = { id: v.id, type };
+    if (graphPath) {
+      node.graph = graphPath; // §19.3 instance
+    }
     if (v.src) {
       node.src = v.src;
     }
@@ -2304,7 +2574,7 @@ function addNodeOfType(type, anchor) {
     if (NODE_DEFAULT_INPUTS[type]) {
       node.inputs = structuredClone(NODE_DEFAULT_INPUTS[type]);
     }
-    sceneSource.nodes.push(node);
+    doc.nodes.push(node);
     placeAtViewCenter(v.id);
     selectedNodeId = v.id;
     pushFromGraph();
@@ -2312,40 +2582,10 @@ function addNodeOfType(type, anchor) {
   });
 }
 
-function deleteSelectedNode() {
-  const node = graph?.byId.get(selectedNodeId);
-  if (!node || node.implicit) {
-    return;
-  }
-  if (!confirm(`delete ${node.param ? 'parameter' : 'node'} '${node.id}'? ` +
-               'wires to it are removed; a required port left unbound ' +
-               'keeps the scene a draft until rewired')) {
-    return;
-  }
-  if (node.param) {
-    delete sceneSource.parameters[node.param];
-    const ref = '$' + node.param;
-    for (const other of sceneSource.nodes) {
-      for (const [name, value] of Object.entries(other.inputs ?? {})) {
-        if (Array.isArray(value)) {
-          const kept = value.filter((el) => el !== ref);
-          if (kept.length !== value.length) {
-            other.inputs[name] = kept;
-          }
-        } else if (value === ref) {
-          unbindPort(other.id, other.inputs, name);
-        }
-      }
-    }
-    delete sceneSource.editor?.positions?.[node.id];
-    selectedNodeId = null;
-    pushFromGraph();
-    return;
-  }
-  const id = node.id;
+function removeNodeFromDoc(doc, id) {
   const refNode = (value) => parseConnection(value)?.node ?? null;
-  sceneSource.nodes = sceneSource.nodes.filter((n) => n.id !== id);
-  for (const other of sceneSource.nodes) {
+  doc.nodes = doc.nodes.filter((n) => n.id !== id);
+  for (const other of doc.nodes) {
     for (const [name, value] of Object.entries(other.inputs ?? {})) {
       if (Array.isArray(value)) {
         const kept = value.filter((el) => refNode(el) !== id);
@@ -2357,24 +2597,390 @@ function deleteSelectedNode() {
       }
     }
   }
-  delete sceneSource.editor?.positions?.[id];
+  delete doc.editor?.positions?.[id];
+}
+
+function deleteSelectedNode() {
+  const doc = activeDoc();
+  const targets = (selectedIds.size > 1 ? [...selectedIds] : [selectedNodeId])
+      .map((id) => graph?.byId.get(id))
+      .filter((n) => n && !n.implicit && !n.boundary &&
+                     !(n.param && selectedIds.size > 1));
+  if (!targets.length || !doc) {
+    return;
+  }
+  const what = targets.length > 1
+      ? `${targets.length} nodes`
+      : `${targets[0].param ? 'parameter' : 'node'} '${targets[0].id}'`;
+  if (!confirm(`delete ${what}? wires to it are removed; a required port ` +
+               'left unbound keeps the scene a draft until rewired')) {
+    return;
+  }
+  for (const node of targets) {
+    if (node.param) {
+      delete doc.parameters[node.param];
+      const ref = '$' + node.param;
+      for (const other of doc.nodes) {
+        for (const [name, value] of Object.entries(other.inputs ?? {})) {
+          if (Array.isArray(value)) {
+            const kept = value.filter((el) => el !== ref);
+            if (kept.length !== value.length) {
+              other.inputs[name] = kept;
+            }
+          } else if (value === ref) {
+            unbindPort(other.id, other.inputs, name);
+          }
+        }
+      }
+      delete doc.editor?.positions?.[node.id];
+      continue;
+    }
+    removeNodeFromDoc(doc, node.id);
+  }
   selectedNodeId = null;
+  selectedIds.clear();
   pushFromGraph();
 }
 
+// ---- §19.5: make-subgraph (collapse a selection) and flatten (inline) ------
+
+// Rewrites every connection in a raw input value through mapNode; a null
+// return keeps the original.
+function mapRefs(value, mapNode) {
+  if (Array.isArray(value) && value.some((el) => typeof el !== 'number')) {
+    return value.map((el) => mapRefs(el, mapNode));
+  }
+  const conn = parseConnection(value);
+  return (conn && mapNode(conn)) ?? value;
+}
+
+const refOf = (node, port, previous) => previous
+    ? { node, ...(port ? { port } : {}), previous: true }
+    : port ? `@${node}.${port}` : `@${node}`;
+
+// The declared §19.2 type for a boundary-crossing wire into node.port:
+// category pins it for texture/event/buffer; value ports fall back to the
+// parameter's declared type or the default literal's shape.
+function boundaryType(node, port, rawValue) {
+  const spec = specInputsOf(node.source)?.find(([n]) => n === port);
+  const category = spec?.[1];
+  if (category === 'texture' || category === 'event' ||
+      category === 'buffer') {
+    return category;
+  }
+  if (typeof rawValue === 'string' && rawValue[0] === '$') {
+    return sceneSource.parameters?.[rawValue.slice(1)]?.type ?? 'scalar';
+  }
+  const def = spec?.[3];
+  return Array.isArray(def) ? `vec${def.length}` : 'scalar';
+}
+
+function makeSubgraphFromSelection(anchor) {
+  if (inSubgraph() || !wasm || !sceneSource) {
+    return;
+  }
+  const picked = [...selectedIds].map((id) => graph?.byId.get(id))
+      .filter((n) => n && !n.implicit && !n.param && !n.boundary &&
+                     n.source.type !== 'output');
+  if (picked.length < 2 || picked.length !== selectedIds.size) {
+    setGraphStatus('make subgraph: select two or more regular nodes ' +
+                   '(the output node stays in the scene)');
+    return;
+  }
+  const ids = new Set(picked.map((n) => n.id));
+  // The selection must be connected through its own wires (undirected).
+  const adjacency = new Map([...ids].map((id) => [id, []]));
+  for (const edge of graph.edges) {
+    if (ids.has(edge.from) && ids.has(edge.to)) {
+      adjacency.get(edge.from).push(edge.to);
+      adjacency.get(edge.to).push(edge.from);
+    }
+  }
+  const seen = new Set([picked[0].id]);
+  const queue = [picked[0].id];
+  while (queue.length) {
+    for (const next of adjacency.get(queue.pop())) {
+      if (!seen.has(next)) {
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  if (seen.size !== ids.size) {
+    setGraphStatus('make subgraph: the selection must be connected');
+    return;
+  }
+  // §19.2 binds have no array-element form, so an outside wire INTO a
+  // selected array port (compositor layers) cannot become an interface
+  // input. Outgoing array consumption is fine — the outside element just
+  // rewires to the instance.
+  const arrayCrossesIn = (owner) =>
+      Object.values(owner.inputs ?? {}).some((value) =>
+          Array.isArray(value) && value.some((el) => {
+            const conn = parseConnection(el);
+            return conn && !ids.has(conn.node) &&
+                   !IMPLICIT_OUTPUTS[conn.node];
+          }));
+  if (picked.some((n) => arrayCrossesIn(n.source))) {
+    setGraphStatus('make subgraph: an outside wire into a selected array ' +
+                   'port (layers) is not supported yet');
+    return;
+  }
+  setGraphStatus(null);
+
+  openQuickForm(anchor, 'make subgraph', [
+    { key: 'name', label: 'file name', value: 'block' },
+  ], (v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(v.name)) {
+      return 'a simple file name (letters, digits, _ or -)';
+    }
+    const path = `graphs/${v.name}.json`;
+    if (wasm.readAsset(path)) {
+      return `${path} already exists`;
+    }
+
+    const file = { version: 1, name: v.name, inputs: {}, outputs: {},
+                   nodes: [] };
+    const instId = freeNodeId(v.name.replace(/-/g, '_'));
+    const instInputs = {};
+    const usedNames = new Set();
+    const exportName = (want) => {
+      let name = want.replace(/[^A-Za-z0-9_]/g, '_');
+      if (!/^[A-Za-z_]/.test(name)) {
+        name = '_' + name;
+      }
+      while (usedNames.has(name)) {
+        name += '_';
+      }
+      usedNames.add(name);
+      return name;
+    };
+    const paramInputs = new Map(); // $param -> exported input name
+
+    // Inner copies; boundary-crossing and $param bindings become the
+    // interface (incoming wires -> declared inputs).
+    for (const node of picked) {
+      const src = structuredClone(node.source);
+      for (const [port, value] of Object.entries(src.inputs ?? {})) {
+        const conn = parseConnection(value);
+        if (conn && !ids.has(conn.node) && !IMPLICIT_OUTPUTS[conn.node]) {
+          const name = exportName(port);
+          file.inputs[name] = { type: boundaryType(node, port, value),
+                                bind: `@${src.id}.${port}` };
+          instInputs[name] = value; // keeps previous/object form
+          delete src.inputs[port];
+        } else if (typeof value === 'string' && value[0] === '$') {
+          const param = value.slice(1);
+          if (!paramInputs.has(param)) {
+            const name = exportName(param);
+            paramInputs.set(param, name);
+            file.inputs[name] = { type: boundaryType(node, port, value),
+                                  bind: [] };
+            instInputs[name] = value;
+          }
+          const decl = file.inputs[paramInputs.get(param)];
+          decl.bind = [].concat(decl.bind, `@${src.id}.${port}`);
+          delete src.inputs[port];
+        }
+      }
+      file.nodes.push(src);
+      const pos = sceneSource.editor?.positions?.[src.id];
+      if (pos) {
+        ((file.editor ??= {}).positions ??= {})[src.id] = pos;
+      }
+    }
+
+    // Outgoing wires -> declared outputs; consumers rewire to the instance.
+    const exports = new Map(); // 'node.port' -> exported name
+    for (const other of sceneSource.nodes) {
+      if (ids.has(other.id)) {
+        continue;
+      }
+      for (const [port, value] of Object.entries(other.inputs ?? {})) {
+        other.inputs[port] = mapRefs(value, (conn) => {
+          if (!ids.has(conn.node)) {
+            return null;
+          }
+          const producer = graph.byId.get(conn.node);
+          const fromPort =
+              conn.port ?? outputsOf(producer.source)[0]?.[0] ?? 'result';
+          const key = `${conn.node}.${fromPort}`;
+          if (!exports.has(key)) {
+            const name = exports.size ? exportName(`${conn.node}_${fromPort}`)
+                                      : 'result';
+            exports.set(key, name);
+            file.outputs[name] = `@${conn.node}.${fromPort}`;
+          }
+          return refOf(instId, exports.get(key), conn.previous);
+        });
+      }
+    }
+    if (!exports.size) {
+      // Nothing outside consumes the selection: export the sink so the
+      // file still has its required 'result' (§19.2).
+      const consumedInside = new Set(graph.edges
+          .filter((e) => ids.has(e.from) && ids.has(e.to))
+          .map((e) => e.from));
+      const sink = picked.find((n) => !consumedInside.has(n.id)) ?? picked[0];
+      file.outputs.result =
+          `@${sink.id}.${outputsOf(sink.source)[0]?.[0] ?? 'result'}`;
+    }
+
+    // Swap the selection for the instance.
+    const at = sceneSource.nodes.findIndex((n) => ids.has(n.id));
+    sceneSource.nodes = sceneSource.nodes.filter((n) => !ids.has(n.id));
+    const inst = { id: instId, type: 'graph', graph: path };
+    if (Object.keys(instInputs).length) {
+      inst.inputs = instInputs;
+    }
+    sceneSource.nodes.splice(Math.max(at, 0), 0, inst);
+    const positions = (sceneSource.editor ??= {}).positions ??= {};
+    positions[instId] = [
+      Math.round(picked.reduce((s, n) => s + n.x, 0) / picked.length),
+      Math.round(picked.reduce((s, n) => s + n.y, 0) / picked.length),
+    ];
+    for (const id of ids) {
+      delete positions[id];
+    }
+
+    wasm.writeAsset(projectRoot(), path,
+                    JSON.stringify(file, null, 2) + '\n');
+    graphDocs.delete(path);
+    selectedIds = new Set([instId]);
+    selectedNodeId = instId;
+    pushFromGraph();
+    return null;
+  });
+}
+
+// The inverse: inline the instance this subgraph view was entered through
+// back into the scene, keeping the inlined nodes selected.
+function flattenInstance() {
+  const view = viewStack[0];
+  if (viewStack.length !== 1 || !view?.viaInstance || !sceneSource) {
+    return;
+  }
+  const inst = sceneSource.nodes.find((n) => n.id === view.viaInstance);
+  if (!inst) {
+    return;
+  }
+  const doc = view.doc;
+  const taken = new Set(sceneSource.nodes.map((n) => n.id));
+  taken.delete(inst.id);
+  const rename = new Map();
+  for (const inner of doc.nodes ?? []) {
+    let id = `${inst.id}_${inner.id}`;
+    for (let i = 2; taken.has(id); ++i) {
+      id = `${inst.id}_${inner.id}${i}`;
+    }
+    taken.add(id);
+    rename.set(inner.id, id);
+  }
+  const copies = (doc.nodes ?? []).map((inner) => {
+    const copy = structuredClone(inner);
+    copy.id = rename.get(inner.id);
+    for (const [port, value] of Object.entries(copy.inputs ?? {})) {
+      copy.inputs[port] = mapRefs(value, (conn) =>
+          rename.has(conn.node)
+              ? refOf(rename.get(conn.node), conn.port, conn.previous)
+              : null);
+    }
+    return copy;
+  });
+  // Interface inputs land on their bound ports; declared defaults fill the
+  // unbound ones so behavior is unchanged (§19.3).
+  for (const [name, decl] of Object.entries(doc.inputs ?? {})) {
+    const value = inst.inputs?.[name] ?? decl?.default;
+    if (value === undefined) {
+      continue;
+    }
+    for (const bind of [].concat(decl?.bind ?? [])) {
+      const conn = typeof bind === 'string' ? parseConnection(bind) : null;
+      const target =
+          conn && copies.find((c) => c.id === rename.get(conn.node));
+      if (target) {
+        (target.inputs ??= {})[conn.port] = structuredClone(value);
+      }
+    }
+  }
+  // Outer consumers of the instance follow the output mapping.
+  const exportsMap = new Map(Object.entries(doc.outputs ?? {}).map(
+      ([name, ref]) => {
+        const conn = parseConnection(ref);
+        return [name, conn ? { node: rename.get(conn.node),
+                               port: conn.port ?? null } : null];
+      }));
+  for (const other of sceneSource.nodes) {
+    if (other.id === inst.id) {
+      continue;
+    }
+    for (const [port, value] of Object.entries(other.inputs ?? {})) {
+      other.inputs[port] = mapRefs(value, (conn) => {
+        if (conn.node !== inst.id) {
+          return null;
+        }
+        const exp = exportsMap.get(conn.port ?? 'result');
+        return exp ? refOf(exp.node, exp.port, conn.previous) : null;
+      });
+    }
+  }
+  const at = sceneSource.nodes.indexOf(inst);
+  sceneSource.nodes.splice(at, 1, ...copies);
+  const positions = (sceneSource.editor ??= {}).positions ??= {};
+  const base = positions[inst.id] ?? [60, 60];
+  delete positions[inst.id];
+  const filePos = doc.editor?.positions ?? {};
+  const minX = Math.min(...Object.values(filePos).map((p) => p[0]), 0);
+  const minY = Math.min(...Object.values(filePos).map((p) => p[1]), 0);
+  copies.forEach((copy, i) => {
+    const pos = filePos[(doc.nodes ?? [])[i]?.id];
+    positions[copy.id] = pos
+        ? [base[0] + pos[0] - minX, base[1] + pos[1] - minY]
+        : [base[0] + (i % 3) * 180, base[1] + Math.floor(i / 3) * 90];
+  });
+  viewStack = [];
+  selectedIds = new Set(copies.map((c) => c.id));
+  selectedNodeId = copies[0]?.id ?? null;
+  graphNeedsFit = true;
+  setGraphStatus(null);
+  pushFromGraph();
+  updateGraphChrome();
+}
+
+document.getElementById('makeSubBtn').onclick = (e) =>
+    makeSubgraphFromSelection(e.target.getBoundingClientRect());
+document.getElementById('flattenBtn').onclick = flattenInstance;
+
 const nodeMenu = document.getElementById('nodeMenu');
-for (const type of NODE_PALETTE) {
-  const button = document.createElement('button');
-  button.textContent = type;
-  button.onclick = (e) => {
-    const anchor = e.target.getBoundingClientRect();
-    nodeMenu.hidden = true;
-    addNodeOfType(type, anchor);
-  };
-  nodeMenu.appendChild(button);
+// Rebuilt on open: the graphs/ entries (§19) depend on the project, and a
+// graph file cannot declare parameters (§19.1).
+function rebuildNodeMenu() {
+  nodeMenu.textContent = '';
+  const items = NODE_PALETTE
+      .filter((type) => !(inSubgraph() && type === 'parameter'))
+      .map((type) => ({ label: type, type }));
+  try {
+    for (const path of JSON.parse(wasm?.graphs() ?? '[]')) {
+      items.push({
+        label: '▣ ' + path.replace(/^graphs\//, '').replace(/\.json$/, ''),
+        type: 'graph', graphPath: path,
+      });
+    }
+  } catch { /* no runtime, no graph entries */ }
+  for (const item of items) {
+    const button = document.createElement('button');
+    button.textContent = item.label;
+    button.onclick = (e) => {
+      const anchor = e.target.getBoundingClientRect();
+      nodeMenu.hidden = true;
+      addNodeOfType(item.type, anchor, item.graphPath);
+    };
+    nodeMenu.appendChild(button);
+  }
 }
 document.getElementById('addNodeBtn').onclick = (e) => {
   const rect = e.target.getBoundingClientRect();
+  rebuildNodeMenu();
   nodeMenu.style.left = rect.left + 'px';
   nodeMenu.style.top = rect.bottom + 4 + 'px';
   nodeMenu.hidden = !nodeMenu.hidden;
@@ -2407,7 +3013,35 @@ graphCanvas.addEventListener('wheel', (e) => {
   graphView.y = e.offsetY / next - wy;
 }, { passive: false });
 
-graphCanvas.ondblclick = () => fitGraphView();
+// Double- or middle-click on a graph instance drills into the subgraph
+// (§19.5); double-click elsewhere refits the view.
+function nodeAtClient(clientX, clientY) {
+  const { x, y } = graphWorldOf(clientX, clientY);
+  return [...(graph?.nodes ?? [])].reverse().find((n) =>
+      x >= n.x && x <= n.x + n.w && y >= n.y && y <= n.y + n.h);
+}
+
+graphCanvas.ondblclick = (e) => {
+  const hit = nodeAtClient(e.clientX, e.clientY);
+  if (hit?.source?.type === 'graph' &&
+      typeof hit.source.graph === 'string') {
+    enterSubgraph(hit.source.graph, hit.id);
+    return;
+  }
+  fitGraphView();
+};
+graphCanvas.addEventListener('auxclick', (e) => {
+  if (e.button !== 1) {
+    return;
+  }
+  e.preventDefault();
+  const hit = nodeAtClient(e.clientX, e.clientY);
+  if (hit?.source?.type === 'graph' &&
+      typeof hit.source.graph === 'string') {
+    enterSubgraph(hit.source.graph, hit.id);
+  }
+});
+document.getElementById('backBtn').onclick = leaveSubgraph;
 
 // ---- graph view: drawing ---------------------------------------------------
 
@@ -2479,7 +3113,7 @@ function drawGraph() {
     return text.length > 12 ? text.slice(0, 11) + '…' : text;
   };
   for (const node of graph.nodes) {
-    const selected = node.id === selectedNodeId;
+    const selected = node.id === selectedNodeId || selectedIds.has(node.id);
     const draft = graphDraftIds.has(node.id);
     ctx.beginPath();
     ctx.roundRect(node.x, node.y, node.w, node.h, node.param ? 12 : 6);

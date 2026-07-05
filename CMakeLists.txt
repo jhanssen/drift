@@ -73,7 +73,7 @@ if(EMSCRIPTEN)
         SUFFIX ".html"
         LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
-                         comets fireworks)
+                         comets fireworks bokeh)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
@@ -182,4 +182,5 @@ if(BUILD_TESTING)
     drift_golden_test(sparks)
     drift_golden_test(comets)
     drift_golden_test(fireworks)
+    drift_golden_test(bokeh)
 endif()

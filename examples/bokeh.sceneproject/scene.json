@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "Bokeh",
+  "description": "§19 subgraphs: one graphs/bokeh.json block instantiated twice — a cool far field and a warm near field with different depths, so the pointer parallaxes them apart.",
+  "nodes": [
+    { "id": "sway", "type": "remap",
+      "inputs": { "value": "@mouse.position", "inMin": 0, "inMax": 1,
+                  "outMin": -0.12, "outMax": 0.12 } },
+
+    { "id": "far", "type": "graph", "graph": "graphs/bokeh.json",
+      "inputs": { "tint": [0.40, 0.60, 0.95, 0.55],
+                  "tintEnd": [0.30, 0.45, 0.90, 0],
+                  "rate": 14, "size": [0.01, 0.03],
+                  "depth": [0.1, 0.3], "parallax": "@sway" } },
+
+    { "id": "near", "type": "graph", "graph": "graphs/bokeh.json",
+      "inputs": { "tint": [1.0, 0.75, 0.45, 0.7],
+                  "tintEnd": [0.95, 0.55, 0.35, 0],
+                  "rate": 5, "size": [0.05, 0.12],
+                  "depth": [0.7, 1.0], "parallax": "@sway" } },
+
+    { "id": "bg", "type": "shader", "shader": "shaders/dusk.wgsl" },
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@bg", "@far", "@near"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}
