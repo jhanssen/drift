@@ -103,7 +103,7 @@ if(EMSCRIPTEN)
         "-sALLOW_MEMORY_GROWTH=1"
         "-sSTACK_SIZE=1048576"
         "-sENVIRONMENT=web"
-        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap"
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS"
         "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/src/platform/web/shell.html"
         ${DRIFT_WEB_PRELOADS}
     )

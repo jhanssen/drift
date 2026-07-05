@@ -138,12 +138,14 @@ Host writes inputs → WASM update() → outputs written → host applies change
 
 ### 5.4 Project Storage Providers
 
-Design adopted 2026-07-05 (not yet implemented). The editor reads and
-writes projects through a **storage provider** abstraction; the WASM
-runtime's in-memory filesystem is only the working copy the preview
-renders from, never the source of truth. Every project write funnels
-through one path (today: preview FS + live wall) and fans out to the
-active provider.
+Design adopted 2026-07-05; first implementation same day (directory and
+origin-private projects, recents, write-through, the failure-driven
+store overlay — zip import/export, asset drag-drop, and `list-assets`
+remain). The editor reads and writes projects through a **storage
+provider** abstraction; the WASM runtime's in-memory filesystem is only
+the working copy the preview renders from, never the source of truth.
+Every project write funnels through one path and fans out to the active
+provider.
 
 Providers:
 
