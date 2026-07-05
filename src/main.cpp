@@ -472,6 +472,68 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
                                          std::string& error) {
             return applyDocument(&sceneJson, error);
         };
+        // Project file access (write-asset/read-asset): same confinement
+        // as the loader's AssetReader — project-root relative, no "..",
+        // no absolute paths. Writes create directories, like the web
+        // runtime's drift_write_asset; a follow-up load/reload applies.
+        auto confinedPath = [&scenePath](const std::string& rel,
+                                         std::filesystem::path& out,
+                                         std::string& error) {
+            namespace fs = std::filesystem;
+            if (scenePath.empty()) {
+                error = "no scene loaded";
+                return false;
+            }
+            for (const auto& part : fs::path(rel)) {
+                if (part == "..") {
+                    error = "path escapes the project";
+                    return false;
+                }
+            }
+            if (rel.empty() || fs::path(rel).is_absolute()) {
+                error = "path must be project-relative";
+                return false;
+            }
+            fs::path root(scenePath);
+            if (fs::is_regular_file(root)) {
+                root = root.parent_path();
+            }
+            out = root / rel;
+            return true;
+        };
+        callbacks.writeAsset = [confinedPath](const std::string& rel,
+                                              const std::string& contents,
+                                              std::string& error) {
+            std::filesystem::path full;
+            if (!confinedPath(rel, full, error)) {
+                return false;
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(full.parent_path(), ec);
+            std::ofstream out(full, std::ios::binary | std::ios::trunc);
+            if (!out || !(out << contents).good()) {
+                error = "cannot write '" + rel + "'";
+                return false;
+            }
+            return true;
+        };
+        callbacks.readAsset = [confinedPath](const std::string& rel,
+                                             std::string& out,
+                                             std::string& error) {
+            std::filesystem::path full;
+            if (!confinedPath(rel, full, error)) {
+                return false;
+            }
+            std::ifstream in(full, std::ios::binary);
+            if (!in) {
+                error = "cannot read '" + rel + "'";
+                return false;
+            }
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            out = ss.str();
+            return true;
+        };
         callbacks.fire = [anyScene, &firstScene, &scenes, &app](
                              const std::string& node, const std::string& port,
                              std::string& error) {

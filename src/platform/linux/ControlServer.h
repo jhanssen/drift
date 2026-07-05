@@ -28,6 +28,15 @@
 //   -> {"id":9,"method":"fire","params":{"node":"seq","port":"cue"}}
 //                                          (manually fire an event output —
 //                                           the editor's "fire now" verb)
+//   -> {"id":10,"method":"write-asset","params":{"path":"graphs/x.json",
+//                                                "contents":"..."}}
+//                                          (write a project file — §19
+//                                           subgraph edits and the shader
+//                                           pane; project-root confined,
+//                                           text only; follow with load/
+//                                           reload to apply)
+//   -> {"id":11,"method":"read-asset","params":{"path":"graphs/x.json"}}
+//   <- {"id":11,"result":{"contents":"..."}}
 //   <- {"event":"transport","paused":B,"seconds":T}   (after pause/seek)
 //   <- {"event":"reload"}                  (after reload/load; clients
 //                                           should re-describe)
@@ -76,6 +85,13 @@ public:
             load;
         std::function<bool(const std::string& node, const std::string& port,
                            std::string& error)> fire;
+        // Project files (write-asset/read-asset): paths are project-root
+        // relative and confined there; the callback owner enforces it.
+        std::function<bool(const std::string& path,
+                           const std::string& contents, std::string& error)>
+            writeAsset;
+        std::function<bool(const std::string& path, std::string& out,
+                           std::string& error)> readAsset;
     };
 
     ~ControlServer();

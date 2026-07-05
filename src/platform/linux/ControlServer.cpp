@@ -567,6 +567,52 @@ void ControlServer::handleRequest(int fd, Client& client, const std::string& tex
         return;
     }
 
+    if (method == "write-asset" || method == "read-asset") {
+        std::string path;
+        const std::string* contents = nullptr;
+        if (auto paramsIt = obj.find("params");
+            paramsIt != obj.end() && paramsIt->second.is_object()) {
+            const auto& params = paramsIt->second.get_object();
+            if (auto it = params.find("path");
+                it != params.end() && it->second.is_string()) {
+                path = it->second.get_string();
+            }
+            if (auto it = params.find("contents");
+                it != params.end() && it->second.is_string()) {
+                contents = &it->second.get_string();
+            }
+        }
+        if (path.empty() || (method == "write-asset" && !contents)) {
+            respond("\"error\":\"'" + method +
+                    "' needs a string 'path'" +
+                    (method == "write-asset" ? " and 'contents'" : "") +
+                    "\"");
+            return;
+        }
+        std::string error;
+        if (method == "write-asset") {
+            if (!mCallbacks.writeAsset ||
+                !mCallbacks.writeAsset(path, *contents, error)) {
+                respond("\"error\":\"" +
+                        jsonEscape(error.empty() ? "unsupported" : error) +
+                        "\"");
+                return;
+            }
+            respond("\"result\":{}");
+            return;
+        }
+        std::string out;
+        if (!mCallbacks.readAsset ||
+            !mCallbacks.readAsset(path, out, error)) {
+            respond("\"error\":\"" +
+                    jsonEscape(error.empty() ? "unsupported" : error) +
+                    "\"");
+            return;
+        }
+        respond("\"result\":{\"contents\":\"" + jsonEscape(out) + "\"}");
+        return;
+    }
+
     respond("\"error\":\"unknown method '" + jsonEscape(method) + "'\"");
 }
 

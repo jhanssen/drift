@@ -11,6 +11,10 @@
 //        driftctl.mjs [--port N] fire NODE PORT   (fire an event output)
 //        driftctl.mjs [--port N] source           (print the scene document)
 //        driftctl.mjs [--port N] load FILE        (push a scene document)
+//        driftctl.mjs [--port N] write-asset PATH FILE  (write a project
+//                                                 file, e.g. graphs/x.json;
+//                                                 follow with reload/load)
+//        driftctl.mjs [--port N] read-asset PATH  (print a project file)
 //        driftctl.mjs [--port N] watch            (print events)
 
 import fs from 'node:fs';
@@ -52,6 +56,16 @@ if (command === 'describe' || command === 'reload' || command === 'source') {
   const port = args.shift();
   if (!node || !port) usage();
   request = { id: 1, method: 'fire', params: { node, port } };
+} else if (command === 'write-asset') {
+  const path = args.shift();
+  const file = args.shift();
+  if (!path || !file) usage();
+  request = { id: 1, method: 'write-asset',
+              params: { path, contents: fs.readFileSync(file, 'utf8') } };
+} else if (command === 'read-asset') {
+  const path = args.shift();
+  if (!path) usage();
+  request = { id: 1, method: 'read-asset', params: { path } };
 } else if (command === 'pause' || command === 'resume') {
   request = { id: 1, method: 'pause',
               params: { paused: command === 'pause' } };
