@@ -1571,6 +1571,18 @@ const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
 const projectRoot = () =>
     scratchActive ? SCRATCH_ROOT : '/scenes/' + sceneName;
 
+// §20.1: paths inside a package's graph file resolve against the package
+// root — mirror the loader's rewrite when reading, reflecting, or
+// flattening package content.
+const pkgRootOf = (path) =>
+    (typeof path === 'string' &&
+     path.match(/^packages\/[a-z0-9-]+\//)?.[0]) || '';
+const activeDocRoot = () =>
+    viewStack.length ? pkgRootOf(viewStack[viewStack.length - 1].path) : '';
+const resolveDocPath = (p, base) =>
+    base && typeof p === 'string' && !p.startsWith('packages/') ? base + p
+                                                                : p;
+
 // path -> parsed graph file (null while unreadable); dropped whenever the
 // underlying file may have changed.
 const graphDocs = new Map();
@@ -1613,7 +1625,7 @@ function graphInterface(path) {
     const outputs = Object.entries(doc.outputs ?? {}).map(([name, ref]) => {
       const conn = parseConnection(ref);
       const inner = doc.nodes?.find((n) => n.id === conn?.node);
-      const ports = inner ? outputsOf(inner) : [];
+      const ports = inner ? outputsOf(inner, pkgRootOf(path)) : [];
       const port = ports.find(
           ([n]) => n === (conn?.port ?? ports[0]?.[0]));
       return [name, port ? port[1] : 'value'];
@@ -1652,6 +1664,10 @@ function enterSubgraph(path, viaInstance) {
     setGraphStatus('the subgraph view needs the preview runtime');
     return;
   }
+  // A nested instance inside a package references its file
+  // package-relative (§20.1); canonicalize so reads and the read-only
+  // check see the packages/ form.
+  path = resolveDocPath(path, activeDocRoot());
   graphDocs.delete(path); // fresh read — the file may have changed
   const doc = graphDoc(path);
   if (!doc) {
@@ -1737,15 +1753,16 @@ async function commitSubgraph() {
   refreshPanel();
 }
 
-function specInputsOf(source) {
+function specInputsOf(source, base = activeDocRoot()) {
   if (source.type === 'graph') {
     // §19.3: pins are the graph file's declared interface.
-    return graphInterface(source.graph)?.inputs ?? null;
+    return graphInterface(resolveDocPath(source.graph, base))?.inputs ??
+           null;
   }
   if (source.type === 'shader' || source.type === 'compute') {
     // The WGSL is the port declaration (§9.10/§18.2); the wasm runtime
     // reflects it. Without a preview runtime only bound ports get pins.
-    return reflectPorts(source, false)?.map((p) =>
+    return reflectPorts(source, false, base)?.map((p) =>
         [p.name, reflectCategory(p), false]) ?? null;
   }
   return NODE_INPUTS[source.type] ?? null;
@@ -1754,21 +1771,23 @@ function specInputsOf(source) {
 const reflectCategory = (p) =>
     p.type === 'texture' ? 'texture' : p.type === 'buffer' ? 'buffer' : 'value';
 
-function reflectPorts(source, dir) {
+function reflectPorts(source, dir, base = activeDocRoot()) {
   if (!wasm || typeof source.shader !== 'string') {
     return null;
   }
   try {
-    const reflected = JSON.parse(wasm.reflect(source.shader));
+    const reflected =
+        JSON.parse(wasm.reflect(resolveDocPath(source.shader, base)));
     return reflected.ports?.filter((p) => (p.dir === 'out') === dir) ?? null;
   } catch {
     return null;
   }
 }
 
-function outputsOf(node) {
+function outputsOf(node, base = activeDocRoot()) {
   if (node.type === 'graph') {
-    return graphInterface(node.graph)?.outputs ?? [['result', 'value']];
+    return graphInterface(resolveDocPath(node.graph, base))?.outputs ??
+           [['result', 'value']];
   }
   if (node.type === 'sequence') {
     return (node.tracks ?? []).filter((t) => t?.name).map((t) =>
@@ -1776,7 +1795,7 @@ function outputsOf(node) {
   }
   if (node.type === 'compute') {
     // §18.2: outputs are the read_write storage bindings, reflected.
-    return reflectPorts(node, true)?.map((p) =>
+    return reflectPorts(node, true, base)?.map((p) =>
         [p.name, reflectCategory(p)]) ?? [];
   }
   return NODE_OUTPUTS[node.type] ?? [['result', 'value']];
@@ -3085,6 +3104,14 @@ function flattenInstance() {
   const copies = (doc.nodes ?? []).map((inner) => {
     const copy = structuredClone(inner);
     copy.id = rename.get(inner.id);
+    // §20.1: a package's inner paths are package-relative; inlined into
+    // the scene they must carry the package root (the loader's rewrite).
+    const base = pkgRootOf(view.path);
+    for (const key of ['shader', 'src', 'graph']) {
+      if (typeof copy[key] === 'string') {
+        copy[key] = resolveDocPath(copy[key], base);
+      }
+    }
     for (const [port, value] of Object.entries(copy.inputs ?? {})) {
       copy.inputs[port] = mapRefs(value, (conn) =>
           rename.has(conn.node)

@@ -554,12 +554,13 @@ EMSCRIPTEN_KEEPALIVE const char* drift_reflect(const char* path)
         return out;
     };
     const std::string rel(path ? path : "");
-    if (rel.empty() || rel.find("..") != std::string::npos || rel[0] == '/') {
+    std::filesystem::path full;
+    if (rel.empty() ||
+        !drift::platform::resolveProjectPath(gApp.scenePath, rel, full)) {
         json = "{\"error\":\"bad path\"}";
         return json.c_str();
     }
-    std::ifstream in(std::filesystem::path(gApp.scenePath) / rel,
-                     std::ios::binary);
+    std::ifstream in(full, std::ios::binary);
     if (!in) {
         json = "{\"error\":" + quote(rel + ": cannot read") + "}";
         return json.c_str();
