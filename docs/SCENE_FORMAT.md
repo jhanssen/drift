@@ -860,3 +860,195 @@ already does; adopting them is purely a documentation change:
 If adopted: `fit` alignment modes, `@time.wrapped`, per-node update rates, and
 per-layer `fit` on `compositor` join the reserved list; the "additional value
 nodes" bullet is partially discharged by §17.7's arithmetic nodes.
+
+## 18. Proposed Amendment: Buffers, Compute, and Particles (draft)
+
+Status: proposal, not yet adopted. Three layers, independently adoptable in
+order — §18.1 (the `buffer` edge type) is prerequisite to §18.2 (the
+`compute` node), which is prerequisite in spirit (shared machinery) but not
+in format to §18.3 (the particle nodes). Simulation runs on the GPU: state
+lives in storage buffers, emission and update are compute passes, rendering
+is an instanced draw. The CPU contributes uniforms.
+
+Feature survey note (non-normative): the §18.3 vocabulary covers Wallpaper
+Engine's particle system (box/sphere emitters; random color/size/alpha/
+lifetime/velocity initializers; movement/drag/turbulence/vortex/attract and
+fade/size/color-over-life operators; mouse-linked control points) but is not
+bounded by it. Structural upgrades over that system: every knob is a port
+(wireable from `sequence` curves, `@mouse`, a future `audio` node), bursts
+are event-driven (§16), and authored `compute` nodes interoperate with the
+stock nodes through a public buffer contract.
+
+### 18.1 The `buffer` Edge Type
+
+Amendment to §4 — new edge/value type:
+
+| Type     | JSON literal form    | Notes                                    |
+|----------|----------------------|------------------------------------------|
+| `buffer` | — (connections only) | fixed-capacity array of structs, GPU-resident |
+
+- A `buffer` value is an array of `capacity` fixed-size elements in a GPU
+  storage buffer. Capacity and element stride are set at load by the
+  producing node and never change at runtime.
+- Typing: a `buffer` connection is valid when producer and consumer declare
+  the same element *stride* (WGSL memory layout). Field-level interpretation
+  is a convention between producer and consumer; §18.3 fixes one such
+  convention (the `Particle` struct) for the stock nodes.
+- `buffer` takes part in no implicit conversions; parameters cannot be of
+  type `buffer`.
+- Feedback: `previous: true` on a `buffer` edge is realized as ping-pong
+  buffers, exactly like textures (§10). On the first frame (and after a
+  node reload) a previous-frame buffer reads as all zeroes.
+- Dirty semantics (§11 amendment): change detection is impractical for GPU
+  buffer contents, so a `buffer` output is dirty whenever its node executes.
+  A self-sustaining simulation therefore follows the §10 feedback rule: it
+  keeps running once kicked, and quiesces only when nothing upstream of it
+  is dirty — wire `@time.delta` into a simulation to tick it every rendered
+  frame, and gate that wire to pause it.
+
+### 18.2 `compute`
+
+GPU compute pass. Like `shader` (§9.10), the WGSL file *is* the node's port
+declaration; the runtime reflects it and binds by name.
+
+| Kind     | Name       | Type      | Default  | Notes                              |
+|----------|------------|-----------|----------|------------------------------------|
+| property | `shader`   | `string`  | —        | path to WGSL with a `@compute` entry point `main` |
+| property | `capacity` | `scalar`/object | —  | element count for owned buffer outputs; object form maps port → count when there are several |
+| property | `dispatch` | `[x,y,z]` | `"auto"` | workgroup counts; `"auto"` covers the primary output (buffer capacity or storage-texture size) with the entry point's workgroup size |
+| input    | *(from WGSL)* | *(reflected)* |  | see below                          |
+| output   | *(from WGSL)* | *(reflected)* |  | first storage binding is the default output† |
+
+Reflection rules, extending §9.10:
+
+- A uniform struct binding named `params` contributes value input ports per
+  field, exactly as §9.10.
+- `texture_2d<f32>` bindings are texture input ports (with the `_sampler`
+  convention); `texture_storage_2d<…, write>` bindings are texture output
+  ports, allocated by this node (`size` rules follow §9.3/§17.5).
+- `var<storage, read> name: array<S>` is a `buffer` input port.
+- `var<storage, read_write> name: array<S>` is a `buffer` output port,
+  allocated by this node with `capacity` elements. It may also be read in
+  the kernel; combined with a `previous: true` self-connection it is the
+  ping-pong simulation idiom.
+- All reflected ports must be bound (§9.10's rule); `capacity` is required
+  when any storage output exists.
+
+Validation additions (§13): missing `@compute` entry point; a `buffer`
+connection whose element strides differ; `capacity` missing, non-integral,
+or ≤ 0; `dispatch` malformed.
+
+### 18.3 Particle Nodes: `particles` and `sprites`
+
+The no-WGSL particle path, split so simulation and rendering compose: a
+`particles` buffer can feed several renderers, a custom `compute` node can
+post-process it, and an authored simulation can drive the stock renderer,
+all through the public element contract:
+
+```wgsl
+struct Particle {         // 48 bytes; the buffer contract for stock nodes
+    pos: vec2f,           // output space (§9 conventions)
+    vel: vec2f,           // units of output height per second
+    age: f32,             // seconds since emission
+    lifetime: f32,        // seconds; 0 = dead slot (renderers skip it)
+    size: f32,            // fraction of output height (§9.4 sizing spirit)
+    rotation: f32,        // degrees, clockwise
+    color: vec4f,         // premultiplied tint
+}
+```
+
+`particles` — emission + simulation over one particle pool:
+
+| Kind     | Name         | Type      | Default      | Notes                       |
+|----------|--------------|-----------|--------------|-----------------------------|
+| property | `capacity`   | `scalar`  | `1000`       | pool size; dead slots recycle |
+| property | `emitter`    | `string`  | `"point"`    | `point`, `box`, `disc`      |
+| input    | `rate`       | `scalar`  | `10`         | particles/second; 0 stops emission |
+| input    | `burst`      | `event`   | —            | on fire: emit `burstCount` at once |
+| input    | `burstCount` | `scalar`  | `32`         |                             |
+| input    | `origin`     | `vec2`    | `[0.5, 0.5]` | emitter center, output space |
+| input    | `extent`     | `vec2`    | `[0, 0]`     | box half-size / disc radius (x) |
+| input    | `direction`  | `vec2`    | `[0, -1]`    | mean initial velocity direction |
+| input    | `spread`     | `scalar`  | `180`        | degrees of random cone around `direction` |
+| input    | `speed`      | `vec2`    | `[0.05, 0.15]` | [min, max] initial speed  |
+| input    | `lifetime`   | `vec2`    | `[1, 3]`     | [min, max] seconds          |
+| input    | `size`       | `vec2`    | `[0.01, 0.03]` | [min, max] at emission    |
+| input    | `spin`       | `vec2`    | `[0, 0]`     | [min, max] degrees/second   |
+| input    | `colorStart` | `vec4`    | `[1,1,1,1]`  | tint at birth               |
+| input    | `colorEnd`   | `vec4`    | `[1,1,1,0]`  | tint at death (lerped over life) |
+| input    | `fadeIn`     | `scalar`  | `0.1`        | seconds to full alpha       |
+| input    | `sizeEnd`    | `scalar`  | `1`          | size multiplier at death    |
+| input    | `gravity`    | `vec2`    | `[0, 0]`     | output-heights/s²           |
+| input    | `drag`       | `scalar`  | `0`          | 1/s velocity damping        |
+| input    | `turbulence` | `scalar`  | `0`          | curl-noise force strength   |
+| input    | `turbulenceScale` | `scalar` | `4`      | noise spatial frequency     |
+| input    | `attractor`  | `vec2`    | `[0.5, 0.5]` | force target (wire `@mouse.position`) |
+| input    | `attract`    | `scalar`  | `0`          | signed strength; negative repels |
+| input    | `vortex`     | `scalar`  | `0`          | signed swirl strength around `attractor` |
+| input    | `time`       | `scalar`  | —            | required; wire `@time.delta` (the sim tick) |
+| output   | `result`†    | `buffer`  |              | `Particle[capacity]`        |
+
+Ranged inputs (`speed`, `lifetime`, `size`, `spin`) are `[min, max]` pairs
+sampled uniformly per particle. Randomness is deterministic: a fixed
+per-slot/per-emission hash, so identical documents stepped with identical
+`time` deltas produce identical pools (headless/golden rendering stays
+exact).
+
+`sprites` — instanced draw of a particle buffer into an output-sized layer:
+
+| Kind     | Name        | Type      | Default  | Notes                          |
+|----------|-------------|-----------|----------|--------------------------------|
+| property | `blend`     | `string`  | `"add"`  | `add` or `over` (§12 premultiplied either way) |
+| input    | `particles` | `buffer`  | —        | required; `Particle` contract  |
+| input    | `texture`   | `texture` | —        | optional sprite; absent = built-in soft disc |
+| output   | `result`†   | `texture` |          | output-sized, premultiplied    |
+
+`over` draws in slot order (no depth sort in v1 — additive is order-free
+and is the wallpaper workhorse).
+
+### 18.4 Example
+
+Sparks that erupt on a sequence cue and drift toward the pointer:
+
+```json
+{ "id": "cues", "type": "sequence", "duration": 10, "loop": true,
+  "tracks": [ { "name": "boom", "kind": "event", "fires": [ 2, 7 ] } ],
+  "inputs": { "time": "@time.seconds" } },
+
+{ "id": "sparks", "type": "particles", "capacity": 4000,
+  "emitter": "disc",
+  "inputs": { "time": "@time.delta", "rate": 40,
+              "burst": "@cues.boom", "burstCount": 600,
+              "origin": [0.5, 0.8], "extent": [0.02, 0.02],
+              "direction": [0, -1], "spread": 60,
+              "speed": [0.1, 0.4], "lifetime": [1, 2.5],
+              "gravity": [0, 0.25], "drag": 0.5, "turbulence": 0.35,
+              "attractor": "@mouse.position", "attract": 0.1,
+              "colorStart": [1, 0.8, 0.3, 1], "colorEnd": [1, 0.2, 0.1, 0] } },
+
+{ "id": "glitter", "type": "sprites",
+  "inputs": { "particles": "@sparks" } },
+
+{ "id": "comp", "type": "compositor",
+  "inputs": { "layers": ["@bg", "@glitter"] } }
+```
+
+### 18.5 Reserved Growth
+
+- Rope / trail renderers over the same buffer contract (Catmull-Rom strips,
+  per-particle history) — the signature "premium" look.
+- Spritesheet frame animation on `sprites`.
+- Multiple emitters per `particles` node; emission `delay`/`duration`
+  windows (today: gate `rate` with a `sequence` hold track instead).
+- Sub-emitters (spawn on death), 3D positions + parallax depth, ring-shaped
+  vortices, SDF collisions against a texture.
+- `audio` implicit input node (§9.7 growth) — FFT bands as value ports;
+  every §18.3 input is already wireable, so audio-reactive particles need
+  no new particle format.
+- Event ports on authored `compute` nodes.
+- Depth/age sorting for `over` blending; indirect draws sized by live count.
+
+### 18.6 Effect on §15
+
+If adopted, §15's `buffer` reservation is discharged; rope/trail renderers,
+sub-emitters, spritesheets, and compute event ports join the reserved list.
