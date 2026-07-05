@@ -9,7 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # First-party packages under library/ (§20.4): the web bundle ships them
 # as a store at /packages, and the test fixture installs them into a
 # build-dir store for the goldens.
-set(DRIFT_LIBRARY_PACKAGES sway bokeh)
+set(DRIFT_LIBRARY_PACKAGES sway bokeh adjust gradient blur glow displace)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -74,7 +74,7 @@ if(EMSCRIPTEN)
     )
     target_link_libraries(drift_web PRIVATE drift_core)
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
-                         comets fireworks bokeh sway fit)
+                         comets fireworks bokeh sway fit effects)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
@@ -223,4 +223,5 @@ if(BUILD_TESTING)
     drift_golden_test(bokeh)
     drift_golden_test(sway)
     drift_golden_test(fit)
+    drift_golden_test(effects)
 endif()

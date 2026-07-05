@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "name": "Glow",
+  "description": "Bloom: luma threshold (soft knee) → two-pass gaussian → added back over the source, halo scaled by strength.",
+  "inputs": {
+    "source":    { "type": "texture",
+                   "bind": ["@thresh.source", "@combine.base"] },
+    "threshold": { "type": "scalar", "default": 0.6,
+                   "bind": "@thresh.threshold" },
+    "radius":    { "type": "scalar", "default": 8,
+                   "bind": ["@x.radius", "@y.radius"] },
+    "strength":  { "type": "scalar", "default": 1,
+                   "bind": "@combine.strength" }
+  },
+  "outputs": { "result": "@combine" },
+  "nodes": [
+    { "id": "thresh", "type": "shader", "shader": "shaders/thresh.wgsl" },
+    { "id": "x", "type": "shader", "shader": "shaders/blur.wgsl",
+      "inputs": { "source": "@thresh", "dir": [1, 0] } },
+    { "id": "y", "type": "shader", "shader": "shaders/blur.wgsl",
+      "inputs": { "source": "@x", "dir": [0, 1] } },
+    { "id": "combine", "type": "shader", "shader": "shaders/combine.wgsl",
+      "inputs": { "halo": "@y" } }
+  ]
+}

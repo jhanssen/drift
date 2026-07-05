@@ -1,0 +1,6 @@
+{
+  "name": "blur",
+  "version": "1.0.0",
+  "description": "Two-pass separable gaussian blur.",
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "Gradient",
+  "description": "Output-sized linear gradient between two straight-alpha colors. angle in degrees, clockwise: 0 = left→right, 90 = top→bottom.",
+  "inputs": {
+    "colorA": { "type": "vec4", "default": [0, 0, 0, 1], "bind": "@fill.colorA" },
+    "colorB": { "type": "vec4", "default": [1, 1, 1, 1], "bind": "@fill.colorB" },
+    "angle":  { "type": "scalar", "default": 90, "bind": "@fill.angle" }
+  },
+  "outputs": { "result": "@fill" },
+  "nodes": [
+    { "id": "fill", "type": "shader", "shader": "shaders/gradient.wgsl" }
+  ]
+}

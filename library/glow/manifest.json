@@ -1,0 +1,6 @@
+{
+  "name": "glow",
+  "version": "1.0.0",
+  "description": "Bloom: threshold, gaussian halo, additive recombine.",
+  "license": "MIT"
+}

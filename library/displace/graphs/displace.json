@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "Displace",
+  "description": "Offset source UVs by a displacement map's red/green channels (0.5 = rest), scaled by amount in uv units.",
+  "inputs": {
+    "source": { "type": "texture", "bind": "@warp.source" },
+    "map":    { "type": "texture", "bind": "@warp.map" },
+    "amount": { "type": "scalar", "default": 0.02, "bind": "@warp.amount" }
+  },
+  "outputs": { "result": "@warp" },
+  "nodes": [
+    { "id": "warp", "type": "shader", "shader": "shaders/displace.wgsl" }
+  ]
+}

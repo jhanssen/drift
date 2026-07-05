@@ -2,6 +2,52 @@
   "version": 1,
   "packages": [
     {
+      "name": "adjust",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/adjust.json",
+          "sha256": "e8e012f4c99692cbbde54617cded218315a8b4f572a76780d9f17484b349e561",
+          "size": 799
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "576ff47c1335a21352c6a964db68895983ba840b4df43fdf5c63b4f0f774569f",
+          "size": 152
+        },
+        {
+          "path": "shaders/adjust.wgsl",
+          "sha256": "0553810aaf5e3776cdd7c4911a2b1b705a00e29a88a500eaf72dafcff454d4c4",
+          "size": 1142
+        }
+      ],
+      "hash": "6e4ab3d7a6fa6b9161ef2ce910cf535c8ae6e72a842dce7d2adf79fbadb2ed6a",
+      "description": "Color grade: brightness, contrast, saturation, hue rotation, tint."
+    },
+    {
+      "name": "blur",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/blur.json",
+          "sha256": "0274d15b0e5ba87ffcc3429c063137dbbd58110c8c607c3812414c091a48fbcd",
+          "size": 613
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "bc33c98cc1f9db955b306a9147b647eb799337244c9ad9eb5be54d502a6324d5",
+          "size": 117
+        },
+        {
+          "path": "shaders/blur.wgsl",
+          "sha256": "964efd18d62093e252054c6217098d87b284b8b10c030601b85c4b8175ca88e4",
+          "size": 891
+        }
+      ],
+      "hash": "8562a974b6656891f09e6c8f26735d1f2b2dc0500dbcb821b34ff9333313187f",
+      "description": "Two-pass separable gaussian blur."
+    },
+    {
       "name": "bokeh",
       "version": "1.0.0",
       "files": [
@@ -18,6 +64,85 @@
       ],
       "hash": "1326b8868ecc323e35d21abb36ce2484262bb7f56257f907c51d73867b911a18",
       "description": "A drifting field of soft discs: one particles + sprites block with the layer-defining knobs exported — tint gradient, spawn rate, size and depth ranges, parallax offset."
+    },
+    {
+      "name": "displace",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/displace.json",
+          "sha256": "26f690fbe0ac00ee2dfc38efa3b005143cb1b42b4355e94a5ca6e9089b83baf3",
+          "size": 508
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "dbd7d4d676fd911f91f4032ae1cea2b40a21d5377f313348e0a06b380a486482",
+          "size": 149
+        },
+        {
+          "path": "shaders/displace.wgsl",
+          "sha256": "7a3af4baaac6a4591a19f149515c0ea509224a2e876c440ec499093188df87b8",
+          "size": 839
+        }
+      ],
+      "hash": "8ab97d138a6e10cd47593a99f6622b48ea14f43feedfe1901867aad340e662fd",
+      "description": "Offset source UVs by a displacement map's red/green channels."
+    },
+    {
+      "name": "glow",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/glow.json",
+          "sha256": "058a6c7b467ced6199fe3dc61d9b2556a3b250e94b8ec80eabee0f3fa18267d6",
+          "size": 1089
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "adbab99ea30f59bb43f16cd55d85e7984953e02d9fb0e1d48b443beecad1d452",
+          "size": 136
+        },
+        {
+          "path": "shaders/blur.wgsl",
+          "sha256": "eee8dd94431561478414e3f76cd92ed80338af11af5ef40d956114b8ad6141be",
+          "size": 821
+        },
+        {
+          "path": "shaders/combine.wgsl",
+          "sha256": "184e4fa54c18f2a5b564a4467597d1ac39b22d9bbacb12d6de21699acec334fd",
+          "size": 538
+        },
+        {
+          "path": "shaders/thresh.wgsl",
+          "sha256": "e5f3eabe525969d0ff31f56b0adbaa88378b8d2614f9ab17f1e8f0269303baa8",
+          "size": 598
+        }
+      ],
+      "hash": "1cf8127dc3840a70f3e208a76b22305aa4db2abf443410849d269a333ef555ee",
+      "description": "Bloom: threshold, gaussian halo, additive recombine."
+    },
+    {
+      "name": "gradient",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/gradient.json",
+          "sha256": "9b4097b7e2485f015a289168cc893b1afb186611ac29295f4a33dcdf7bedea90",
+          "size": 577
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "0916f96cba647651c41d9d8bd1c9262e0f18944f907c3a0f1948ecbbf7312058",
+          "size": 136
+        },
+        {
+          "path": "shaders/gradient.wgsl",
+          "sha256": "289b628cc0bf24a0365b463b4ba3f04f8927945063fe3099c08be25e6f616efd",
+          "size": 615
+        }
+      ],
+      "hash": "6804dcdc53cb8f18f800d11fa123c89dbb252f64a04a70a68032cf2876c35d19",
+      "description": "Output-sized linear gradient between two colors."
     },
     {
       "name": "sway",

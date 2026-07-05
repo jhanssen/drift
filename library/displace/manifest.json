@@ -1,0 +1,6 @@
+{
+  "name": "displace",
+  "version": "1.0.0",
+  "description": "Offset source UVs by a displacement map's red/green channels.",
+  "license": "MIT"
+}

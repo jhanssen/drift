@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "Blur",
+  "description": "Two-pass separable gaussian. radius is σ in source texels; useful up to ~16 before the taps spread thin.",
+  "inputs": {
+    "source": { "type": "texture", "bind": "@x.source" },
+    "radius": { "type": "scalar", "default": 4,
+                "bind": ["@x.radius", "@y.radius"] }
+  },
+  "outputs": { "result": "@y" },
+  "nodes": [
+    { "id": "x", "type": "shader", "shader": "shaders/blur.wgsl",
+      "inputs": { "dir": [1, 0] } },
+    { "id": "y", "type": "shader", "shader": "shaders/blur.wgsl",
+      "inputs": { "source": "@x", "dir": [0, 1] } }
+  ]
+}

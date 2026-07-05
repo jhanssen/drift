@@ -1,0 +1,6 @@
+{
+  "name": "gradient",
+  "version": "1.0.0",
+  "description": "Output-sized linear gradient between two colors.",
+  "license": "MIT"
+}

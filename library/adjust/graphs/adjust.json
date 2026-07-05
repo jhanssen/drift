@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "Adjust",
+  "description": "Color grade: brightness, contrast (pivot 0.5), saturation, hue rotation (degrees), and a straight-alpha tint multiply.",
+  "inputs": {
+    "source":     { "type": "texture", "bind": "@grade.source" },
+    "brightness": { "type": "scalar", "default": 1, "bind": "@grade.brightness" },
+    "contrast":   { "type": "scalar", "default": 1, "bind": "@grade.contrast" },
+    "saturation": { "type": "scalar", "default": 1, "bind": "@grade.saturation" },
+    "hue":        { "type": "scalar", "default": 0, "bind": "@grade.hue" },
+    "tint":       { "type": "vec4", "default": [1, 1, 1, 1], "bind": "@grade.tint" }
+  },
+  "outputs": { "result": "@grade" },
+  "nodes": [
+    { "id": "grade", "type": "shader", "shader": "shaders/adjust.wgsl" }
+  ]
+}

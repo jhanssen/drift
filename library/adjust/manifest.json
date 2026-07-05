@@ -1,0 +1,6 @@
+{
+  "name": "adjust",
+  "version": "1.0.0",
+  "description": "Color grade: brightness, contrast, saturation, hue rotation, tint.",
+  "license": "MIT"
+}
