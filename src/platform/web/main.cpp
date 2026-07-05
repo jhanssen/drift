@@ -403,6 +403,28 @@ EMSCRIPTEN_KEEPALIVE int drift_fire(const char* node, const char* port)
     return gApp.scene && gApp.scene->fireEvent(node, port) ? 1 : 0;
 }
 
+// Scene ids bundled under /scenes — the editor's scene picker fills from
+// this, so the CMake preload list stays the single source of truth.
+EMSCRIPTEN_KEEPALIVE const char* drift_scenes()
+{
+    static std::string json;
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& entry :
+         std::filesystem::directory_iterator("/scenes", ec)) {
+        if (entry.is_directory()) {
+            names.push_back(entry.path().filename().string());
+        }
+    }
+    std::sort(names.begin(), names.end());
+    json = "[";
+    for (size_t i = 0; i < names.size(); ++i) {
+        json += (i ? ",\"" : "\"") + names[i] + "\"";
+    }
+    json += "]";
+    return json.c_str();
+}
+
 // The running scene document, for the editor.
 EMSCRIPTEN_KEEPALIVE const char* drift_source()
 {

@@ -208,17 +208,31 @@
 
 // ---- wasm preview runtime (same artifacts as drift.html) -----------------
 
-const SCENES = ['plasma', 'buoy', 'follow', 'trail', 'pulse', 'handoff'];
 const query = new URLSearchParams(location.search);
-const sceneName = query.get('scene') || SCENES[0];
+const sceneName = query.get('scene') || 'plasma'; // the runtime's default
 
+// The picker fills from the bundle (drift_scenes) once the runtime is up;
+// until then it shows just the active scene.
 const sceneSelect = document.getElementById('sceneSelect');
-for (const name of SCENES) {
+{
   const option = document.createElement('option');
-  option.value = name;
-  option.textContent = name;
-  option.selected = name === sceneName;
+  option.value = option.textContent = sceneName;
+  option.selected = true;
   sceneSelect.appendChild(option);
+}
+function populateScenes() {
+  try {
+    const names = JSON.parse(wasm.scenes());
+    sceneSelect.textContent = '';
+    for (const name of names) {
+      const option = document.createElement('option');
+      option.value = option.textContent = name;
+      option.selected = name === sceneName;
+      sceneSelect.appendChild(option);
+    }
+  } catch (err) {
+    console.log(`editor: scenes: ${err}`);
+  }
 }
 sceneSelect.onchange = () => {
   if (sceneSelect.value === '_scratch') {
@@ -257,9 +271,11 @@ var Module = {
     const readAsset = Module.cwrap('drift_read_asset', 'string', ['string']);
     const open = Module.cwrap('drift_open', 'number', ['string']);
     const reflect = Module.cwrap('drift_reflect', 'string', ['string']);
+    const scenes = Module.cwrap('drift_scenes', 'string', []);
     wasm = {
       describe,
       reflect,
+      scenes,
       time,
       seek,
       pause,
@@ -275,6 +291,7 @@ var Module = {
         return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
       },
     };
+    populateScenes(); // MEMFS is mounted; no need to wait for the scene
     // The scene loads after the async adapter/device dance; poll briefly.
     const started = Date.now();
     const timer = setInterval(() => {
