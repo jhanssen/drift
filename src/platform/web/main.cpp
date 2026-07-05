@@ -9,6 +9,7 @@
 // (§11) maps to: don't touch the canvas at all — it then keeps showing the
 // last presented image.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -26,6 +27,7 @@ static std::string gLastLoadErrors;
 #include <emscripten/html5.h>
 
 #include "core/Scene.h"
+#include "core/WgslInterface.h"
 #include "platform/ParamJson.h"
 
 namespace {
@@ -426,6 +428,71 @@ EMSCRIPTEN_KEEPALIVE int drift_write_asset(const char* root, const char* path,
     }
     out << contents;
     return out.good() ? 1 : 0;
+}
+
+// Reflects a project-relative WGSL file's port interface (§9.10) so the
+// editor's graph view can draw pins for shader ports that are not bound
+// yet. Returns {"ports":[{"name","type"},…]} — texture ports first in
+// (group, binding) order, the §17.5 convention — or {"error":"…"}.
+EMSCRIPTEN_KEEPALIVE const char* drift_reflect(const char* path)
+{
+    static std::string json;
+    auto quote = [](const std::string& s) {
+        std::string out = "\"";
+        for (char c : s) {
+            if (c == '"' || c == '\\') {
+                out += '\\';
+                out += c;
+            } else if (c == '\n') {
+                out += "\\n";
+            } else {
+                out += c;
+            }
+        }
+        out += '"';
+        return out;
+    };
+    const std::string rel(path ? path : "");
+    if (rel.empty() || rel.find("..") != std::string::npos || rel[0] == '/') {
+        json = "{\"error\":\"bad path\"}";
+        return json.c_str();
+    }
+    std::ifstream in(std::filesystem::path(gApp.scenePath) / rel,
+                     std::ios::binary);
+    if (!in) {
+        json = "{\"error\":" + quote(rel + ": cannot read") + "}";
+        return json.c_str();
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    drift::core::WgslInterface iface;
+    std::string error;
+    if (!drift::core::WgslInterface::parse(ss.str(), iface, error)) {
+        json = "{\"error\":" + quote(error) + "}";
+        return json.c_str();
+    }
+    auto textures = iface.textures;
+    std::sort(textures.begin(), textures.end(),
+              [](const drift::core::WgslTexture& a,
+                 const drift::core::WgslTexture& b) {
+                  return a.group != b.group ? a.group < b.group
+                                            : a.binding < b.binding;
+              });
+    json = "{\"ports\":[";
+    bool first = true;
+    for (const auto& t : textures) {
+        json += first ? "" : ",";
+        first = false;
+        json += "{\"name\":" + quote(t.name) + ",\"type\":\"texture\"}";
+    }
+    for (const auto& f : iface.fields) {
+        json += first ? "" : ",";
+        first = false;
+        json += "{\"name\":" + quote(f.name) + ",\"type\":\"" +
+                drift::core::valueTypeName(f.type) + "\"}";
+    }
+    json += "]}";
+    return json.c_str();
 }
 
 // Reads a project-relative text file (e.g. a shader into the editor pane).

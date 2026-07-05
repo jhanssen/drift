@@ -20,6 +20,16 @@
   #viewTabs button { font-size: 11px; padding: 2px 12px; }
   #viewTabs button.active { border-color: var(--accent); color: var(--accent); }
   #viewTabs .dim { color: var(--dim); margin-left: 8px; }
+  #graphStatus { font-size: 11px; margin-left: 8px; white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+  #nodeMenu { position: fixed; z-index: 10; display: flex;
+              flex-direction: column; gap: 2px; background: var(--panel);
+              border: 1px solid var(--edge); border-radius: 5px; padding: 4px;
+              box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #nodeMenu[hidden] { display: none; }
+  #nodeMenu button { border: none; text-align: left; padding: 3px 10px;
+                     background: none; font-size: 12px; }
+  #nodeMenu button:hover { background: var(--bg); color: var(--accent); }
   #viewStack { flex: 1; position: relative; min-height: 0; background: #000; }
   #canvas { position: absolute; inset: 0; width: 100%; height: 100%;
             display: block; background: #000; }
@@ -97,10 +107,13 @@
   <div id="viewTabs">
     <button id="tabPreview" class="active">Preview</button>
     <button id="tabGraph">Graph</button>
-    <span id="graphHint" class="dim" hidden>click a node to inspect ·
-      drag moves it · drag background pans · wheel zooms ·
-      dbl-click re-fits</span>
+    <button id="addNodeBtn" hidden>+ node</button>
+    <span id="graphStatus"></span>
+    <span id="graphHint" class="dim" hidden>drag pins to wire (drop on
+      nothing disconnects) · click inspects · Del removes ·
+      drag background pans · wheel zooms · dbl-click re-fits</span>
   </div>
+  <div id="nodeMenu" hidden></div>
   <div id="viewStack">
     <canvas id="canvas"></canvas>
     <canvas id="graphCanvas"></canvas>
@@ -219,8 +232,10 @@ var Module = {
         ['string', 'string', 'string']);
     const readAsset = Module.cwrap('drift_read_asset', 'string', ['string']);
     const open = Module.cwrap('drift_open', 'number', ['string']);
+    const reflect = Module.cwrap('drift_reflect', 'string', ['string']);
     wasm = {
       describe,
+      reflect,
       time,
       seek,
       pause,
@@ -431,10 +446,12 @@ async function fetchSource() {
 // re-applies parameter values to the preview (a load resets them).
 async function pushDocument() {
   const manifest = activeManifest();
-  if (!sceneSource || !manifest?.sequences) {
+  if (!sceneSource) {
     return;
   }
-  for (const seq of manifest.sequences) {
+  // No manifest (dead preview, not connected) still pushes: wasm.load is
+  // what can revive the preview, and its errors feed the draft status.
+  for (const seq of manifest?.sequences ?? []) {
     const node = sceneSource.nodes?.find((n) => n.id === seq.id);
     if (!node) {
       continue;
@@ -460,19 +477,26 @@ async function pushDocument() {
         });
   }
   const json = JSON.stringify(sceneSource, null, 2);
-  if (wasm && wasm.load(json)) {
-    for (const [name, values] of currentValues) {
-      wasm.set(name, values);
+  const result = { wasmError: null, liveError: null };
+  if (wasm) {
+    if (wasm.load(json)) {
+      for (const [name, values] of currentValues) {
+        wasm.set(name, values);
+      }
+    } else {
+      result.wasmError = wasm.errors() || 'load failed';
     }
   }
   if (live) {
     try {
       await liveSend('load', { scene: json });
     } catch (err) {
+      result.liveError = String(err);
       console.log(`editor: load rejected: ${err}`);
     }
   }
   console.log('editor: document pushed');
+  return result;
 }
 
 // ---- scene from scratch ----------------------------------------------------
@@ -1285,6 +1309,7 @@ function setView(showGraph) {
   document.getElementById('tabPreview').classList.toggle('active', !showGraph);
   document.getElementById('tabGraph').classList.toggle('active', showGraph);
   document.getElementById('graphHint').hidden = !showGraph;
+  document.getElementById('addNodeBtn').hidden = !showGraph;
 }
 document.getElementById('tabPreview').onclick = () => setView(false);
 document.getElementById('tabGraph').onclick = () => setView(true);
@@ -1311,8 +1336,44 @@ const IMPLICIT_OUTPUTS = {
   time: [['seconds', 'value'], ['delta', 'value']],
   mouse: [['position', 'value'], ['active', 'value']],
 };
+// Input ports per built-in type as [name, category, isArray] (§9), so ports
+// that are not bound in the document still get pins to drop wires on.
+// shader ports come from WGSL reflection instead (specInputsOf).
+const NODE_INPUTS = {
+  image: [],
+  video: [['playing', 'value'], ['restart', 'event']],
+  transform: [['source', 'texture'], ['position', 'value'],
+              ['rotation', 'value'], ['scale', 'value'], ['anchor', 'value'],
+              ['opacity', 'value']],
+  compositor: [['layers', 'texture', true]],
+  output: [['color', 'texture']],
+  remap: [['value', 'value'], ['inMin', 'value'], ['inMax', 'value'],
+          ['outMin', 'value'], ['outMax', 'value']],
+  wave: [['input', 'value'], ['frequency', 'value'], ['phase', 'value']],
+  combine: [['x', 'value'], ['y', 'value'], ['z', 'value'], ['w', 'value']],
+  split: [['value', 'value']],
+  sequence: [['time', 'value']],
+};
 const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d' };
 const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
+
+function specInputsOf(source) {
+  if (source.type === 'shader') {
+    // The WGSL is the port declaration (§9.10); the wasm runtime reflects
+    // it for us. Without a preview runtime only bound ports get pins.
+    if (!wasm || typeof source.shader !== 'string') {
+      return null;
+    }
+    try {
+      const reflected = JSON.parse(wasm.reflect(source.shader));
+      return reflected.ports?.map((p) =>
+          [p.name, p.type === 'texture' ? 'texture' : 'value', false]) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  return NODE_INPUTS[source.type] ?? null;
+}
 
 function outputsOf(node) {
   if (node.type === 'sequence') {
@@ -1360,13 +1421,44 @@ function buildGraph() {
   const byId = new Map();
   const add = (source, implicit) => {
     const inputs = [];
-    for (const [name, value] of Object.entries(source.inputs ?? {})) {
+    const pushBound = (name, value, category, forceArray) => {
       // An array-valued port (compositor.layers, §9.5) holds one reference
       // per element; a plain vector literal stays a single literal input.
-      if (Array.isArray(value) && value.some((el) => typeof el !== 'number')) {
-        value.forEach((el, i) => inputs.push(inputEntry(`${name}[${i}]`, el)));
+      if (Array.isArray(value) &&
+          (forceArray || value.length === 0 ||
+           value.some((el) => typeof el !== 'number'))) {
+        value.forEach((el, i) => {
+          const entry = inputEntry(`${name}[${i}]`, el);
+          entry.arrayOf = { base: name, index: i };
+          entry.category ??= category;
+          inputs.push(entry);
+        });
+        inputs.push({ name: `${name}[+]`, append: name, category });
       } else {
-        inputs.push(inputEntry(name, value));
+        const entry = inputEntry(name, value);
+        entry.category ??= category;
+        inputs.push(entry);
+      }
+    };
+    // Spec'd ports first (spec order), whether bound or not; ports the spec
+    // does not know about (draft docs, unreflectable shaders) follow, but
+    // only where the document binds them.
+    const seen = new Set();
+    for (const [name, category, isArray] of
+             (implicit ? [] : specInputsOf(source)) ?? []) {
+      seen.add(name);
+      const bound = source.inputs?.[name];
+      if (bound !== undefined) {
+        pushBound(name, bound, category, isArray);
+      } else if (isArray) {
+        inputs.push({ name: `${name}[+]`, append: name, category });
+      } else {
+        inputs.push({ name, unbound: true, category });
+      }
+    }
+    for (const [name, value] of Object.entries(source.inputs ?? {})) {
+      if (!seen.has(name)) {
+        pushBound(name, value, undefined, false);
       }
     }
     const outputs = implicit ? IMPLICIT_OUTPUTS[source.id] : outputsOf(source);
@@ -1464,6 +1556,7 @@ function refreshGraph() {
   if (graphDrag?.kind === 'node') {
     graphDrag = null; // the dragged node object just went stale
   }
+  wireDrag = null;
   graph = buildGraph();
   if (selectedNodeId && !graph?.byId.has(selectedNodeId)) {
     selectedNodeId = null;
@@ -1471,10 +1564,47 @@ function refreshGraph() {
   renderInspector();
 }
 
+// ---- graph view: pin geometry (shared by drawing and hit tests) ------------
+
+const pinY = (node, index) => node.y + G.HEAD + index * G.ROW + G.ROW / 2;
+const inputPinPos = (node, name) => ({
+  x: node.x,
+  y: pinY(node, Math.max(node.inputs.findIndex((p) => p.name === name), 0)),
+});
+const outputPinPos = (node, name) => ({
+  x: node.x + node.w,
+  y: pinY(node, Math.max(node.outputs.findIndex(([n]) => n === name), 0)),
+});
+
+function pinAt(wx, wy) {
+  const r = 8 / graphView.scale;
+  const near = (px, py) => Math.hypot(wx - px, wy - py) < r;
+  for (const node of [...(graph?.nodes ?? [])].reverse()) {
+    for (let i = 0; i < node.inputs.length; i++) {
+      if (near(node.x, pinY(node, i))) {
+        return { node, side: 'in', input: node.inputs[i] };
+      }
+    }
+    for (let i = 0; i < node.outputs.length; i++) {
+      if (near(node.x + node.w, pinY(node, i))) {
+        return { node, side: 'out', output: node.outputs[i] };
+      }
+    }
+  }
+  return null;
+}
+
 // ---- graph view: pan/zoom and dragging -------------------------------------
 
 const graphView = { x: 0, y: 0, scale: 1 }; // screen = (world + x/y) · scale
 let graphDrag = null; // { kind: 'node'|'pan', ... }
+let wireDrag = null;  // { seek: 'in'|'out', from?, to?, detach?, cursor }
+
+const graphWorldOf = (clientX, clientY) => {
+  const rect = graphCanvas.getBoundingClientRect();
+  return { x: (clientX - rect.left) / graphView.scale - graphView.x,
+           y: (clientY - rect.top) / graphView.scale - graphView.y };
+};
 
 function fitGraphView() {
   const cw = graphCanvas.clientWidth, ch = graphCanvas.clientHeight;
@@ -1495,8 +1625,16 @@ function fitGraphView() {
 }
 
 graphCanvas.onmousedown = (e) => {
-  const wx = e.offsetX / graphView.scale - graphView.x;
-  const wy = e.offsetY / graphView.scale - graphView.y;
+  const { x: wx, y: wy } = graphWorldOf(e.clientX, e.clientY);
+  const pin = pinAt(wx, wy);
+  if (pin) {
+    wireDrag = startWireDrag(pin);
+    if (wireDrag) {
+      wireDrag.cursor = { x: wx, y: wy };
+      e.preventDefault();
+      return;
+    }
+  }
   const hit = [...(graph?.nodes ?? [])].reverse().find((n) =>
       wx >= n.x && wx <= n.x + n.w && wy >= n.y && wy <= n.y + n.h);
   if (hit) {
@@ -1512,6 +1650,10 @@ graphCanvas.onmousedown = (e) => {
 };
 
 window.addEventListener('mousemove', (e) => {
+  if (wireDrag) {
+    wireDrag.cursor = graphWorldOf(e.clientX, e.clientY);
+    return;
+  }
   if (!graphDrag) {
     return;
   }
@@ -1529,7 +1671,13 @@ window.addEventListener('mousemove', (e) => {
   graphDrag.moved = true;
 });
 
-window.addEventListener('mouseup', () => {
+window.addEventListener('mouseup', (e) => {
+  if (wireDrag) {
+    const w = graphWorldOf(e.clientX, e.clientY);
+    applyWireDrop(wireDrag, pinAt(w.x, w.y));
+    wireDrag = null;
+    return;
+  }
   if (!graphDrag) {
     return;
   }
@@ -1546,6 +1694,291 @@ window.addEventListener('mouseup', () => {
     renderInspector();
   }
   graphDrag = null;
+});
+
+// ---- graph view: wiring edits (§16.1: the graph owns *what*) ---------------
+
+// Wires are edited by dragging pins: an output pin starts a new wire seeking
+// an input; an empty input pin seeks an output; a wired input pin picks the
+// wire up (its raw document value moves along, keeping `previous` and the
+// reference form). Dropping a picked-up wire on nothing disconnects it. The
+// runtimes stay the validation authority: an invalid document keeps the old
+// scene running and the editor shows a draft status until the push takes.
+function startWireDrag(pin) {
+  if (!sceneSource) {
+    return null;
+  }
+  if (pin.side === 'out') {
+    return { seek: 'in',
+             from: { node: pin.node.id, port: pin.output[0],
+                     category: pin.output[1] } };
+  }
+  const input = pin.input;
+  if (input.conn) {
+    const raw = input.arrayOf
+        ? pin.node.source.inputs[input.arrayOf.base][input.arrayOf.index]
+        : pin.node.source.inputs[input.name];
+    const producer = graph.byId.get(input.conn.node);
+    return { seek: 'in', raw,
+             detach: { node: pin.node, entry: input },
+             from: producer ? {
+               node: producer.id,
+               port: input.conn.port ?? producer.outputs[0]?.[0],
+               category: input.category ?? 'value',
+             } : null };
+  }
+  return { seek: 'out', to: { node: pin.node, entry: input } };
+}
+
+// Always the explicit "@node.port" form: unambiguous, and stable if the
+// producer's default output ever changes (e.g. sequence track reorder).
+const refFor = (nodeId, port) => `@${nodeId}.${port}`;
+
+function writeInput(node, entry, rawValue) {
+  const inputs = (node.source.inputs ??= {});
+  if (entry.append) {
+    (inputs[entry.append] ??= []).push(rawValue);
+  } else if (entry.arrayOf) {
+    inputs[entry.arrayOf.base][entry.arrayOf.index] = rawValue;
+  } else {
+    inputs[entry.name] = rawValue;
+  }
+}
+
+function removeInput(node, entry) {
+  const inputs = node.source.inputs;
+  if (!inputs) {
+    return;
+  }
+  if (entry.arrayOf) {
+    inputs[entry.arrayOf.base].splice(entry.arrayOf.index, 1);
+  } else {
+    delete inputs[entry.name];
+  }
+}
+
+function applyWireDrop(drag, pin) {
+  const compatible = (a, b) => a == null || b == null || a === b;
+  if (drag.seek === 'out') {
+    if (!pin || pin.side !== 'out') {
+      return; // dropped on nothing: an empty input stays empty
+    }
+    if (pin.node.id === drag.to.node.id) {
+      setGraphStatus('refused: direct self-loop (needs previous: true)');
+      return;
+    }
+    if (!compatible(pin.output[1], drag.to.entry.category)) {
+      setGraphStatus(`refused: ${pin.output[1]} → ` +
+                     `${drag.to.entry.category} port`);
+      return;
+    }
+    writeInput(drag.to.node, drag.to.entry, refFor(pin.node.id, pin.output[0]));
+    pushFromGraph();
+    return;
+  }
+  // seek === 'in': a new wire from an output, or a picked-up existing one.
+  const target = pin && pin.side === 'in' ? pin : null;
+  if (!target) {
+    if (drag.detach) {
+      removeInput(drag.detach.node, drag.detach.entry);
+      pushFromGraph();
+    }
+    return;
+  }
+  if (drag.detach && target.node.id === drag.detach.node.id &&
+      target.input.name === drag.detach.entry.name) {
+    return; // dropped back where it came from
+  }
+  if (drag.from && target.node.id === drag.from.node) {
+    setGraphStatus('refused: direct self-loop (needs previous: true)');
+    return;
+  }
+  if (drag.from &&
+      !compatible(drag.from.category, target.input.category)) {
+    setGraphStatus(`refused: ${drag.from.category} → ` +
+                   `${target.input.category} port`);
+    return;
+  }
+  const raw = drag.raw ?? refFor(drag.from.node, drag.from.port);
+  const sameArray = drag.detach?.entry.arrayOf &&
+      drag.detach.node.id === target.node.id &&
+      (target.input.arrayOf?.base ?? target.input.append) ===
+          drag.detach.entry.arrayOf.base;
+  if (sameArray) {
+    // Within one array port the gesture reads as reordering, not replacing.
+    const arr = drag.detach.node.source.inputs[drag.detach.entry.arrayOf.base];
+    const fromIdx = drag.detach.entry.arrayOf.index;
+    arr.splice(fromIdx, 1);
+    let toIdx = target.input.append ? arr.length : target.input.arrayOf.index;
+    if (!target.input.append && target.input.arrayOf.index > fromIdx) {
+      toIdx--;
+    }
+    arr.splice(toIdx, 0, raw);
+  } else {
+    if (drag.detach) {
+      removeInput(drag.detach.node, drag.detach.entry);
+    }
+    writeInput(target.node, target.input, raw);
+  }
+  pushFromGraph();
+}
+
+// Graph edits land here: push the document, surface accept/draft state, and
+// re-describe an accepting preview so the timeline and params follow along
+// (a live accept re-describes itself via its reload event).
+async function pushFromGraph() {
+  const { wasmError, liveError } = await pushDocument() ?? {};
+  if (wasm && !wasmError) {
+    const manifest = JSON.parse(wasm.describe());
+    if (manifest.scene) {
+      wasmManifest = manifest;
+    }
+  }
+  const error = wasmError ?? liveError;
+  setGraphStatus(error ? `draft — ${error.split('\n')[0]}` : null);
+  refreshPanel();
+}
+
+function setGraphStatus(text) {
+  const el = document.getElementById('graphStatus');
+  el.textContent = text ?? '';
+  el.className = text ? 'warn' : '';
+  el.title = text ?? '';
+}
+
+// ---- graph view: add / delete nodes ----------------------------------------
+
+// Node types the palette offers ('output' is exactly-one per scene, §9.6).
+// Defaults keep a fresh node valid where possible (wave/sequence tick along
+// immediately); nodes with required texture ports (transform, output-like)
+// stay a draft until wired — that is the expected add-then-wire flow.
+const NODE_PALETTE = ['image', 'video', 'shader', 'transform', 'compositor',
+                      'sequence', 'wave', 'remap', 'combine', 'split'];
+const NODE_DEFAULT_INPUTS = {
+  wave: { input: '@time.seconds' },
+  sequence: { time: '@time.seconds' },
+  remap: { value: 0 },
+  combine: { x: 0, y: 0 },
+  split: { value: [0, 0] },
+  compositor: { layers: [] },
+};
+
+function freeNodeId(type) {
+  const taken = new Set(sceneSource.nodes.map((n) => n.id));
+  for (let i = 1; ; i++) {
+    const id = i === 1 ? type : `${type}${i}`;
+    if (!taken.has(id)) {
+      return id;
+    }
+  }
+}
+
+function addNodeOfType(type) {
+  if (!sceneSource?.nodes) {
+    return;
+  }
+  let props = {};
+  if (type === 'image' || type === 'video') {
+    const src = prompt(`${type} path (project-relative):`, 'assets/');
+    if (!src) {
+      return;
+    }
+    props = { src };
+  } else if (type === 'shader') {
+    const shader = prompt('WGSL path (project-relative):', 'shaders/');
+    if (!shader) {
+      return;
+    }
+    props = { shader };
+  }
+  const id = prompt('node id:', freeNodeId(type));
+  if (!id) {
+    return;
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(id) || id === 'time' ||
+      id === 'mouse' || sceneSource.nodes.some((n) => n.id === id)) {
+    alert('invalid, reserved, or duplicate node id (§3)');
+    return;
+  }
+  const node = { id, type, ...props };
+  if (type === 'sequence') {
+    node.duration = 8;
+    node.loop = true;
+    node.tracks = [{ name: 'level', kind: 'value', type: 'scalar',
+                     interpolate: 'linear', keys: [{ t: 0, value: 0 }] }];
+  }
+  if (NODE_DEFAULT_INPUTS[type]) {
+    node.inputs = structuredClone(NODE_DEFAULT_INPUTS[type]);
+  }
+  sceneSource.nodes.push(node);
+  const cx = graphCanvas.clientWidth / 2 / graphView.scale - graphView.x;
+  const cy = graphCanvas.clientHeight / 2 / graphView.scale - graphView.y;
+  ((sceneSource.editor ??= {}).positions ??= {})[id] =
+      [Math.round(cx - G.W / 2), Math.round(cy - 40)];
+  selectedNodeId = id;
+  pushFromGraph();
+}
+
+function deleteSelectedNode() {
+  const node = graph?.byId.get(selectedNodeId);
+  if (!node || node.implicit) {
+    return;
+  }
+  if (!confirm(`delete node '${node.id}'? wires to it are removed; a ` +
+               'required port left unbound keeps the scene a draft until ' +
+               'rewired')) {
+    return;
+  }
+  const id = node.id;
+  const refNode = (value) => parseConnection(value)?.node ?? null;
+  sceneSource.nodes = sceneSource.nodes.filter((n) => n.id !== id);
+  for (const other of sceneSource.nodes) {
+    for (const [name, value] of Object.entries(other.inputs ?? {})) {
+      if (Array.isArray(value)) {
+        const kept = value.filter((el) => refNode(el) !== id);
+        if (kept.length !== value.length) {
+          other.inputs[name] = kept;
+        }
+      } else if (refNode(value) === id) {
+        delete other.inputs[name];
+      }
+    }
+  }
+  delete sceneSource.editor?.positions?.[id];
+  selectedNodeId = null;
+  pushFromGraph();
+}
+
+const nodeMenu = document.getElementById('nodeMenu');
+for (const type of NODE_PALETTE) {
+  const button = document.createElement('button');
+  button.textContent = type;
+  button.onclick = () => {
+    nodeMenu.hidden = true;
+    addNodeOfType(type);
+  };
+  nodeMenu.appendChild(button);
+}
+document.getElementById('addNodeBtn').onclick = (e) => {
+  const rect = e.target.getBoundingClientRect();
+  nodeMenu.style.left = rect.left + 'px';
+  nodeMenu.style.top = rect.bottom + 4 + 'px';
+  nodeMenu.hidden = !nodeMenu.hidden;
+};
+window.addEventListener('mousedown', (e) => {
+  if (!nodeMenu.hidden && !nodeMenu.contains(e.target) &&
+      e.target.id !== 'addNodeBtn') {
+    nodeMenu.hidden = true;
+  }
+}, true);
+
+window.addEventListener('keydown', (e) => {
+  if ((e.key === 'Delete' || e.key === 'Backspace') &&
+      document.body.classList.contains('graph-mode') && selectedNodeId &&
+      !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName)) {
+    e.preventDefault();
+    deleteSelectedNode();
+  }
 });
 
 graphCanvas.addEventListener('wheel', (e) => {
@@ -1610,20 +2043,10 @@ function drawGraph() {
   ctx.setTransform(dpr * s, 0, 0, dpr * s,
                    dpr * s * graphView.x, dpr * s * graphView.y);
 
-  const pinY = (node, index) => node.y + G.HEAD + index * G.ROW + G.ROW / 2;
-  const inputPin = (node, name) => ({
-    x: node.x,
-    y: pinY(node, Math.max(node.inputs.findIndex((p) => p.name === name), 0)),
-  });
-  const outputPin = (node, name) => ({
-    x: node.x + node.w,
-    y: pinY(node, Math.max(node.outputs.findIndex(([n]) => n === name), 0)),
-  });
-
   const now = performance.now();
   for (const edge of graph.edges) {
-    const a = outputPin(graph.byId.get(edge.from), edge.fromPort);
-    const b = inputPin(graph.byId.get(edge.to), edge.toPort);
+    const a = outputPinPos(graph.byId.get(edge.from), edge.fromPort);
+    const b = inputPinPos(graph.byId.get(edge.to), edge.toPort);
     const flash = edge.category === 'event' && edgeFlashed(edge, now);
     ctx.strokeStyle = flash ? '#ffffff' : GRAPH_COLORS[edge.category];
     ctx.lineWidth = (edge.category === 'texture' ? 2 : 1.4) + (flash ? 1 : 0);
@@ -1672,7 +2095,7 @@ function drawGraph() {
 
     node.inputs.forEach((input, i) => {
       const y = pinY(node, i);
-      ctx.fillStyle = '#c6cad1';
+      ctx.fillStyle = input.unbound || input.append ? '#8a8f98' : '#c6cad1';
       ctx.fillText(input.name, node.x + 8, y + 3);
       const binding = input.param ? '$' + input.param
                     : input.literal !== undefined ? shortLit(input.literal)
@@ -1691,7 +2114,9 @@ function drawGraph() {
     ctx.textAlign = 'left';
     ctx.restore();
 
-    // Pins: filled = wired (or an output), hollow = literal/parameter.
+    // Pins: filled = wired (or an output), hollow = wireable but carrying
+    // a literal, a parameter, or nothing; hollow rings take the port's
+    // category color when the spec knows it.
     node.inputs.forEach((input, i) => {
       const y = pinY(node, i);
       ctx.beginPath();
@@ -1700,7 +2125,7 @@ function drawGraph() {
         ctx.fillStyle = GRAPH_COLORS[input.category ?? 'value'];
         ctx.fill();
       } else {
-        ctx.strokeStyle = '#8a8f98';
+        ctx.strokeStyle = GRAPH_COLORS[input.category] ?? '#8a8f98';
         ctx.stroke();
       }
     });
@@ -1710,6 +2135,27 @@ function drawGraph() {
       ctx.fillStyle = GRAPH_COLORS[category];
       ctx.fill();
     });
+  }
+
+  if (wireDrag?.cursor) {
+    // Ghost wire while dragging: from the producer pin (or the seeking
+    // input pin) to the cursor.
+    const from = wireDrag.from && graph.byId.get(wireDrag.from.node);
+    const a = wireDrag.seek === 'in'
+        ? (from ? outputPinPos(from, wireDrag.from.port) : wireDrag.cursor)
+        : inputPinPos(wireDrag.to.node, wireDrag.to.entry.name);
+    const b = wireDrag.cursor;
+    ctx.strokeStyle = '#d6d9de';
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([4, 3]);
+    const dx = Math.max(48, Math.abs(b.x - a.x) * 0.5);
+    const dir = wireDrag.seek === 'in' ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.bezierCurveTo(a.x + dir * dx, a.y, b.x - dir * dx, b.y, b.x, b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
   }
 }
 
@@ -1756,13 +2202,15 @@ function renderInspector() {
       row(key, fmt(value), JSON.stringify(value));
     }
   }
-  if (node.inputs.length) {
+  const inputs = node.inputs.filter((input) => !input.append);
+  if (inputs.length) {
     heading('inputs');
-    for (const input of node.inputs) {
+    for (const input of inputs) {
       row(input.name, input.conn
           ? `@${input.conn.node}.${input.conn.port ?? ''}`.replace(/\.$/, '') +
             (input.conn.previous ? ' (previous)' : '')
-          : input.param ? '$' + input.param : fmt(input.literal));
+          : input.param ? '$' + input.param
+          : input.unbound ? '(default)' : fmt(input.literal));
     }
   }
   if (node.outputs.length) {
@@ -1770,6 +2218,13 @@ function renderInspector() {
     for (const [name, category] of node.outputs) {
       row(name, category);
     }
+  }
+  if (!node.implicit) {
+    const del = document.createElement('button');
+    del.textContent = 'Delete node';
+    del.style.marginTop = '10px';
+    del.onclick = deleteSelectedNode;
+    info.appendChild(del);
   }
 }
 
