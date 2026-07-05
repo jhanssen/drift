@@ -45,6 +45,7 @@ add_library(drift_core STATIC
     src/core/SceneLoader.cpp
     src/core/Nodes.cpp
     src/core/WgslInterface.cpp
+    src/core/Mp4Demux.cpp
 )
 target_include_directories(drift_core PUBLIC src PRIVATE 3rdparty/stb)
 if(EMSCRIPTEN)
@@ -58,18 +59,19 @@ endif()
 target_link_libraries(drift_core PRIVATE glaze::glaze webpdecoder ktx)
 
 # ---- drift_web: browser runtime (Emscripten) ----
-# Ships the video-free example scenes in the bundle's MEMFS; there is no
-# WebCodecs decoder yet, so scenes with video nodes fail to load (§9.2).
+# Ships the example scenes in the bundle's MEMFS. Video decodes through
+# WebCodecs (mp4: h264/h265/av1, demuxed by core/Mp4Demux); a codec the
+# browser cannot decode plays back as a black layer with a console error.
 if(EMSCRIPTEN)
-    add_executable(drift_web src/platform/web/main.cpp)
+    add_executable(drift_web
+        src/platform/web/main.cpp
+        src/platform/web/VideoDecoderWebCodecs.cpp
+    )
     target_link_libraries(drift_web PRIVATE drift_core)
     set_target_properties(drift_web PROPERTIES
         OUTPUT_NAME drift
         SUFFIX ".html"
         LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
-    # handoff has video nodes (unsupported in the web preview until a
-    # WebCodecs decoder exists); it's bundled anyway so the editor can be
-    # used live-only against a native runtime playing it.
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
@@ -151,9 +153,13 @@ if(BUILD_TESTING)
         tests/unit/value_precision_test.cpp
         tests/unit/sequence_test.cpp
         tests/unit/ws_codec_test.cpp
+        tests/unit/mp4_demux_test.cpp
         src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
+    # mp4_demux_test parses committed fixtures instead of embedding bytes.
+    target_compile_definitions(drift_tests
+        PRIVATE DRIFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     add_test(NAME unit COMMAND drift_tests)
 
     function(drift_golden_test name)

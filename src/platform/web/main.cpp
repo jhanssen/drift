@@ -29,6 +29,7 @@ static std::string gLastLoadErrors;
 #include "core/Scene.h"
 #include "core/WgslInterface.h"
 #include "platform/ParamJson.h"
+#include "platform/web/VideoDecoderWebCodecs.h"
 
 namespace {
 
@@ -99,10 +100,15 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
         return true;
     };
 
-    auto videoFactory = [](const std::string&, bool, std::string& error)
+    auto videoFactory = [confined](const std::string& relPath, bool loop,
+                                   std::string& error)
         -> std::unique_ptr<drift::core::VideoDecoder> {
-        error = "video nodes are not supported in the browser build yet";
-        return nullptr;
+        fs::path full;
+        if (!confined(relPath, full)) {
+            error = "path escapes the project root";
+            return nullptr;
+        }
+        return drift::web::createVideoDecoder(full.string(), loop, error);
     };
 
     std::string sceneJson;

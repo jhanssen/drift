@@ -296,8 +296,8 @@ var Module = {
           newScene();
         }
       } else if (wasm.errors()) {
-        // The scene failed to load (e.g. video nodes have no web decoder
-        // yet); the editor still works live-only.
+        // The scene failed to load (e.g. an asset this browser cannot
+        // read); the editor still works live-only.
         clearInterval(timer);
         const reason = wasm.errors().split('\n')[0];
         setStatus('wasmStatus', `preview: ${reason}`, 'warn');
