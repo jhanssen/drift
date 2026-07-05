@@ -30,6 +30,21 @@
   #nodeMenu button { border: none; text-align: left; padding: 3px 10px;
                      background: none; font-size: 12px; }
   #nodeMenu button:hover { background: var(--bg); color: var(--accent); }
+  #quickForm { position: fixed; z-index: 11; display: flex;
+               flex-direction: column; gap: 6px; background: var(--panel);
+               border: 1px solid var(--accent); border-radius: 5px;
+               padding: 8px 10px; font-size: 12px; min-width: 230px;
+               box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #quickForm[hidden] { display: none; }
+  #quickForm h4 { margin: 0 0 2px; font-size: 10px; color: var(--dim);
+                  font-weight: normal; text-transform: uppercase;
+                  letter-spacing: .06em; }
+  #quickForm .row { margin: 0; }
+  #quickForm .row label { flex: 0 0 48px; color: var(--dim); }
+  #quickForm input, #quickForm select { flex: 1; min-width: 0; }
+  #quickForm .err { color: #e0787d; font-size: 11px; max-width: 220px; }
+  #quickForm .buttons { display: flex; gap: 6px; justify-content: flex-end;
+                        margin-top: 2px; }
   #viewStack { flex: 1; position: relative; min-height: 0; background: #000; }
   #canvas { position: absolute; inset: 0; width: 100%; height: 100%;
             display: block; background: #000; }
@@ -118,6 +133,7 @@
       drag background pans · wheel zooms · dbl-click re-fits</span>
   </div>
   <div id="nodeMenu" hidden></div>
+  <div id="quickForm" hidden></div>
   <div id="viewStack">
     <canvas id="canvas"></canvas>
     <canvas id="graphCanvas"></canvas>
@@ -662,27 +678,26 @@ document.getElementById('wgsl').addEventListener('keydown', (e) => {
 
 // Track add/remove (the timeline owns tracks, §16.1). New tracks get a
 // minimal valid shape (§13 requires one key/cue); shape it by editing.
-function addTrack(seq) {
-  const name = prompt('track name (letters/digits/_):');
-  if (!name) {
-    return;
-  }
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
-      seq.tracks.some((t) => t.name === name)) {
-    alert('invalid or duplicate track name');
-    return;
-  }
-  const kind = prompt("kind: 'value' or 'event'", 'value');
-  if (kind === 'event') {
-    seq.tracks.push({ name, kind: 'event', fires: [0] });
-  } else if (kind === 'value') {
-    seq.tracks.push({ name, kind: 'value', type: 'scalar',
-                      interpolate: 'hold', keys: [{ t: 0, value: 0 }] });
-  } else {
-    return;
-  }
-  pushDocument();
-  refreshPanel();
+function addTrack(seq, anchor) {
+  openQuickForm(anchor, `add track to ${seq.id}`, [
+    { key: 'name', label: 'name', value: '' },
+    { key: 'kind', label: 'kind', options: ['value', 'event'] },
+  ], (v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+      return 'name must be an identifier (§3)';
+    }
+    if (seq.tracks.some((t) => t.name === v.name)) {
+      return `track '${v.name}' already exists`;
+    }
+    if (v.kind === 'event') {
+      seq.tracks.push({ name: v.name, kind: 'event', fires: [0] });
+    } else {
+      seq.tracks.push({ name: v.name, kind: 'value', type: 'scalar',
+                        interpolate: 'hold', keys: [{ t: 0, value: 0 }] });
+    }
+    pushDocument().then(refreshPanel);
+    return null;
+  });
 }
 
 function removeTrack(seq, lane) {
@@ -786,7 +801,7 @@ function refreshTimeline() {
     const addBtn = document.createElement('button');
     addBtn.textContent = '+ track';
     addBtn.style.cssText = 'font-size:10px;padding:1px 6px;margin-left:8px';
-    addBtn.onclick = () => addTrack(seq);
+    addBtn.onclick = (e) => addTrack(seq, e.target.getBoundingClientRect());
     header.appendChild(addBtn);
     const canvas = document.createElement('canvas');
     const tl = { seq, canvas, hits: [], laneRanges: [] };
@@ -1924,6 +1939,100 @@ function setGraphStatus(text) {
   el.title = text ?? '';
 }
 
+// ---- quick form (inline prompt() replacement) -------------------------------
+
+// A small anchored form: all fields at once, Enter submits, Escape or a
+// click elsewhere cancels. onSubmit returns an error string to show inline
+// (keeping the form open) or null to accept.
+const quickForm = document.getElementById('quickForm');
+let quickFormClose = null;
+
+function openQuickForm(anchor, title, fields, onSubmit) {
+  quickForm.textContent = '';
+  const heading = document.createElement('h4');
+  heading.textContent = title;
+  quickForm.appendChild(heading);
+  const inputs = new Map();
+  for (const field of fields) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    row.appendChild(label);
+    let input;
+    if (field.options) {
+      input = document.createElement('select');
+      for (const option of field.options) {
+        const el = document.createElement('option');
+        el.value = el.textContent = option;
+        input.appendChild(el);
+      }
+      input.value = field.value ?? field.options[0];
+    } else {
+      input = document.createElement('input');
+      input.value = field.value ?? '';
+      input.spellcheck = false;
+    }
+    inputs.set(field.key, input);
+    row.appendChild(input);
+    quickForm.appendChild(row);
+  }
+  const error = document.createElement('div');
+  error.className = 'err';
+  error.hidden = true;
+  quickForm.appendChild(error);
+  const buttons = document.createElement('div');
+  buttons.className = 'buttons';
+  const cancel = document.createElement('button');
+  cancel.textContent = 'Cancel';
+  const ok = document.createElement('button');
+  ok.textContent = 'OK';
+  buttons.appendChild(cancel);
+  buttons.appendChild(ok);
+  quickForm.appendChild(buttons);
+
+  const close = () => {
+    quickForm.hidden = true;
+    quickFormClose = null;
+  };
+  quickFormClose = close;
+  cancel.onclick = close;
+  const submit = () => {
+    const values = Object.fromEntries(
+        [...inputs].map(([key, input]) => [key, input.value.trim()]));
+    const problem = onSubmit(values);
+    if (problem) {
+      error.textContent = problem;
+      error.hidden = false;
+      return;
+    }
+    close();
+  };
+  ok.onclick = submit;
+  quickForm.onkeydown = (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submit();
+    } else if (e.key === 'Escape') {
+      close();
+    }
+    e.stopPropagation();
+  };
+  quickForm.hidden = false;
+  quickForm.style.left =
+      Math.min(anchor.left, innerWidth - 270) + 'px';
+  quickForm.style.top = Math.min(anchor.bottom + 4, innerHeight - 220) + 'px';
+  const first = inputs.values().next().value;
+  first?.focus();
+  first?.select?.();
+}
+
+window.addEventListener('mousedown', (e) => {
+  if (quickFormClose && !quickForm.contains(e.target)) {
+    quickFormClose();
+  }
+}, true);
+
 // ---- graph view: add / delete nodes ----------------------------------------
 
 // Node types the palette offers ('output' is exactly-one per scene, §9.6).
@@ -1952,83 +2061,86 @@ function freeNodeId(type) {
   }
 }
 
-// Parameters are declarations (§6), not nodes, but they are created and
-// placed from the same palette; the graph draws them as source nodes.
-function addParameter() {
-  const name = prompt('parameter name:');
-  if (!name) {
-    return;
-  }
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
-      sceneSource.parameters?.[name]) {
-    alert('invalid or duplicate parameter name');
-    return;
-  }
-  const type = (prompt("type: 'scalar', 'vec2', 'vec3' or 'vec4'",
-                       'scalar') ?? '').trim();
-  const arity = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[type];
-  if (!arity) {
-    return;
-  }
-  const decl = arity === 1 ? { type, default: 0, min: 0, max: 1 }
-                           : { type, default: Array(arity).fill(0) };
-  (sceneSource.parameters ??= {})[name] = decl;
+function placeAtViewCenter(key) {
   const cx = graphCanvas.clientWidth / 2 / graphView.scale - graphView.x;
   const cy = graphCanvas.clientHeight / 2 / graphView.scale - graphView.y;
-  ((sceneSource.editor ??= {}).positions ??= {})['$' + name] =
-      [Math.round(cx - G.W / 2), Math.round(cy - 20)];
-  selectedNodeId = '$' + name;
-  pushFromGraph();
+  ((sceneSource.editor ??= {}).positions ??= {})[key] =
+      [Math.round(cx - G.W / 2), Math.round(cy - 30)];
 }
 
-function addNodeOfType(type) {
+// Parameters are declarations (§6), not nodes, but they are created and
+// placed from the same palette; the graph draws them as source nodes.
+function addParameter(anchor) {
+  openQuickForm(anchor, 'add parameter', [
+    { key: 'name', label: 'name', value: '' },
+    { key: 'type', label: 'type',
+      options: ['scalar', 'vec2', 'vec3', 'vec4'] },
+  ], (v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+      return 'name must be an identifier (§3)';
+    }
+    if (sceneSource.parameters?.[v.name]) {
+      return `parameter '${v.name}' already exists`;
+    }
+    const arity = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[v.type];
+    const decl = arity === 1
+        ? { type: v.type, default: 0, min: 0, max: 1 }
+        : { type: v.type, default: Array(arity).fill(0) };
+    (sceneSource.parameters ??= {})[v.name] = decl;
+    placeAtViewCenter('$' + v.name);
+    selectedNodeId = '$' + v.name;
+    pushFromGraph();
+    return null;
+  });
+}
+
+function addNodeOfType(type, anchor) {
   if (!sceneSource?.nodes) {
     return;
   }
+  anchor ??= document.getElementById('addNodeBtn').getBoundingClientRect();
   if (type === 'parameter') {
-    addParameter();
+    addParameter(anchor);
     return;
   }
-  let props = {};
+  const fields = [];
   if (type === 'image' || type === 'video') {
-    const src = prompt(`${type} path (project-relative):`, 'assets/');
-    if (!src) {
-      return;
-    }
-    props = { src };
+    fields.push({ key: 'src', label: 'path', value: 'assets/' });
   } else if (type === 'shader') {
-    const shader = prompt('WGSL path (project-relative):', 'shaders/');
-    if (!shader) {
-      return;
+    fields.push({ key: 'shader', label: 'path', value: 'shaders/' });
+  }
+  fields.push({ key: 'id', label: 'id', value: freeNodeId(type) });
+  openQuickForm(anchor, `add ${type}`, fields, (v) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.id) || v.id === 'time' ||
+        v.id === 'mouse' || sceneSource.nodes.some((n) => n.id === v.id)) {
+      return 'invalid, reserved, or duplicate id (§3)';
     }
-    props = { shader };
-  }
-  const id = prompt('node id:', freeNodeId(type));
-  if (!id) {
-    return;
-  }
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(id) || id === 'time' ||
-      id === 'mouse' || sceneSource.nodes.some((n) => n.id === id)) {
-    alert('invalid, reserved, or duplicate node id (§3)');
-    return;
-  }
-  const node = { id, type, ...props };
-  if (type === 'sequence') {
-    node.duration = 8;
-    node.loop = true;
-    node.tracks = [{ name: 'level', kind: 'value', type: 'scalar',
-                     interpolate: 'linear', keys: [{ t: 0, value: 0 }] }];
-  }
-  if (NODE_DEFAULT_INPUTS[type]) {
-    node.inputs = structuredClone(NODE_DEFAULT_INPUTS[type]);
-  }
-  sceneSource.nodes.push(node);
-  const cx = graphCanvas.clientWidth / 2 / graphView.scale - graphView.x;
-  const cy = graphCanvas.clientHeight / 2 / graphView.scale - graphView.y;
-  ((sceneSource.editor ??= {}).positions ??= {})[id] =
-      [Math.round(cx - G.W / 2), Math.round(cy - 40)];
-  selectedNodeId = id;
-  pushFromGraph();
+    if ((fields[0].key === 'src' && !v.src) ||
+        (fields[0].key === 'shader' && !v.shader)) {
+      return 'a project-relative path is required';
+    }
+    const node = { id: v.id, type };
+    if (v.src) {
+      node.src = v.src;
+    }
+    if (v.shader) {
+      node.shader = v.shader;
+    }
+    if (type === 'sequence') {
+      node.duration = 8;
+      node.loop = true;
+      node.tracks = [{ name: 'level', kind: 'value', type: 'scalar',
+                       interpolate: 'linear', keys: [{ t: 0, value: 0 }] }];
+    }
+    if (NODE_DEFAULT_INPUTS[type]) {
+      node.inputs = structuredClone(NODE_DEFAULT_INPUTS[type]);
+    }
+    sceneSource.nodes.push(node);
+    placeAtViewCenter(v.id);
+    selectedNodeId = v.id;
+    pushFromGraph();
+    return null;
+  });
 }
 
 function deleteSelectedNode() {
@@ -2085,9 +2197,10 @@ const nodeMenu = document.getElementById('nodeMenu');
 for (const type of NODE_PALETTE) {
   const button = document.createElement('button');
   button.textContent = type;
-  button.onclick = () => {
+  button.onclick = (e) => {
+    const anchor = e.target.getBoundingClientRect();
     nodeMenu.hidden = true;
-    addNodeOfType(type);
+    addNodeOfType(type, anchor);
   };
   nodeMenu.appendChild(button);
 }
