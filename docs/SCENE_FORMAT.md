@@ -482,8 +482,10 @@ choice; names are what matter.
 - Each `texture_2d<f32>` binding becomes a `texture` input port with the
   variable's name.
 - For a texture port `foo`, a sampler binding named `foo_sampler` is provided
-  by the runtime (linear filtering, clamp-to-edge). Custom sampler
-  configuration is reserved.
+  by the runtime (linear filtering, clamp-to-edge). Naming it
+  `foo_sampler_repeat` instead requests repeat addressing (linear filtering,
+  wrap both axes) — the tiling/scroll idiom. Further sampler configuration is
+  reserved.
 - A single uniform struct binding named `params` may be declared; each field
   becomes an input port of the corresponding type (`f32` → `scalar`,
   `vec2<f32>` → `vec2`, etc.). Other field types are a load error.

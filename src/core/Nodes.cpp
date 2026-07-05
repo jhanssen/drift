@@ -95,6 +95,18 @@ wgpu::Sampler makeLinearClampSampler(const wgpu::Device& device)
     return device.CreateSampler(&desc);
 }
 
+// §9.10: what a <texture>_sampler_repeat binding gets.
+wgpu::Sampler makeLinearRepeatSampler(const wgpu::Device& device)
+{
+    wgpu::SamplerDescriptor desc{};
+    desc.magFilter = wgpu::FilterMode::Linear;
+    desc.minFilter = wgpu::FilterMode::Linear;
+    desc.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+    desc.addressModeU = wgpu::AddressMode::Repeat;
+    desc.addressModeV = wgpu::AddressMode::Repeat;
+    return device.CreateSampler(&desc);
+}
+
 void writeOutput(Node::Output& out, const Value& value)
 {
     if (!out.value.sameValueAs(value)) {
@@ -1499,6 +1511,10 @@ bool ShaderNode::ensurePipeline(FrameContext& ctx)
         mUniforms = ctx.device.CreateBuffer(&desc);
     }
     mSampler = makeLinearClampSampler(ctx.device);
+    if (std::any_of(mInterface.textures.begin(), mInterface.textures.end(),
+                    [](const WgslTexture& t) { return t.repeat; })) {
+        mRepeatSampler = makeLinearRepeatSampler(ctx.device);
+    }
     return true;
 }
 
@@ -1601,7 +1617,7 @@ void ShaderNode::evaluate(FrameContext& ctx)
             if (t.hasSampler && t.samplerGroup == g) {
                 wgpu::BindGroupEntry e{};
                 e.binding = t.samplerBinding;
-                e.sampler = mSampler;
+                e.sampler = t.repeat ? mRepeatSampler : mSampler;
                 entries.push_back(e);
             }
         }
@@ -1712,6 +1728,11 @@ bool ComputeNode::ensurePipeline(FrameContext& ctx)
     }
     if (!mInterface.textures.empty()) {
         mSampler = makeLinearClampSampler(ctx.device);
+        if (std::any_of(mInterface.textures.begin(),
+                        mInterface.textures.end(),
+                        [](const WgslTexture& t) { return t.repeat; })) {
+            mRepeatSampler = makeLinearRepeatSampler(ctx.device);
+        }
     }
     return true;
 }
@@ -1825,7 +1846,7 @@ void ComputeNode::evaluate(FrameContext& ctx)
             if (t.hasSampler && t.samplerGroup == g) {
                 wgpu::BindGroupEntry e{};
                 e.binding = t.samplerBinding;
-                e.sampler = mSampler;
+                e.sampler = t.repeat ? mRepeatSampler : mSampler;
                 entries.push_back(e);
             }
         }

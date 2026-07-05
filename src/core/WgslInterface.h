@@ -27,6 +27,7 @@ struct WgslTexture {
     std::string name;
     uint32_t group = 0, binding = 0;
     bool hasSampler = false;
+    bool repeat = false; // <name>_sampler_repeat: repeat addressing (§9.10)
     uint32_t samplerGroup = 0, samplerBinding = 0;
 };
 

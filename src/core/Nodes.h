@@ -257,6 +257,7 @@ private:
     wgpu::RenderPipeline mPipeline;
     wgpu::Buffer mUniforms;
     wgpu::Sampler mSampler;
+    wgpu::Sampler mRepeatSampler; // §9.10 _sampler_repeat bindings
     wgpu::Texture mColor;
     uint32_t mWidth = 0, mHeight = 0;
 };
@@ -293,6 +294,7 @@ private:
     wgpu::ComputePipeline mPipeline;
     wgpu::Buffer mUniforms;
     wgpu::Sampler mSampler;
+    wgpu::Sampler mRepeatSampler; // §9.10 _sampler_repeat bindings
     std::vector<wgpu::Buffer> mOwned;        // read_write storage buffers
     std::vector<wgpu::Texture> mStorageTex;  // storage texture outputs
     uint32_t mTexWidth = 0, mTexHeight = 0;

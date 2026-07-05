@@ -236,8 +236,13 @@ bool WgslInterface::parse(const std::string& rawSource, WgslInterface& out, std:
     for (const auto& s : samplers) {
         bool matched = false;
         for (auto& t : out.textures) {
-            if (s.name == t.name + "_sampler") {
+            // The _repeat suffix requests repeat addressing instead of
+            // clamp-to-edge (§9.10).
+            const bool plain = s.name == t.name + "_sampler";
+            const bool repeat = s.name == t.name + "_sampler_repeat";
+            if (plain || repeat) {
                 t.hasSampler = true;
+                t.repeat = repeat;
                 t.samplerGroup = s.group;
                 t.samplerBinding = s.binding;
                 matched = true;
@@ -245,7 +250,9 @@ bool WgslInterface::parse(const std::string& rawSource, WgslInterface& out, std:
             }
         }
         if (!matched) {
-            error = "sampler '" + s.name + "' does not match any texture (expected <texture>_sampler)";
+            error = "sampler '" + s.name +
+                    "' does not match any texture (expected <texture>_sampler "
+                    "or <texture>_sampler_repeat)";
             return false;
         }
     }

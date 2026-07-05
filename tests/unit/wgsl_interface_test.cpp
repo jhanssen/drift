@@ -78,6 +78,23 @@ TEST_CASE("textures pair with <name>_sampler bindings")
     CHECK(iface.textures[0].binding == 1);
     CHECK(iface.textures[0].hasSampler);
     CHECK(iface.textures[0].samplerBinding == 2);
+    CHECK_FALSE(iface.textures[0].repeat);
+}
+
+TEST_CASE("_sampler_repeat requests repeat addressing (§9.10)")
+{
+    const auto iface = parseOk(R"(
+        @group(0) @binding(1) var pattern: texture_2d<f32>;
+        @group(0) @binding(2) var pattern_sampler_repeat: sampler;
+        @group(0) @binding(3) var mask: texture_2d<f32>;
+        @group(0) @binding(4) var mask_sampler: sampler;
+    )");
+    REQUIRE(iface.textures.size() == 2);
+    CHECK(iface.textures[0].name == "pattern");
+    CHECK(iface.textures[0].hasSampler);
+    CHECK(iface.textures[0].repeat);
+    CHECK(iface.textures[1].name == "mask");
+    CHECK_FALSE(iface.textures[1].repeat);
 }
 
 TEST_CASE("comments do not confuse the recognizer")
