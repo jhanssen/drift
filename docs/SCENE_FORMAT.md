@@ -870,14 +870,14 @@ in format to §18.3 (the particle nodes). Simulation runs on the GPU: state
 lives in storage buffers, emission and update are compute passes, rendering
 is an instanced draw. The CPU contributes uniforms.
 
-Feature survey note (non-normative): the §18.3 vocabulary covers Wallpaper
-Engine's particle system (box/sphere emitters; random color/size/alpha/
-lifetime/velocity initializers; movement/drag/turbulence/vortex/attract and
-fade/size/color-over-life operators; mouse-linked control points) but is not
-bounded by it. Structural upgrades over that system: every knob is a port
-(wireable from `sequence` curves, `@mouse`, a future `audio` node), bursts
-are event-driven (§16), and authored `compute` nodes interoperate with the
-stock nodes through a public buffer contract.
+Design note (non-normative): the §18.3 vocabulary covers what established
+2D particle systems offer (shaped emitters; randomized color/size/alpha/
+lifetime/velocity at emission; gravity/drag/turbulence/vortex/attract
+forces and fade/size/color-over-life curves; pointer-linked forces) with
+the structural upgrades the graph model makes natural: every knob is a
+port (wireable from `sequence` curves, `@mouse`, a future `audio` node),
+bursts are event-driven (§16), and authored `compute` nodes interoperate
+with the stock nodes through a public buffer contract.
 
 ### 18.1 The `buffer` Edge Type
 
@@ -946,14 +946,19 @@ post-process it, and an authored simulation can drive the stock renderer,
 all through the public element contract:
 
 ```wgsl
-struct Particle {         // 48 bytes; the buffer contract for stock nodes
-    pos: vec2f,           // output space (§9 conventions)
-    vel: vec2f,           // units of output height per second
+struct Particle {         // 64 bytes; the buffer contract for stock nodes.
+                          // Scalars are packed into the vec3 alignment
+                          // slots, so the WGSL layout is exactly 64 bytes.
+    pos: vec3f,           // x/y in output space (§9 conventions); z is
+                          // depth, reserved — the v1 simulation writes 0
     age: f32,             // seconds since emission
+    vel: vec3f,           // output-heights per second; z reserved
     lifetime: f32,        // seconds; 0 = dead slot (renderers skip it)
+    color: vec4f,         // premultiplied tint
     size: f32,            // fraction of output height (§9.4 sizing spirit)
     rotation: f32,        // degrees, clockwise
-    color: vec4f,         // premultiplied tint
+    seed: f32,            // per-particle random in [0, 1), fixed at emission
+    reserved: f32,        // must be written 0
 }
 ```
 
@@ -1040,8 +1045,9 @@ Sparks that erupt on a sequence cue and drift toward the pointer:
 - Spritesheet frame animation on `sprites`.
 - Multiple emitters per `particles` node; emission `delay`/`duration`
   windows (today: gate `rate` with a `sequence` hold track instead).
-- Sub-emitters (spawn on death), 3D positions + parallax depth, ring-shaped
-  vortices, SDF collisions against a texture.
+- Sub-emitters (spawn on death), 3D simulation + parallax depth (the
+  contract already carries z), ring-shaped vortices, SDF collisions
+  against a texture.
 - `audio` implicit input node (§9.7 growth) — FFT bands as value ports;
   every §18.3 input is already wireable, so audio-reactive particles need
   no new particle format.
