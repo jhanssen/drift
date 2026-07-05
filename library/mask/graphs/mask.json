@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "Mask",
+  "description": "Masked mix: blend base and over per-pixel by a grayscale mask's red channel (white = over, black = base) — how an effect applies to just an area. amount scales the whole mask.",
+  "inputs": {
+    "base":   { "type": "texture", "bind": "@mix.base" },
+    "over":   { "type": "texture", "bind": "@mix.over" },
+    "mask":   { "type": "texture", "bind": "@mix.mask" },
+    "amount": { "type": "scalar", "default": 1, "bind": "@mix.amount" }
+  },
+  "outputs": { "result": "@mix" },
+  "nodes": [
+    { "id": "mix", "type": "shader", "shader": "shaders/mask.wgsl" }
+  ]
+}

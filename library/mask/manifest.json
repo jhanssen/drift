@@ -1,0 +1,6 @@
+{
+  "name": "mask",
+  "version": "1.0.0",
+  "description": "Masked mix: blend two layers per-pixel by a grayscale mask.",
+  "license": "MIT"
+}

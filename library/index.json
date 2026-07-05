@@ -145,6 +145,29 @@
       "description": "Output-sized linear gradient between two colors."
     },
     {
+      "name": "mask",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/mask.json",
+          "sha256": "b1cdca9d5f347f78a1327fd3d5bd00b5aee0a844ae7de710503605179e1bd48f",
+          "size": 622
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "3a1e146fe7077480924289e6362b990121815aaf28ffd2771081175c2919f24a",
+          "size": 143
+        },
+        {
+          "path": "shaders/mask.wgsl",
+          "sha256": "8260f284f44f4b42064fd49edb14381d2ad80d33248ebd1196b4839614b570f0",
+          "size": 975
+        }
+      ],
+      "hash": "31d96e672dac6f7a983d920a9ae2057a5388fbf8503d770ae6e925892e3088df",
+      "description": "Masked mix: blend two layers per-pixel by a grayscale mask."
+    },
+    {
       "name": "sway",
       "version": "1.0.0",
       "files": [
