@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "name": "Fireworks",
+  "description": "§18.5 end to end: two mortars (multi-emitter with staggered windows) launch rockets whose deaths spawn spritesheet-twinkling bursts (sub-emitter) that rain onto the hills and bounce (texture collision).",
+  "parameters": {
+    "tempo": { "type": "scalar", "default": 1, "min": 0.25, "max": 3,
+               "label": "Launch tempo" }
+  },
+  "nodes": [
+    { "id": "launchRate", "type": "remap",
+      "inputs": { "value": "$tempo", "inMin": 0, "inMax": 1,
+                  "outMin": 0, "outMax": 1.1 } },
+
+    { "id": "rockets", "type": "particles", "capacity": 24,
+      "emitters": [
+        { "emitter": "point", "origin": [0.24, 0.87],
+          "direction": [0.18, -1], "colorStart": [1.0, 0.85, 0.55, 1.0] },
+        { "emitter": "point", "origin": [0.76, 0.87],
+          "direction": [-0.18, -1], "delay": 0.9,
+          "colorStart": [0.7, 0.85, 1.0, 1.0] }
+      ],
+      "inputs": { "time": "@time.delta", "rate": "@launchRate",
+                  "spread": 8, "speed": [0.52, 0.64],
+                  "lifetime": [0.9, 1.35], "size": [0.006, 0.009],
+                  "gravity": [0, 0.34], "fadeIn": 0.05,
+                  "colorEnd": [1.0, 0.5, 0.2, 0.8] } },
+
+    { "id": "bursts", "type": "particles", "spawnCount": 170,
+      "inputs": { "time": "@time.delta", "spawn": "@rockets",
+                  "inherit": 0.22, "direction": [0, -1], "spread": 360,
+                  "speed": [0.02, 0.28], "lifetime": [1.2, 2.6],
+                  "size": [0.010, 0.022], "sizeEnd": 0.35,
+                  "gravity": [0, 0.16], "drag": 0.85,
+                  "collide": "@ground", "bounce": 0.45,
+                  "colorStart": [1.0, 0.75, 0.35, 1.0],
+                  "colorEnd": [0.9, 0.25, 0.45, 0.0] } },
+
+    { "id": "flares", "type": "sprites",
+      "inputs": { "particles": "@rockets" } },
+    { "id": "sparkles", "type": "sprites", "sheet": [2, 2],
+      "inputs": { "particles": "@bursts", "texture": "@twinkle",
+                  "frameRate": 6 } },
+
+    { "id": "bg", "type": "shader", "shader": "shaders/night.wgsl" },
+    { "id": "ground", "type": "shader", "shader": "shaders/ground.wgsl" },
+    { "id": "twinkle", "type": "shader", "shader": "shaders/twinkle.wgsl",
+      "size": [128, 128] },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@bg", "@ground", "@flares", "@sparkles"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

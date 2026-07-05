@@ -1039,6 +1039,181 @@ TEST_CASE("particles/sprites validation (§18.3)")
     CHECK(r.hasWarning("@time.delta"));
 }
 
+TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
+{
+    const char* kOut = R"(,
+            { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+              "inputs": { "phase": 0.5 } },
+            { "id": "out", "type": "output", "inputs": { "color": "@fx" } }
+        ] })";
+    auto scene = [&](const std::string& nodes) {
+        return load(R"({ "version": 1, "name": "x", "nodes": [)" + nodes +
+                    kOut);
+    };
+
+    // §18.5.3 multi-emitters: entries override emission-time fields, with
+    // the full reference grammar (a wire on an entry field is a live port).
+    auto r = scene(R"(
+        { "id": "w", "type": "wave", "inputs": { "input": "@time.seconds" } },
+        { "id": "p", "type": "particles", "capacity": 100,
+          "emitters": [
+            { "emitter": "disc", "origin": [0.2, 0.8], "weight": 2 },
+            { "origin": "@w", "delay": 1, "duration": 3 }
+          ],
+          "inputs": { "time": "@time.delta" } },
+        { "id": "s", "type": "sprites", "inputs": { "particles": "@p" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    // Entry fields must be emission-time inputs; forces are node-global.
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "emitters": [ { "gravity": [0, 1] } ],
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("not an emission-time input"));
+
+    // 1-8 entries, objects only, known shapes only.
+    r = scene(R"(
+        { "id": "p", "type": "particles", "emitters": [],
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'emitters'"));
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "emitters": [ {}, {}, {}, {}, {}, {}, {}, {}, {} ],
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("1-8"));
+    r = scene(R"(
+        { "id": "p", "type": "particles", "emitters": [ 3 ],
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("must be objects"));
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "emitters": [ { "emitter": "cone" } ],
+          "inputs": { "time": "@time.delta" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'emitter'"));
+
+    // §18.5.4 sub-emitters: capacity derives from the source (declaring it
+    // warns), and inapplicable emission inputs warn.
+    r = scene(R"(
+        { "id": "src", "type": "particles", "capacity": 50,
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles", "capacity": 10, "spawnCount": 8,
+          "inputs": { "time": "@time.delta", "spawn": "@src", "rate": 5,
+                      "inherit": 0.5 } },
+        { "id": "s", "type": "sprites", "inputs": { "particles": "@sub" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("'capacity' is ignored"));
+    CHECK(r.hasWarning("'rate'"));
+
+    r = scene(R"(
+        { "id": "src", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles", "spawnCount": 0,
+          "inputs": { "time": "@time.delta", "spawn": "@src" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'spawnCount'"));
+
+    // emitters and spawn do not combine.
+    r = scene(R"(
+        { "id": "src", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles",
+          "emitters": [ { "origin": [0.5, 0.5] } ],
+          "inputs": { "time": "@time.delta", "spawn": "@src" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("does not combine"));
+
+    // spawn must be a direct buffer connection.
+    r = scene(R"(
+        { "id": "sub", "type": "particles",
+          "inputs": { "time": "@time.delta", "spawn": 3 } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'spawn'"));
+    r = scene(R"(
+        { "id": "src", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles",
+          "inputs": { "time": "@time.delta",
+                      "spawn": { "node": "src", "previous": true } } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("non-feedback"));
+
+    // The derived pool is bounded (§18.5.7).
+    r = scene(R"(
+        { "id": "src", "type": "particles", "capacity": 100000,
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles", "spawnCount": 100,
+          "inputs": { "time": "@time.delta", "spawn": "@src" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("pool limit"));
+
+    // §18.5.5 spritesheet: [cols, rows] integers, texture required.
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "s", "type": "sprites", "sheet": [4],
+          "inputs": { "particles": "@p" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'sheet'"));
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "s", "type": "sprites", "sheet": [4, 2],
+          "inputs": { "particles": "@p" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("requires the 'texture'"));
+
+    // §18.5.6 trails: the renderer accepts any Particle-stride buffer and
+    // bounds its history length.
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "t", "type": "trails", "length": 24, "blend": "over",
+          "inputs": { "particles": "@p", "width": 0.5, "fade": 0.2 } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    r = scene(R"(
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "t", "type": "trails", "length": 65,
+          "inputs": { "particles": "@p" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'length'"));
+    r = scene(R"(
+        { "id": "t", "type": "trails" })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("required input 'particles' missing"));
+    r = scene(R"(
+        { "id": "gen", "type": "compute", "shader": "shaders/vec4producer.wgsl",
+          "capacity": 8 },
+        { "id": "t", "type": "trails", "inputs": { "particles": "@gen" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("stride mismatch"));
+
+    // §18.5.2 window/force/collision ports all bind.
+    r = scene(R"(
+        { "id": "mask", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "p", "type": "particles",
+          "inputs": { "time": "@time.delta", "delay": 1, "duration": 4,
+                      "ring": 0.2, "depth": [0, 1], "collide": "@mask",
+                      "bounce": 0.8 } },
+        { "id": "s", "type": "sprites",
+          "inputs": { "particles": "@p", "frameRate": 8,
+                      "parallax": [0.1, 0] } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+}
+
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")
 {
     auto r = load(R"({

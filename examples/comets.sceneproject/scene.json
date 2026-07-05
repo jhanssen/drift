@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "name": "Comets",
+  "description": "§18.5 trails: comets orbit a ring vortex on Catmull-Rom ribbons, layered in depth — move the pointer to parallax the swarm.",
+  "parameters": {
+    "energy": { "type": "scalar", "default": 1, "min": 0.2, "max": 2,
+                "label": "Orbital energy" }
+  },
+  "nodes": [
+    { "id": "swirl", "type": "remap",
+      "inputs": { "value": "$energy", "inMin": 0, "inMax": 2,
+                  "outMin": 0, "outMax": 0.9 } },
+    { "id": "sway", "type": "remap",
+      "inputs": { "value": "@mouse.position", "inMin": 0, "inMax": 1,
+                  "outMin": -0.1, "outMax": 0.1 } },
+
+    { "id": "comets", "type": "particles", "capacity": 90, "emitter": "disc",
+      "inputs": { "time": "@time.delta", "rate": 16,
+                  "origin": [0.5, 0.5], "extent": [0.42, 0],
+                  "speed": [0.04, 0.14], "lifetime": [4, 7],
+                  "size": [0.005, 0.011], "depth": [0, 1],
+                  "attractor": [0.5, 0.5], "attract": 0.45,
+                  "vortex": "@swirl", "ring": 0.24,
+                  "fadeIn": 0.4,
+                  "colorStart": [0.35, 0.75, 1.0, 0.9],
+                  "colorEnd": [1.0, 0.35, 0.85, 0.0] } },
+
+    { "id": "ribbons", "type": "trails", "length": 28,
+      "inputs": { "particles": "@comets", "width": 0.7,
+                  "taper": 0.15, "fade": 0, "parallax": "@sway" } },
+
+    { "id": "heads", "type": "sprites", "blend": "over",
+      "inputs": { "particles": "@comets", "parallax": "@sway" } },
+
+    { "id": "bg", "type": "shader", "shader": "shaders/dusk.wgsl",
+      "inputs": { "glow": "$energy" } },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@bg", "@ribbons", "@heads"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

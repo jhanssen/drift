@@ -868,7 +868,10 @@ nodes" bullet is partially discharged by §17.7's arithmetic nodes.
 Status: **fully adopted and implemented 2026-07-04** — §18.1/§18.2 with
 `examples/swarm.sceneproject` (raw compute idioms), §18.3 with
 `examples/sparks.sceneproject` (the stock particle nodes: cue-driven
-bursts, pointer attraction, life curves), both golden-tested. Buffer
+bursts, pointer attraction, life curves), both golden-tested. §18.5
+(particle growth: trails, spritesheets, multi-/sub-emitters, emission
+windows, depth + parallax, ring vortices, collisions, sorted draws)
+adopted the same day. Buffer
 feedback is realized as history copies exactly like textures. Simulation
 runs on the GPU: state lives in storage buffers, emission and update are
 compute passes, rendering is an instanced draw. The CPU contributes
@@ -967,8 +970,10 @@ struct Particle {         // 64 bytes; the buffer contract for stock nodes.
     color: vec4f,         // premultiplied tint
     size: f32,            // fraction of output height (§9.4 sizing spirit)
     rotation: f32,        // degrees, clockwise
-    seed: f32,            // per-particle random in [0, 1), fixed at emission
-    reserved: f32,        // must be written 0
+    seed: f32,            // emission ordinal, integer-valued f32 (§18.5.1);
+                          // hash it for per-particle randoms
+    emitter: f32,         // producing emitter index (§18.5.3); 0 when
+                          // single-emitter (was `reserved`, see §18.5.1)
 }
 ```
 
@@ -1050,23 +1055,217 @@ adding a parameter-driven rate and sequence-driven turbulence):
   "inputs": { "layers": ["@bg", "@glitter"] } }
 ```
 
-### 18.5 Reserved Growth
+### 18.5 Particle Growth (adopted)
 
-- Rope / trail renderers over the same buffer contract (Catmull-Rom strips,
-  per-particle history) — the signature "premium" look.
-- Spritesheet frame animation on `sprites`.
-- Multiple emitters per `particles` node; emission `delay`/`duration`
-  windows (today: gate `rate` with a `sequence` hold track instead).
-- Sub-emitters (spawn on death), 3D simulation + parallax depth (the
-  contract already carries z), ring-shaped vortices, SDF collisions
-  against a texture.
+Status: **adopted and implemented 2026-07-04**. Everything here extends
+§18.3 without breaking existing documents: every new port has a default
+that reproduces the old behavior, and the `Particle` contract keeps its
+64-byte layout. Runnable, golden-tested examples:
+`examples/comets.sceneproject` (trails over a ring vortex, depth +
+pointer parallax, sorted `over` sprites) and
+`examples/fireworks.sceneproject` (multi-emitter windows, sub-emitter
+bursts, spritesheet twinkle, texture collision).
+
+#### 18.5.1 Contract errata
+
+Two fields of the §18.3 `Particle` struct are respecified to match need
+and shipped behavior:
+
+- `seed` is the **emission ordinal**: an integer-valued f32 (the running
+  count of emissions modulo 2²⁴, so it stays f32-exact). Per-particle
+  randoms are derived by hashing it; the §18.3 wording ("random in
+  [0, 1)") described one such derived value, not the stored field. Custom
+  consumers that only need *a* per-particle random can hash `seed` with
+  any function of their choice.
+- `reserved` becomes `emitter`: the index of the emitter that produced
+  the particle (§18.5.3), 0 for single-emitter nodes. Custom simulations
+  that write 0 (the old rule) remain conforming.
+
+#### 18.5.2 `particles`: emission windows, ring vortex, depth, collisions
+
+New inputs on `particles` (all optional):
+
+| Kind  | Name       | Type      | Default    | Notes                            |
+|-------|------------|-----------|------------|----------------------------------|
+| input | `delay`    | `scalar`  | `0`        | seconds of sim time before emission starts |
+| input | `duration` | `scalar`  | `0`        | emission window length; 0 = unbounded |
+| input | `ring`     | `scalar`  | `0`        | when > 0, `attract`/`vortex` act toward the nearest point of the circle of this radius around `attractor` |
+| input | `depth`    | `vec2`    | `[0, 0]`   | [min, max] initial z, sampled per particle |
+| input | `collide`  | `texture` | —          | collision mask; alpha ≥ 0.5 is solid |
+| input | `bounce`   | `scalar`  | `0.5`      | restitution on collision, 0..1   |
+
+- **Emission windows.** Sim time is the accumulated sum of `time` deltas
+  since load (not `@time.seconds` — deterministic under the sim tick).
+  Emission (both `rate` and `burst`) is active only while
+  `delay ≤ simTime` and, when `duration > 0`,
+  `simTime < delay + duration`. Live particles keep simulating after the
+  window closes.
+- **Ring vortex.** With `ring = 0` the force center is `attractor`
+  (§18.3, unchanged). With `ring > 0` the center is the nearest point on
+  the ring — particles attract onto the circle and `vortex` swirls them
+  around its circumference. Radius is in output-space units (no aspect
+  correction, matching every other §18.3 spatial input).
+- **Depth.** z is sampled uniformly in `depth` at emission and held
+  constant over life (forces remain 2D in v1); it exists to feed parallax
+  and sorting (§18.5.5). Convention: larger z reads as "farther" for
+  sorting (drawn first under `over`); parallax offsets scale linearly
+  with z, so foreground-moves-more is a negative `depth` range.
+- **Collisions.** When `collide` is bound, the kernel samples it at the
+  integrated position (output-space UV); alpha ≥ 0.5 is solid. On
+  contact the particle is pushed out along the mask's alpha gradient and
+  its velocity reflects with restitution `bounce`
+  (`v' = v − (1 + bounce)(v·n)n`). A texture mask is deliberately the
+  interface — any shape source works (an `image`, a `shader`, even a
+  feedback texture); a true SDF input may join later for thin features.
+
+#### 18.5.3 Multiple emitters
+
+The `emitters` property turns one `particles` node into several emission
+sources sharing a pool, forces, and life curves:
+
+```json
+{ "id": "show", "type": "particles", "capacity": 6000,
+  "emitters": [
+    { "emitter": "point", "origin": [0.3, 0.9], "weight": 2,
+      "colorStart": [1, 0.6, 0.2, 1] },
+    { "emitter": "disc", "origin": "@orbit", "extent": [0.05, 0],
+      "delay": 3, "duration": 4 }
+  ],
+  "inputs": { "time": "@time.delta", "rate": 120 } }
+```
+
+- `emitters` is an array of 1–8 objects. Each entry may set the emitter
+  shape (`emitter`) and any of the *emission-time* inputs — `origin`,
+  `extent`, `direction`, `spread`, `speed`, `lifetime`, `size`, `spin`,
+  `colorStart`, `colorEnd`, `depth`, `delay`, `duration` — plus `weight`
+  (scalar, default 1). Fields accept the full §7 grammar (literals,
+  `$param`, `@node.port` connections), and wired fields are live —
+  entry fields are real input ports.
+- An entry field that is absent falls back to the node-level input of
+  the same name, so shared values are written once.
+- The node-level `rate` (and `burstCount`) is the total; each frame's
+  emissions are distributed across emitters in proportion to `weight`,
+  deterministically (largest-remainder on the accumulated fractions, so
+  identical documents stepped identically emit identically). An emitter
+  whose `delay`/`duration` window is closed takes no share.
+- Forces and per-frame life curves (`gravity` … `vortex`, `fadeIn`,
+  `sizeEnd`) remain node-global. `colorStart`/`colorEnd` are per-emitter:
+  the shipped simulation shades from the emitting entry's colors via the
+  particle's `emitter` field (§18.5.1).
+- Without an `emitters` property the node behaves exactly as §18.3 (one
+  emitter, index 0).
+
+#### 18.5.4 Sub-emitters (spawn on death)
+
+A `particles` node whose `spawn` input is connected emits from *deaths*
+in the source buffer instead of from an emitter shape:
+
+| Kind     | Name         | Type     | Default | Notes                        |
+|----------|--------------|----------|---------|------------------------------|
+| input    | `spawn`      | `buffer` | —       | `Particle` source; emission sites are its deaths this tick |
+| property | `spawnCount` | `scalar` | `4`     | children per death (load-time constant) |
+| input    | `inherit`    | `scalar` | `0`     | fraction of the parent's velocity added to children |
+
+- A death is a source slot whose `lifetime` was > 0 on the previous tick
+  and is 0 now (the runtime keeps the one-frame history; the author wires
+  only `spawn`). Particles culled by pool recycling also count — they
+  died, just early.
+- Children emit at the parent's last position (z included — the node's
+  `depth` input does not apply), with the node's own
+  `direction`/`spread`/`speed`/`lifetime`/`size`/`spin`/colors, plus
+  `inherit` × the parent's final velocity.
+- **Capacity is derived**: `spawn.capacity × spawnCount`, so every death
+  has a home and slot assignment is static — source slot *s* owns child
+  slots `[s·spawnCount, (s+1)·spawnCount)`. A redeath of a recycled
+  source slot re-emits over its own children (its previous brood is the
+  stalest by construction). A `capacity` property on a spawn-connected
+  node is ignored with a warning.
+- `rate`, `burst`, `burstCount`, `origin`, `extent`, `emitter`, `delay`,
+  and `duration` do not apply when `spawn` is connected (warning if set);
+  combining `emitters` with `spawn` is an error. Chaining sub-emitters is
+  legal; capacities multiply.
+
+#### 18.5.5 `sprites`: spritesheets, parallax, sorted & culled draws
+
+New surface on `sprites`:
+
+| Kind     | Name        | Type     | Default  | Notes                         |
+|----------|-------------|----------|----------|-------------------------------|
+| property | `sheet`     | `[cols, rows]` | —  | grid layout of `texture`; requires `texture` |
+| input    | `frameRate` | `scalar` | `0`      | frames/second; 0 = one pass over the sheet across each particle's lifetime |
+| input    | `parallax`  | `vec2`   | `[0, 0]` | screen offset per unit z, output space |
+
+- **Spritesheet.** Frames are read row-major. With `frameRate = 0` a
+  particle plays the whole sheet exactly once over its lifetime; with
+  `frameRate > 0` it advances at that rate and loops, starting on a
+  per-particle random frame (hashed from `seed`) so pools don't strobe
+  in sync.
+- **Parallax.** Each particle is offset by `parallax × z` at draw time
+  (the simulation is untouched — several `sprites` with different
+  `parallax` wires can draw one pool at several apparent distances).
+  Wire something centered on zero (e.g. `@mouse.position` through a
+  `remap` to [-0.5, 0.5]).
+- **Sorted, culled draws** (behavioral change, no new surface): `sprites`
+  compacts live slots on the GPU and draws only the live count via an
+  indirect draw. Under `blend: "over"` the compacted instances draw
+  back-to-front — descending z, ties broken oldest-first — which makes
+  `over` deterministic and correct for parallax layering; §18.3's "slot
+  order, no sort" rule is discharged. `add` remains order-free and skips
+  the sort.
+
+#### 18.5.6 `trails`
+
+The rope/trail renderer — Catmull-Rom ribbons through per-particle
+position history, over the same public buffer contract:
+
+| Kind     | Name        | Type      | Default  | Notes                        |
+|----------|-------------|-----------|----------|------------------------------|
+| property | `length`    | `scalar`  | `16`     | history samples per particle, 2–64 |
+| property | `blend`     | `string`  | `"add"`  | `add` or `over` (§12)        |
+| input    | `particles` | `buffer`  | —        | required; `Particle` contract |
+| input    | `width`     | `scalar`  | `1`      | ribbon width at the head, × particle `size` |
+| input    | `taper`     | `scalar`  | `0`      | width multiplier at the tail |
+| input    | `fade`      | `scalar`  | `0`      | alpha multiplier at the tail |
+| input    | `parallax`  | `vec2`    | `[0, 0]` | as §18.5.5, applied per history sample |
+| output   | `result`†   | `texture` |          | output-sized, premultiplied  |
+
+- Each time the input buffer produces (each sim tick), the node records
+  one history sample per particle into an internal ring; a slot whose
+  particle was just emitted (`age == 0`) resets its ring to the emission
+  point, so recycled slots never draw a streak from their previous life.
+  Sample spacing is therefore the sim tick — history covers the last
+  `length` ticks.
+- The ribbon is a Catmull-Rom spline through the ring, tessellated at a
+  fixed 4 subdivisions per segment, extruded perpendicular to its local
+  tangent. Width runs `width × size` at the head to `taper ×` that at
+  the tail; alpha runs the particle's color alpha at the head to
+  `fade ×` it at the tail. Color is the particle's current premultiplied
+  tint. Dead slots draw nothing.
+- Determinism matches §18.3: identical documents stepped with identical
+  deltas produce identical ribbons.
+
+#### 18.5.7 Validation additions (§13)
+
+`emitters` empty, longer than 8, containing a non-object, or an entry
+field that is not an emission-time input; `sheet` malformed, non-integral,
+< 1, or set without `texture`; `spawnCount` non-integral or < 1; `spawn`
+stride mismatch (§18.1 rule); `length` outside 2–64; derived sub-emitter
+capacity exceeding the implementation pool limit; warnings per §18.5.4
+for inapplicable emission inputs and ignored `capacity`.
+
+### 18.6 Reserved Growth
+
 - `audio` implicit input node (§9.7 growth) — FFT bands as value ports;
-  every §18.3 input is already wireable, so audio-reactive particles need
-  no new particle format.
+  every §18.3/§18.5 input is already wireable, so audio-reactive
+  particles need no new particle format.
 - Event ports on authored `compute` nodes.
-- Depth/age sorting for `over` blending; indirect draws sized by live count.
+- 3D forces (gravity/turbulence in z; the contract already carries
+  z-velocity), true SDF collision inputs, textured/spritesheet trails,
+  per-emitter force overrides, emission along a spline.
 
-### 18.6 Effect on §15
+### 18.7 Effect on §15
 
-If adopted, §15's `buffer` reservation is discharged; rope/trail renderers,
-sub-emitters, spritesheets, and compute event ports join the reserved list.
+§15's `buffer` reservation is discharged. Rope/trail renderers,
+spritesheets, sub-emitters, multi-emitters, parallax depth, and sorted
+draws are adopted (§18.5); the audio node and compute event ports remain
+on the reserved list (§18.6).

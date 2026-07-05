@@ -72,7 +72,8 @@ if(EMSCRIPTEN)
         OUTPUT_NAME drift
         SUFFIX ".html"
         LINK_DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/shell.html")
-    set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks)
+    set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
+                         comets fireworks)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
@@ -179,4 +180,6 @@ if(BUILD_TESTING)
     drift_golden_test(handoff)
     drift_golden_test(swarm)
     drift_golden_test(sparks)
+    drift_golden_test(comets)
+    drift_golden_test(fireworks)
 endif()

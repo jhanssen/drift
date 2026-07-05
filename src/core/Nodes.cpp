@@ -1747,25 +1747,38 @@ struct Particle {
     pos: vec3f, age: f32,
     vel: vec3f, lifetime: f32,
     color: vec4f,
-    size: f32, rotation: f32, seed: f32, reserved: f32,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
 }
 
 struct Params {
+    gravity: vec2f, attractor: vec2f,
+    collideTexel: vec2f,
+    emitCountA: vec4f, emitCountB: vec4f,
+    fadeIn: f32, sizeEnd: f32, drag: f32, turbulence: f32,
+    turbulenceScale: f32, attract: f32, vortex: f32, ring: f32,
+    bounce: f32, dt: f32, emitStart: f32, seedBase: f32,
+    spawnCount: f32, inherit: f32,
+}
+
+// §18.5.3: one block per emitter; emission-time quantities come from the
+// particle's emitter, forces and life-curve shaping from params. Kept as a
+// storage block (the reflection oracle allows one uniform binding) and
+// hand-packed on the CPU — kEmitterStride must match this layout.
+struct EmitterP {
     origin: vec2f, extent: vec2f,
-    direction: vec2f, gravity: vec2f,
-    attractor: vec2f, speed: vec2f,
+    direction: vec2f, speed: vec2f,
     lifetime: vec2f, size: vec2f,
-    spin: vec2f,
+    spin: vec2f, depth: vec2f,
     colorStart: vec4f, colorEnd: vec4f,
-    spread: f32, fadeIn: f32, sizeEnd: f32, drag: f32,
-    turbulence: f32, turbulenceScale: f32, attract: f32, vortex: f32,
-    dt: f32, emitStart: f32, emitCount: f32, seedBase: f32,
-    emitterKind: f32,
+    spread: f32, kind: f32, pad0: f32, pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> prev: array<Particle>;
 @group(0) @binding(2) var<storage, read_write> state: array<Particle>;
+@group(0) @binding(3) var<storage, read> emitters: array<EmitterP>;
+//COLLIDE_BINDINGS
+//SPAWN_BINDINGS
 
 fn pcg(v: u32) -> u32 {
     var x = v * 747796405u + 2891336453u;
@@ -1780,14 +1793,23 @@ fn rnd(n: u32, k: u32) -> f32 {
 }
 
 // Life curves: premultiplied tint (§18.3 contract) with the fade-in ramp.
-fn shade(age: f32, lifetime: f32) -> vec4f {
+fn shade(cs: vec4f, ce: vec4f, age: f32, lifetime: f32) -> vec4f {
     let t = age / lifetime;
-    let c = mix(params.colorStart, params.colorEnd, t);
+    let c = mix(cs, ce, t);
     var a = c.a;
     if (params.fadeIn > 0.0) {
         a = a * clamp(age / params.fadeIn, 0.0, 1.0);
     }
     return vec4f(c.rgb * a, a);
+}
+
+// This frame's emission count for emitter j (§18.5.3: the CPU splits the
+// window across emitters; their segments concatenate in index order).
+fn emitCountAt(j: u32) -> u32 {
+    if (j < 4u) {
+        return u32(params.emitCountA[j]);
+    }
+    return u32(params.emitCountB[j - 4u]);
 }
 
 @compute @workgroup_size(64)
@@ -1798,40 +1820,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
 
-    // Emission ring window [emitStart, emitStart + emitCount) mod cap:
-    // the CPU advances the cursor, so the window is deterministic and the
-    // oldest slots recycle when the pool saturates.
-    let count = u32(params.emitCount);
-    let rel = (i + cap - (u32(params.emitStart) % cap)) % cap;
-    if (count > 0u && rel < count) {
-        let n = u32(params.seedBase) + rel;
-        var p: Particle;
-        var origin = params.origin;
-        let kind = u32(params.emitterKind);
-        if (kind == 1u) { // box
-            origin += (vec2f(rnd(n, 1u), rnd(n, 2u)) * 2.0 - 1.0) *
-                      params.extent;
-        } else if (kind == 2u) { // disc, area-uniform
-            let ang = rnd(n, 1u) * 6.2831853;
-            origin += sqrt(rnd(n, 2u)) * params.extent.x *
-                      vec2f(cos(ang), sin(ang));
-        }
-        let base = atan2(params.direction.y, params.direction.x);
-        let theta = base + radians(params.spread) * (rnd(n, 3u) - 0.5);
-        let speed = mix(params.speed.x, params.speed.y, rnd(n, 4u));
-        p.pos = vec3f(origin, 0.0);
-        p.vel = vec3f(cos(theta) * speed, sin(theta) * speed, 0.0);
-        p.age = 0.0;
-        p.lifetime = max(mix(params.lifetime.x, params.lifetime.y,
-                             rnd(n, 5u)), 0.001);
-        p.size = mix(params.size.x, params.size.y, rnd(n, 6u));
-        p.rotation = 360.0 * rnd(n, 9u);
-        p.seed = f32(n % 16777216u); // f32-exact emission ordinal
-        p.reserved = 0.0;
-        p.color = shade(0.0, p.lifetime);
-        state[i] = p;
-        return;
-    }
+    //EMISSION
 
     var p = prev[i];
     if (p.lifetime == 0.0) {
@@ -1859,23 +1848,188 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if (params.attract != 0.0 || params.vortex != 0.0) {
         let d = params.attractor - p.pos.xy;
         let len = sqrt(max(dot(d, d), 1e-6));
-        v += (d / len) * params.attract * params.dt;
+        // §18.5.2 ring: attraction targets the nearest ring point (d scaled
+        // by 1 - r/|d| flips outward inside the ring, pulling onto the
+        // circle); vortex stays around the center — the circumferential
+        // flow. ring = 0 degenerates to §18.3 exactly.
+        let da = d * (1.0 - params.ring / len);
+        let la = sqrt(max(dot(da, da), 1e-6));
+        v += (da / la) * params.attract * params.dt;
         v += (vec2f(-d.y, d.x) / len) * params.vortex * params.dt;
     }
     p.vel = vec3f(v, 0.0);
     p.pos += p.vel * params.dt;
+    //COLLIDE
 
     let t = p.age / p.lifetime;
-    let emitSize = mix(params.size.x, params.size.y, rnd(n, 6u));
+    // Emission-time draws are recomputable from the stored ordinal; the
+    // ranges come from the particle's own emitter (§18.5.3).
+    let E = emitters[min(u32(p.emitter), 7u)];
+    let emitSize = mix(E.size.x, E.size.y, rnd(n, 6u));
     p.size = emitSize * mix(1.0, params.sizeEnd, t);
-    p.rotation += mix(params.spin.x, params.spin.y, rnd(n, 7u)) * params.dt;
-    p.color = shade(p.age, p.lifetime);
+    p.rotation += mix(E.spin.x, E.spin.y, rnd(n, 7u)) * params.dt;
+    p.color = shade(E.colorStart, E.colorEnd, p.age, p.lifetime);
     state[i] = p;
 }
 )";
 
-ParticlesNode::ParticlesNode(uint32_t capacity, Emitter emitter)
-    : mCapacity(capacity), mEmitter(emitter)
+// §18.3 ring-window emission: [emitStart, emitStart + total) mod cap. The
+// CPU advances the cursor, so the window is deterministic and the oldest
+// slots recycle when the pool saturates.
+const char* kParticleEmitRing = R"(
+    var total = 0u;
+    for (var j = 0u; j < 8u; j++) {
+        total += emitCountAt(j);
+    }
+    let rel = (i + cap - (u32(params.emitStart) % cap)) % cap;
+    if (total > 0u && rel < total) {
+        var em = 0u; // which emitter's segment this slot falls in (§18.5.3)
+        var rem = rel;
+        for (var j = 0u; j < 8u; j++) {
+            let cj = emitCountAt(j);
+            if (rem < cj) {
+                em = j;
+                break;
+            }
+            rem -= cj;
+        }
+        let E = emitters[em];
+        let n = u32(params.seedBase) + rel;
+        var p: Particle;
+        var origin = E.origin;
+        let kind = u32(E.kind);
+        if (kind == 1u) { // box
+            origin += (vec2f(rnd(n, 1u), rnd(n, 2u)) * 2.0 - 1.0) * E.extent;
+        } else if (kind == 2u) { // disc, area-uniform
+            let ang = rnd(n, 1u) * 6.2831853;
+            origin += sqrt(rnd(n, 2u)) * E.extent.x * vec2f(cos(ang), sin(ang));
+        }
+        let base = atan2(E.direction.y, E.direction.x);
+        let theta = base + radians(E.spread) * (rnd(n, 3u) - 0.5);
+        let speed = mix(E.speed.x, E.speed.y, rnd(n, 4u));
+        // §18.5.2: z is sampled at emission and held over life.
+        let z = mix(E.depth.x, E.depth.y, rnd(n, 10u));
+        p.pos = vec3f(origin, z);
+        p.vel = vec3f(cos(theta) * speed, sin(theta) * speed, 0.0);
+        p.age = 0.0;
+        p.lifetime = max(mix(E.lifetime.x, E.lifetime.y, rnd(n, 5u)), 0.001);
+        p.size = mix(E.size.x, E.size.y, rnd(n, 6u));
+        p.rotation = 360.0 * rnd(n, 9u);
+        p.seed = f32(n % 16777216u); // f32-exact emission ordinal
+        p.emitter = f32(em);
+        p.color = shade(E.colorStart, E.colorEnd, 0.0, p.lifetime);
+        state[i] = p;
+        return;
+    }
+)";
+
+// §18.5.4 sub-emitter permutation: emission sites are deaths in the spawn
+// source this tick (alive in the previous copy, dead now). Source slot s
+// statically owns child slots [s*spawnCount, (s+1)*spawnCount), so slot
+// assignment needs no atomics and a redeath of a recycled parent re-emits
+// over its own (stalest-by-construction) brood.
+const char* kParticleSpawnBindings = R"(
+@group(0) @binding(6) var<storage, read> spawn: array<Particle>;
+@group(0) @binding(7) var<storage, read> spawnPrev: array<Particle>;
+)";
+
+const char* kParticleEmitSpawn = R"(
+    let sc = max(u32(params.spawnCount), 1u);
+    let ps = i / sc;
+    if (ps < arrayLength(&spawn)) {
+        let parent = spawn[ps];
+        if (spawnPrev[ps].lifetime > 0.0 && parent.lifetime == 0.0) {
+            // Randoms hash the parent's emission ordinal (its seed), so
+            // every life of a recycled parent slot gets a fresh stream —
+            // folded to 24 bits up front so the stored seed replays the
+            // same stream in later frames.
+            let n = ((u32(parent.seed) * sc + (i % sc)) ^
+                     (ps * 2654435761u)) % 16777216u;
+            let E = emitters[0];
+            var p: Particle;
+            let base = atan2(E.direction.y, E.direction.x);
+            let theta = base + radians(E.spread) * (rnd(n, 3u) - 0.5);
+            let speed = mix(E.speed.x, E.speed.y, rnd(n, 4u));
+            // Children start where the parent ended (z included) and
+            // inherit a fraction of its final velocity.
+            p.pos = parent.pos;
+            p.vel = vec3f(cos(theta) * speed, sin(theta) * speed, 0.0) +
+                    vec3f(parent.vel.xy * params.inherit, 0.0);
+            p.age = 0.0;
+            p.lifetime = max(mix(E.lifetime.x, E.lifetime.y, rnd(n, 5u)),
+                             0.001);
+            p.size = mix(E.size.x, E.size.y, rnd(n, 6u));
+            p.rotation = 360.0 * rnd(n, 9u);
+            p.seed = f32(n);
+            p.emitter = 0.0;
+            p.color = shade(E.colorStart, E.colorEnd, 0.0, p.lifetime);
+            state[i] = p;
+            return;
+        }
+    }
+)";
+
+// §18.5.2 collision permutation, spliced in when the collide port is bound.
+// The mask samples in output-space UV; alpha >= 0.5 is solid. Compute passes
+// have no implicit derivatives, so gradients come from central differences a
+// texel and a half apart.
+const char* kParticleCollideBindings = R"(
+@group(0) @binding(4) var collideTex: texture_2d<f32>;
+@group(0) @binding(5) var collideSamp: sampler;
+)";
+
+const char* kParticleCollideCode = R"(
+    // Sample along this frame's motion so fast particles cannot tunnel
+    // through thin (or thick) solids: the first solid sample is the hit.
+    let cnew = p.pos.xy;
+    let cold = cnew - p.vel.xy * params.dt;
+    var hit = 0.0;
+    for (var s = 1u; s <= 4u; s++) {
+        let f = f32(s) * 0.25;
+        if (textureSampleLevel(collideTex, collideSamp, mix(cold, cnew, f),
+                               0.0).a >= 0.5) {
+            hit = f;
+            break;
+        }
+    }
+    if (hit > 0.0) {
+        let cuv = mix(cold, cnew, hit);
+        let e = params.collideTexel * 1.5;
+        let gx = textureSampleLevel(collideTex, collideSamp,
+                                    cuv + vec2f(e.x, 0.0), 0.0).a -
+                 textureSampleLevel(collideTex, collideSamp,
+                                    cuv - vec2f(e.x, 0.0), 0.0).a;
+        let gy = textureSampleLevel(collideTex, collideSamp,
+                                    cuv + vec2f(0.0, e.y), 0.0).a -
+                 textureSampleLevel(collideTex, collideSamp,
+                                    cuv - vec2f(0.0, e.y), 0.0).a;
+        var nrm = vec2f(-gx, -gy); // toward falling alpha: out of the solid
+        let nl = sqrt(dot(nrm, nrm));
+        if (nl > 1e-5) {
+            nrm /= nl;
+        } else {
+            // Deep inside (flat alpha): send it back the way it came.
+            nrm = -p.vel.xy / max(sqrt(dot(p.vel.xy, p.vel.xy)), 1e-6);
+        }
+        var q = mix(cold, cnew, hit - 0.25); // last pre-hit point
+        for (var s = 0u; s < 8u; s++) {      // and out of any overlap
+            if (textureSampleLevel(collideTex, collideSamp, q, 0.0).a <
+                0.5) { break; }
+            q += nrm * e;
+        }
+        p.pos = vec3f(q, p.pos.z);
+        let vn = dot(p.vel.xy, nrm);
+        if (vn < 0.0) { // restitution: v' = v - (1 + bounce)(v.n)n
+            p.vel = vec3f(p.vel.xy - (1.0 + params.bounce) * vn * nrm, 0.0);
+        }
+    }
+)";
+
+ParticlesNode::ParticlesNode(uint32_t capacity, std::vector<Emitter> emitters,
+                             std::vector<uint32_t> overrideMasks,
+                             uint32_t spawnCount)
+    : mCapacity(capacity), mEmitters(std::move(emitters)),
+      mMasks(std::move(overrideMasks)), mSpawnCount(spawnCount)
 {
     std::string err;
     WgslInterface::parse(kParticleSimWgsl, mIface, err); // own source: cannot fail
@@ -1887,12 +2041,42 @@ ParticlesNode::ParticlesNode(uint32_t capacity, Emitter emitter)
     outputs[0].value.bufCapacity = capacity;
 }
 
+// §18.5.3 fallback: an emitter field that the document did not set on the
+// entry reads the node-level port of the same name.
+Value ParticlesNode::emitterValue(size_t e, EmitterField f) const
+{
+    if (mMasks[e] & (1u << f)) {
+        return inputValue(PortCount + e * EfCount + f);
+    }
+    static constexpr Port kBase[EfCount] = {
+        PortOrigin, PortExtent, PortDirection, PortSpread, PortSpeed,
+        PortLifetime, PortSize, PortSpin, PortColorStart, PortColorEnd,
+        PortDepth, PortDelay, PortDuration, PortCount /* weight: below */,
+    };
+    if (f == EfWeight) {
+        Value v;
+        v.v[0] = 1.0;
+        return v;
+    }
+    return inputValue(kBase[f]);
+}
+
 bool ParticlesNode::ensurePipeline(FrameContext& ctx)
 {
+    // Bound-ness of the collide mask is static after load.
+    mCollide = inputs[PortCollide].srcNode != nullptr;
     if (mPipeline) {
         return true;
     }
-    wgpu::ShaderModule module = makeModule(ctx.device, kParticleSimWgsl);
+    std::string source = kParticleSimWgsl;
+    const auto replace = [&](const char* tag, const char* text) {
+        source.replace(source.find(tag), std::strlen(tag), text);
+    };
+    replace("//COLLIDE_BINDINGS", mCollide ? kParticleCollideBindings : "");
+    replace("//SPAWN_BINDINGS", mSpawnCount ? kParticleSpawnBindings : "");
+    replace("//EMISSION", mSpawnCount ? kParticleEmitSpawn : kParticleEmitRing);
+    replace("//COLLIDE", mCollide ? kParticleCollideCode : "");
+    wgpu::ShaderModule module = makeModule(ctx.device, source);
     if (!module) {
         return false;
     }
@@ -1905,6 +2089,13 @@ bool ParticlesNode::ensurePipeline(FrameContext& ctx)
     ud.size = mIface.uniformSize;
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     mUniforms = ctx.device.CreateBuffer(&ud);
+    wgpu::BufferDescriptor ed{};
+    ed.size = (uint64_t)kEmitterStride * kMaxEmitters;
+    ed.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+    mEmitterUniforms = ctx.device.CreateBuffer(&ed);
+    if (mCollide) {
+        mSampler = makeLinearClampSampler(ctx.device);
+    }
 
     for (int i = 0; i < 2; i++) {
         wgpu::BufferDescriptor bd{};
@@ -1920,17 +2111,83 @@ void ParticlesNode::evaluate(FrameContext& ctx)
     if (!ensurePipeline(ctx)) {
         return;
     }
+    if (mCollide && !inputValue(PortCollide).texture) {
+        return; // the mask's producer has not run yet
+    }
+    if (mSpawnCount &&
+        (!inputValue(PortSpawn).buffer || !inputValue(PortSpawnPrev).buffer)) {
+        return; // the spawn source (or its first history copy) isn't there yet
+    }
 
     // Deterministic emission accounting: rate accumulates fractionally,
     // bursts land whole, and the ring cursor maps the window onto slots.
     const double dt = std::max(0.0, inputValue(PortTime).v[0]);
-    mAccum += std::max(0.0, inputValue(PortRate).v[0]) * dt;
-    uint32_t emit = (uint32_t)mAccum;
-    mAccum -= emit;
-    if (inputFired(PortBurst)) {
-        emit += (uint32_t)std::max(0.0, inputValue(PortBurstCount).v[0]);
+    const size_t emitterCount = mEmitters.size();
+    // §18.5.2/§18.5.3: per-emitter windows on the accumulated sim clock
+    // (not @time.seconds), and rate/burst shares proportional to weight.
+    // A closed emitter's weight is zero and its accumulator holds at zero,
+    // so an opening window doesn't dump the closed period's backlog.
+    double weights[kMaxEmitters] = {};
+    double weightSum = 0.0;
+    for (size_t e = 0; e < emitterCount; ++e) {
+        const double delay = std::max(0.0, emitterValue(e, EfDelay).v[0]);
+        const double duration = emitterValue(e, EfDuration).v[0];
+        const bool open = mSimTime >= delay &&
+            (duration <= 0.0 || mSimTime < delay + duration);
+        weights[e] =
+            open ? std::max(0.0, emitterValue(e, EfWeight).v[0]) : 0.0;
+        weightSum += weights[e];
     }
-    emit = std::min(emit, mCapacity);
+    mSimTime += dt;
+
+    uint32_t counts[kMaxEmitters] = {};
+    uint32_t emit = 0;
+    if (mSpawnCount) {
+        // §18.5.4: emission is death-driven on the GPU; the ring window
+        // stays empty and the cursor never moves.
+        weightSum = 0.0;
+    }
+    if (weightSum > 0.0) {
+        const double rate = std::max(0.0, inputValue(PortRate).v[0]);
+        const uint32_t burstTotal = inputFired(PortBurst)
+            ? (uint32_t)std::max(0.0, inputValue(PortBurstCount).v[0])
+            : 0;
+        // Burst split: floor shares now, the remainder to the largest
+        // fractions (ties to the lowest index) — deterministic.
+        double shareFrac[kMaxEmitters] = {};
+        uint32_t burstGiven = 0;
+        for (size_t e = 0; e < emitterCount; ++e) {
+            const double w = weights[e] / weightSum;
+            mAccum[e] += rate * dt * w;
+            counts[e] = (uint32_t)mAccum[e];
+            mAccum[e] -= counts[e];
+            const double share = burstTotal * w;
+            const uint32_t base = (uint32_t)share;
+            shareFrac[e] = share - base;
+            counts[e] += base;
+            burstGiven += base;
+        }
+        for (uint32_t r = burstGiven; r < burstTotal; ++r) {
+            size_t best = 0;
+            for (size_t e = 1; e < emitterCount; ++e) {
+                if (shareFrac[e] > shareFrac[best]) {
+                    best = e;
+                }
+            }
+            counts[best]++;
+            shareFrac[best] = -1.0;
+        }
+        for (size_t e = 0; e < emitterCount; ++e) {
+            // Clamp the concatenated window to the pool; later emitters
+            // lose first, deterministically.
+            counts[e] = std::min(counts[e], mCapacity - emit);
+            emit += counts[e];
+        }
+    } else {
+        for (size_t e = 0; e < emitterCount; ++e) {
+            mAccum[e] = 0.0;
+        }
+    }
     const uint32_t emitStart = mCursor;
     mCursor = (mCursor + emit) % mCapacity;
 
@@ -1941,26 +2198,38 @@ void ParticlesNode::evaluate(FrameContext& ctx)
             v.v[0] = dt;
         } else if (field.name == "emitStart") {
             v.v[0] = emitStart;
-        } else if (field.name == "emitCount") {
-            v.v[0] = emit;
+        } else if (field.name == "emitCountA") {
+            for (int c = 0; c < 4; ++c) {
+                v.v[c] = counts[c];
+            }
+        } else if (field.name == "emitCountB") {
+            for (int c = 0; c < 4; ++c) {
+                v.v[c] = counts[4 + c];
+            }
         } else if (field.name == "seedBase") {
             v.v[0] = std::fmod(mEmitted, 16777216.0); // stays f32-exact
-        } else if (field.name == "emitterKind") {
-            v.v[0] = (double)(int)mEmitter;
+        } else if (field.name == "collideTexel") {
+            const Value mask = inputValue(PortCollide);
+            if (mask.texWidth && mask.texHeight) {
+                v.v[0] = 1.0 / mask.texWidth;
+                v.v[1] = 1.0 / mask.texHeight;
+            }
+        } else if (field.name == "bounce") {
+            v.v[0] = inputValue(PortBounce).v[0];
+        } else if (field.name == "spawnCount") {
+            v.v[0] = mSpawnCount;
+        } else if (field.name == "inherit") {
+            v.v[0] = inputValue(PortInherit).v[0];
         } else {
             // The kernel's port fields are named exactly like the input
             // ports; Port enum order matches the loader's table.
             static const std::map<std::string, Port> kByName = {
-                { "origin", PortOrigin }, { "extent", PortExtent },
-                { "direction", PortDirection }, { "gravity", PortGravity },
-                { "attractor", PortAttractor }, { "speed", PortSpeed },
-                { "lifetime", PortLifetime }, { "size", PortSize },
-                { "spin", PortSpin }, { "colorStart", PortColorStart },
-                { "colorEnd", PortColorEnd }, { "spread", PortSpread },
+                { "gravity", PortGravity }, { "attractor", PortAttractor },
                 { "fadeIn", PortFadeIn }, { "sizeEnd", PortSizeEnd },
                 { "drag", PortDrag }, { "turbulence", PortTurbulence },
                 { "turbulenceScale", PortTurbulenceScale },
                 { "attract", PortAttract }, { "vortex", PortVortex },
+                { "ring", PortRing },
             };
             v = inputValue(kByName.at(field.name));
         }
@@ -1974,8 +2243,38 @@ void ParticlesNode::evaluate(FrameContext& ctx)
     mEmitted += emit;
     ctx.device.GetQueue().WriteBuffer(mUniforms, 0, data.data(), data.size());
 
+    // §18.5.3 per-emitter blocks, hand-packed to EmitterP's WGSL layout
+    // (the struct is fixed; kEmitterStride pins the stride).
+    uint8_t eblock[kEmitterStride * kMaxEmitters] = {};
+    const auto packField = [&](size_t e, uint32_t off, const Value& val,
+                               int n) {
+        float f[4];
+        for (int c = 0; c < n; ++c) {
+            f[c] = (float)val.v[c];
+        }
+        std::memcpy(eblock + e * kEmitterStride + off, f, n * sizeof(float));
+    };
+    for (size_t e = 0; e < emitterCount; ++e) {
+        packField(e, 0, emitterValue(e, EfOrigin), 2);
+        packField(e, 8, emitterValue(e, EfExtent), 2);
+        packField(e, 16, emitterValue(e, EfDirection), 2);
+        packField(e, 24, emitterValue(e, EfSpeed), 2);
+        packField(e, 32, emitterValue(e, EfLifetime), 2);
+        packField(e, 40, emitterValue(e, EfSize), 2);
+        packField(e, 48, emitterValue(e, EfSpin), 2);
+        packField(e, 56, emitterValue(e, EfDepth), 2);
+        packField(e, 64, emitterValue(e, EfColorStart), 4);
+        packField(e, 80, emitterValue(e, EfColorEnd), 4);
+        packField(e, 96, emitterValue(e, EfSpread), 1);
+        Value kind;
+        kind.v[0] = (double)(int)mEmitters[e];
+        packField(e, 100, kind, 1);
+    }
+    ctx.device.GetQueue().WriteBuffer(mEmitterUniforms, 0, eblock,
+                                      sizeof(eblock));
+
     const int back = 1 - mFront;
-    std::vector<wgpu::BindGroupEntry> entries(3);
+    std::vector<wgpu::BindGroupEntry> entries(4);
     entries[0].binding = 0;
     entries[0].buffer = mUniforms;
     entries[0].size = mIface.uniformSize;
@@ -1985,6 +2284,33 @@ void ParticlesNode::evaluate(FrameContext& ctx)
     entries[2].binding = 2;
     entries[2].buffer = mState[back];
     entries[2].size = (uint64_t)kStride * mCapacity;
+    entries[3].binding = 3;
+    entries[3].buffer = mEmitterUniforms;
+    entries[3].size = (uint64_t)kEmitterStride * kMaxEmitters;
+    if (mCollide) {
+        wgpu::BindGroupEntry t{};
+        t.binding = 4;
+        t.textureView = inputValue(PortCollide).texture.CreateView();
+        entries.push_back(t);
+        wgpu::BindGroupEntry s{};
+        s.binding = 5;
+        s.sampler = mSampler;
+        entries.push_back(s);
+    }
+    if (mSpawnCount) {
+        const Value cur = inputValue(PortSpawn);
+        const Value prev = inputValue(PortSpawnPrev);
+        wgpu::BindGroupEntry c{};
+        c.binding = 6;
+        c.buffer = cur.buffer;
+        c.size = (uint64_t)cur.bufStride * cur.bufCapacity;
+        entries.push_back(c);
+        wgpu::BindGroupEntry h{};
+        h.binding = 7;
+        h.buffer = prev.buffer;
+        h.size = (uint64_t)prev.bufStride * prev.bufCapacity;
+        entries.push_back(h);
+    }
     wgpu::BindGroupDescriptor bgd{};
     bgd.layout = mPipeline.GetBindGroupLayout(0);
     bgd.entryCount = entries.size();
@@ -2005,24 +2331,116 @@ void ParticlesNode::evaluate(FrameContext& ctx)
     outputs[0].dirty = true; // §18.1: dirty whenever the node executes
 }
 
-// ---- SpritesNode (§18.3) ----
+// ---- SpritesNode (§18.3, §18.5.5) ----
 
-// Instanced quads from the Particle contract: 4-vertex strip per instance,
-// dead slots collapse to a degenerate point. DISC/TEXTURED selects the
+// Draw-list preparation: one serial invocation compacts live slots into
+// `indices` (slot order — deterministic) and sizes the indirect draw. The
+// padded tail gets a sentinel that the sort network sinks to the end.
+const char* kSpritesPrepareWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
+}
+
+@group(0) @binding(0) var<storage, read> pts: array<Particle>;
+@group(0) @binding(1) var<storage, read_write> indices: array<u32>;
+@group(0) @binding(2) var<storage, read_write> indirect: array<u32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let cap = arrayLength(&pts);
+    var n = 0u;
+    for (var i = 0u; i < cap; i++) {
+        if (pts[i].lifetime != 0.0) {
+            indices[n] = i;
+            n++;
+        }
+    }
+    let padded = arrayLength(&indices);
+    for (var i = n; i < padded; i++) {
+        indices[i] = 0xffffffffu;
+    }
+    indirect[0] = 4u; // vertexCount
+    indirect[1] = n;  // instanceCount: the live count (§18.5.5)
+    indirect[2] = 0u;
+    indirect[3] = 0u;
+}
+)";
+
+// One bitonic stage over the index list. The comparison is a total order
+// (deadness, z descending, emission ordinal ascending, slot ascending), so
+// the network's output is deterministic regardless of thread scheduling.
+const char* kSpritesSortWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
+}
+
+struct SortParams { j: u32, k: u32 }
+
+@group(0) @binding(0) var<storage, read> pts: array<Particle>;
+@group(0) @binding(1) var<storage, read_write> indices: array<u32>;
+@group(0) @binding(2) var<uniform> params: SortParams;
+
+fn before(a: u32, b: u32) -> bool {
+    // Draw order for 'over' (§18.5.5): far first, then oldest.
+    if (a == 0xffffffffu) { return false; }
+    if (b == 0xffffffffu) { return true; }
+    let pa = pts[a];
+    let pb = pts[b];
+    if (pa.pos.z != pb.pos.z) { return pa.pos.z > pb.pos.z; }
+    if (pa.seed != pb.seed) { return pa.seed < pb.seed; }
+    return a < b;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    let l = i ^ params.j;
+    if (l <= i || l >= arrayLength(&indices)) {
+        return;
+    }
+    let a = indices[i];
+    let b = indices[l];
+    if (((i & params.k) == 0u) != before(a, b)) {
+        indices[i] = b;
+        indices[l] = a;
+    }
+}
+)";
+
+// Instanced quads from the Particle contract, driven by the prepared index
+// list: 4-vertex strip per live instance. DISC/TEXTURED selects the
 // fragment via string replacement at pipeline build.
 const char* kSpritesWgsl = R"(
 struct Particle {
     pos: vec3f, age: f32,
     vel: vec3f, lifetime: f32,
     color: vec4f,
-    size: f32, rotation: f32, seed: f32, reserved: f32,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
 }
 
-struct Params { aspect: f32 }
+// misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,-,-)
+struct Params { misc: vec4f, par: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> pts: array<Particle>;
+@group(0) @binding(2) var<storage, read> indices: array<u32>;
 //TEXTURE_BINDINGS
+
+fn pcg(v: u32) -> u32 {
+    var x = v * 747796405u + 2891336453u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    return (x >> 22u) ^ x;
+}
+
+fn rnd(n: u32, k: u32) -> f32 {
+    return f32(pcg(n ^ (k * 2654435769u))) / 4294967296.0;
+}
 
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -2034,20 +2452,42 @@ struct VsOut {
 fn drift_sprite_vs(@builtin(vertex_index) v: u32,
                    @builtin(instance_index) i: u32) -> VsOut {
     var out: VsOut;
-    let p = pts[i];
-    if (p.lifetime == 0.0) {
+    let slot = indices[i];
+    if (slot == 0xffffffffu) {
         out.pos = vec4f(0.0, 0.0, 0.0, 1.0); // degenerate: nothing rastered
         return out;
     }
+    let p = pts[slot];
     let corner = vec2f(f32(v & 1u), f32((v >> 1u) & 1u)) * 2.0 - 1.0;
     let c = cos(radians(p.rotation));
     let s = sin(radians(p.rotation));
     // size is a fraction of output height (§18.3); x corrects for aspect.
     let r = vec2f(c * corner.x - s * corner.y, s * corner.x + c * corner.y) *
             p.size;
-    let pos = p.pos.xy + vec2f(r.x / params.aspect, r.y);
+    // §18.5.5 parallax: a per-particle offset linear in z.
+    let pos = p.pos.xy + vec2f(r.x / params.misc.x, r.y) +
+              params.par.xy * p.pos.z;
     out.pos = vec4f(pos.x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
-    out.uv = corner * 0.5 + 0.5;
+    var uv = corner * 0.5 + 0.5;
+    let cols = params.misc.z;
+    let rows = params.misc.w;
+    if (cols > 0.0) {
+        // §18.5.5 spritesheet: frameRate 0 plays the sheet once over the
+        // particle's lifetime; > 0 loops at that rate from a per-particle
+        // random start frame.
+        let frames = cols * rows;
+        var fi: f32;
+        if (params.misc.y <= 0.0) {
+            fi = floor(clamp(p.age / p.lifetime, 0.0, 0.99999) * frames);
+        } else {
+            let start = floor(rnd(u32(p.seed), 11u) * frames);
+            fi = floor(start + p.age * params.misc.y);
+            fi = fi - floor(fi / frames) * frames;
+        }
+        uv = (vec2f(fi - floor(fi / cols) * cols, floor(fi / cols)) + uv) /
+             vec2f(cols, rows);
+    }
+    out.uv = uv;
     out.color = p.color;
     return out;
 }
@@ -2070,12 +2510,12 @@ const char* kSpriteTexturedFragment = R"(
 )";
 
 const char* kSpriteTextureBindings = R"(
-@group(0) @binding(2) var sprite: texture_2d<f32>;
-@group(0) @binding(3) var sprite_sampler: sampler;
+@group(0) @binding(3) var sprite: texture_2d<f32>;
+@group(0) @binding(4) var sprite_sampler: sampler;
 )";
 
-SpritesNode::SpritesNode(Blend blend)
-    : mBlend(blend)
+SpritesNode::SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows)
+    : mBlend(blend), mSheetCols(sheetCols), mSheetRows(sheetRows)
 {
     outputs.resize(1);
     outputs[0].name = "result";
@@ -2085,7 +2525,8 @@ SpritesNode::SpritesNode(Blend blend)
 bool SpritesNode::ensurePipeline(FrameContext& ctx)
 {
     // Bound-ness of the sprite texture is static after load.
-    mTextured = inputs.size() > 1 && inputs[1].srcNode != nullptr;
+    mTextured = inputs.size() > PortTexture &&
+                inputs[PortTexture].srcNode != nullptr;
     if (mPipeline) {
         return true;
     }
@@ -2124,8 +2565,21 @@ bool SpritesNode::ensurePipeline(FrameContext& ctx)
     desc.fragment = &fragment;
     mPipeline = ctx.device.CreateRenderPipeline(&desc);
 
+    wgpu::ShaderModule prepMod = makeModule(ctx.device, kSpritesPrepareWgsl);
+    wgpu::ComputePipelineDescriptor pd{};
+    pd.compute.module = prepMod;
+    pd.compute.entryPoint = "main";
+    mPrepare = ctx.device.CreateComputePipeline(&pd);
+    if (mBlend == Blend::Over) {
+        wgpu::ShaderModule sortMod = makeModule(ctx.device, kSpritesSortWgsl);
+        wgpu::ComputePipelineDescriptor sd{};
+        sd.compute.module = sortMod;
+        sd.compute.entryPoint = "main";
+        mSort = ctx.device.CreateComputePipeline(&sd);
+    }
+
     wgpu::BufferDescriptor ud{};
-    ud.size = 16;
+    ud.size = 32;
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     mUniforms = ctx.device.CreateBuffer(&ud);
     if (mTextured) {
@@ -2134,18 +2588,60 @@ bool SpritesNode::ensurePipeline(FrameContext& ctx)
     return mPipeline != nullptr;
 }
 
+// (Re)builds the draw list for a pool size: index list padded to a power of
+// two for the bitonic network, indirect args, and the per-stage (j, k)
+// uniforms. Sort bind groups are cached per source buffer (ping-pong).
+void SpritesNode::ensurePool(FrameContext& ctx, uint32_t capacity)
+{
+    uint32_t padded = 1;
+    while (padded < capacity) {
+        padded *= 2;
+    }
+    if (padded == mPadded) {
+        return;
+    }
+    mPadded = padded;
+    mSortGroups.clear();
+    mSortUniforms.clear();
+
+    wgpu::BufferDescriptor id{};
+    id.size = (uint64_t)mPadded * 4;
+    id.usage = wgpu::BufferUsage::Storage;
+    mIndices = ctx.device.CreateBuffer(&id);
+    wgpu::BufferDescriptor ad{};
+    ad.size = 16;
+    ad.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::Indirect;
+    mIndirect = ctx.device.CreateBuffer(&ad);
+
+    if (mBlend == Blend::Over) {
+        for (uint32_t k = 2; k <= mPadded; k *= 2) {
+            for (uint32_t j = k / 2; j >= 1; j /= 2) {
+                const uint32_t jk[4] = { j, k, 0, 0 };
+                wgpu::BufferDescriptor sd{};
+                sd.size = sizeof(jk);
+                sd.usage =
+                    wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+                wgpu::Buffer buf = ctx.device.CreateBuffer(&sd);
+                ctx.device.GetQueue().WriteBuffer(buf, 0, jk, sizeof(jk));
+                mSortUniforms.push_back(std::move(buf));
+            }
+        }
+    }
+}
+
 void SpritesNode::evaluate(FrameContext& ctx)
 {
     if (!ensurePipeline(ctx)) {
         return;
     }
-    const Value particles = inputValue(0);
+    const Value particles = inputValue(PortParticles);
     if (!particles.buffer) {
         return; // the producer has not run yet
     }
-    if (mTextured && !inputValue(1).texture) {
+    if (mTextured && !inputValue(PortTexture).texture) {
         return;
     }
+    ensurePool(ctx, particles.bufCapacity);
 
     const uint32_t width = ctx.targetWidth, height = ctx.targetHeight;
     if (!mColor || width != mWidth || height != mHeight) {
@@ -2160,31 +2656,90 @@ void SpritesNode::evaluate(FrameContext& ctx)
         mHeight = height;
     }
 
-    const float aspect[4] = { (float)width / (float)height, 0, 0, 0 };
-    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, aspect, sizeof(aspect));
+    const float uniforms[8] = {
+        (float)width / (float)height,
+        (float)inputValue(PortFrameRate).v[0],
+        (float)mSheetCols,
+        (float)mSheetRows,
+        (float)inputValue(PortParallax).v[0],
+        (float)inputValue(PortParallax).v[1],
+        0.0f,
+        0.0f,
+    };
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, uniforms,
+                                      sizeof(uniforms));
+
+    const uint64_t poolSize =
+        (uint64_t)particles.bufStride * particles.bufCapacity;
+    const auto bufferEntry = [](uint32_t binding, const wgpu::Buffer& buf,
+                                uint64_t size) {
+        wgpu::BindGroupEntry e{};
+        e.binding = binding;
+        e.buffer = buf;
+        e.size = size;
+        return e;
+    };
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+
+    // Prepare: compact live slots, size the indirect draw.
+    {
+        wgpu::BindGroupEntry entries[3] = {
+            bufferEntry(0, particles.buffer, poolSize),
+            bufferEntry(1, mIndices, (uint64_t)mPadded * 4),
+            bufferEntry(2, mIndirect, 16),
+        };
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = mPrepare.GetBindGroupLayout(0);
+        bgd.entryCount = 3;
+        bgd.entries = entries;
+        wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgd);
+        wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+        pass.SetPipeline(mPrepare);
+        pass.SetBindGroup(0, group);
+        pass.DispatchWorkgroups(1, 1, 1);
+        pass.End();
+    }
+
+    // 'over': bitonic sort, back-to-front (§18.5.5). One dispatch per
+    // stage; bind groups are cached per source ping-pong buffer.
+    if (mBlend == Blend::Over) {
+        auto& groups = mSortGroups[particles.buffer.Get()];
+        if (groups.size() != mSortUniforms.size()) {
+            groups.clear();
+            for (const auto& stage : mSortUniforms) {
+                wgpu::BindGroupEntry entries[3] = {
+                    bufferEntry(0, particles.buffer, poolSize),
+                    bufferEntry(1, mIndices, (uint64_t)mPadded * 4),
+                    bufferEntry(2, stage, 16),
+                };
+                wgpu::BindGroupDescriptor bgd{};
+                bgd.layout = mSort.GetBindGroupLayout(0);
+                bgd.entryCount = 3;
+                bgd.entries = entries;
+                groups.push_back(ctx.device.CreateBindGroup(&bgd));
+            }
+        }
+        wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+        pass.SetPipeline(mSort);
+        for (const auto& group : groups) {
+            pass.SetBindGroup(0, group);
+            pass.DispatchWorkgroups((mPadded + 63) / 64, 1, 1);
+        }
+        pass.End();
+    }
 
     std::vector<wgpu::BindGroupEntry> entries;
-    {
-        wgpu::BindGroupEntry e{};
-        e.binding = 0;
-        e.buffer = mUniforms;
-        e.size = 16;
-        entries.push_back(e);
-    }
-    {
-        wgpu::BindGroupEntry e{};
-        e.binding = 1;
-        e.buffer = particles.buffer;
-        e.size = (uint64_t)particles.bufStride * particles.bufCapacity;
-        entries.push_back(e);
-    }
+    entries.push_back(bufferEntry(0, mUniforms, 32));
+    entries.push_back(bufferEntry(1, particles.buffer, poolSize));
+    entries.push_back(bufferEntry(2, mIndices, (uint64_t)mPadded * 4));
     if (mTextured) {
         wgpu::BindGroupEntry t{};
-        t.binding = 2;
-        t.textureView = inputValue(1).texture.CreateView();
+        t.binding = 3;
+        t.textureView = inputValue(PortTexture).texture.CreateView();
         entries.push_back(t);
         wgpu::BindGroupEntry s{};
-        s.binding = 3;
+        s.binding = 4;
         s.sampler = mSampler;
         entries.push_back(s);
     }
@@ -2203,11 +2758,312 @@ void SpritesNode::evaluate(FrameContext& ctx)
     rpd.colorAttachmentCount = 1;
     rpd.colorAttachments = &attachment;
 
-    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
     wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rpd);
     pass.SetPipeline(mPipeline);
     pass.SetBindGroup(0, group);
-    pass.Draw(4, particles.bufCapacity);
+    pass.DrawIndirect(mIndirect, 0);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mColor;
+    out.texWidth = mWidth;
+    out.texHeight = mHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+}
+
+// ---- TrailsNode (§18.5.6) ----
+
+// History recording: one ring sample per particle per sim tick. A fresh
+// emission (age == 0) refills its whole ring with the emission point so a
+// recycled slot never draws a streak from its previous life.
+const char* kTrailsRecordWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
+}
+
+// misc = (aspect, tick, length, -); par = parallax; style = (width, taper,
+// fade, -). Shared with the render stage; the record pass reads misc only.
+struct Params { misc: vec4f, par: vec4f, style: vec4f }
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> pts: array<Particle>;
+@group(0) @binding(2) var<storage, read_write> hist: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let i = id.x;
+    if (i >= arrayLength(&pts)) {
+        return;
+    }
+    let L = u32(params.misc.z);
+    let p = pts[i];
+    let s = vec4f(p.pos.xy, p.size, select(0.0, 1.0, p.lifetime != 0.0));
+    if (p.age == 0.0 && p.lifetime != 0.0) {
+        for (var k = 0u; k < L; k++) {
+            hist[i * L + k] = s;
+        }
+    } else {
+        hist[i * L + (u32(params.misc.y) % L)] = s;
+    }
+}
+)";
+
+// Ribbon rendering: per instance (= particle slot), a triangle strip of
+// 2 * (kSubdiv * (length - 1) + 1) vertices along the Catmull-Rom spline
+// through the ring, extruded perpendicular to the local tangent in
+// aspect-corrected space.
+const char* kTrailsRenderWgsl = R"(
+struct Particle {
+    pos: vec3f, age: f32,
+    vel: vec3f, lifetime: f32,
+    color: vec4f,
+    size: f32, rotation: f32, seed: f32, emitter: f32,
+}
+
+struct Params { misc: vec4f, par: vec4f, style: vec4f }
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> pts: array<Particle>;
+@group(0) @binding(2) var<storage, read> hist: array<vec4f>;
+
+struct VsOut {
+    @builtin(position) pos: vec4f,
+    @location(0) color: vec4f,
+}
+
+// Sample k ticks ago (0 = the sample recorded this tick), aspect-corrected
+// x so widths and tangents are isotropic on screen.
+fn sampleAgo(i: u32, k: i32) -> vec3f {
+    let L = u32(params.misc.z);
+    let kk = u32(clamp(k, 0, i32(L) - 1));
+    let slot = (u32(params.misc.y) + L - (kk % L)) % L;
+    let s = hist[i * L + slot];
+    return vec3f(s.x * params.misc.x, s.y, s.z);
+}
+
+@vertex
+fn drift_trail_vs(@builtin(vertex_index) v: u32,
+                  @builtin(instance_index) i: u32) -> VsOut {
+    var out: VsOut;
+    let p = pts[i];
+    if (p.lifetime == 0.0) {
+        out.pos = vec4f(0.0, 0.0, 0.0, 1.0); // degenerate: nothing rastered
+        return out;
+    }
+    let L = u32(params.misc.z);
+    let sub = SUBDIVu;
+    let q = v / 2u;                      // point index along the spline
+    let side = f32(v & 1u) * 2.0 - 1.0;  // extrusion side
+    let t = f32(q) / f32(sub);           // in [0, L-1]
+    let i0 = i32(floor(t));
+    let f = fract(t);
+    let p0 = sampleAgo(i, i0 - 1);
+    let p1 = sampleAgo(i, i0);
+    let p2 = sampleAgo(i, i0 + 1);
+    let p3 = sampleAgo(i, i0 + 2);
+    // Catmull-Rom position and tangent (t runs head -> tail).
+    let pos = 0.5 * (2.0 * p1 + (p2 - p0) * f +
+                     (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f +
+                     (3.0 * p1 - p0 - 3.0 * p2 + p3) * f * f * f);
+    let tan2 = 0.5 * ((p2.xy - p0.xy) +
+                      2.0 * (2.0 * p0.xy - 5.0 * p1.xy + 4.0 * p2.xy -
+                             p3.xy) * f +
+                      3.0 * (3.0 * p1.xy - p0.xy - 3.0 * p2.xy + p3.xy) *
+                          f * f);
+    let tl = sqrt(dot(tan2, tan2));
+    var nrm = vec2f(0.0);
+    if (tl > 1e-6) {
+        nrm = vec2f(-tan2.y, tan2.x) / tl; // zero tangent: zero width
+    }
+    let u = t / f32(L - 1u); // 0 at the head, 1 at the tail
+    let w = pos.z * params.style.x * mix(1.0, params.style.y, u);
+    let pc = pos.xy + nrm * w * side;
+    let fin = vec2f(pc.x / params.misc.x, pc.y) + params.par.xy * p.pos.z;
+    out.pos = vec4f(fin.x * 2.0 - 1.0, 1.0 - fin.y * 2.0, 0.0, 1.0);
+    out.color = p.color * mix(1.0, params.style.z, u);
+    return out;
+}
+
+@fragment
+fn drift_trail_fs(@location(0) color: vec4f) -> @location(0) vec4f {
+    return color;
+}
+)";
+
+TrailsNode::TrailsNode(Blend blend, uint32_t length)
+    : mBlend(blend), mLength(length)
+{
+    outputs.resize(1);
+    outputs[0].name = "result";
+    outputs[0].value.type = ValueType::Texture;
+}
+
+bool TrailsNode::ensurePipeline(FrameContext& ctx)
+{
+    if (mPipeline) {
+        return true;
+    }
+    wgpu::ShaderModule recMod = makeModule(ctx.device, kTrailsRecordWgsl);
+    if (!recMod) {
+        return false;
+    }
+    wgpu::ComputePipelineDescriptor rd{};
+    rd.compute.module = recMod;
+    rd.compute.entryPoint = "main";
+    mRecord = ctx.device.CreateComputePipeline(&rd);
+
+    std::string source = kTrailsRenderWgsl;
+    const std::string sub = std::to_string(kSubdiv);
+    for (size_t at = source.find("SUBDIV"); at != std::string::npos;
+         at = source.find("SUBDIV")) {
+        source.replace(at, 6, sub);
+    }
+    wgpu::ShaderModule module = makeModule(ctx.device, source);
+    if (!module) {
+        return false;
+    }
+
+    wgpu::BlendState blend{};
+    blend.color.srcFactor = wgpu::BlendFactor::One;
+    blend.color.dstFactor = mBlend == Blend::Add
+        ? wgpu::BlendFactor::One
+        : wgpu::BlendFactor::OneMinusSrcAlpha;
+    blend.alpha = blend.color;
+    wgpu::ColorTargetState color{};
+    color.format = wgpu::TextureFormat::RGBA16Float;
+    color.blend = &blend;
+
+    wgpu::FragmentState fragment{};
+    fragment.module = module;
+    fragment.entryPoint = "drift_trail_fs";
+    fragment.targetCount = 1;
+    fragment.targets = &color;
+
+    wgpu::RenderPipelineDescriptor desc{};
+    desc.vertex.module = module;
+    desc.vertex.entryPoint = "drift_trail_vs";
+    desc.primitive.topology = wgpu::PrimitiveTopology::TriangleStrip;
+    desc.fragment = &fragment;
+    mPipeline = ctx.device.CreateRenderPipeline(&desc);
+
+    wgpu::BufferDescriptor ud{};
+    ud.size = 48;
+    ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+    mUniforms = ctx.device.CreateBuffer(&ud);
+    return mPipeline != nullptr;
+}
+
+void TrailsNode::evaluate(FrameContext& ctx)
+{
+    if (!ensurePipeline(ctx)) {
+        return;
+    }
+    const Value particles = inputValue(PortParticles);
+    if (!particles.buffer) {
+        return; // the producer has not run yet
+    }
+    if (particles.bufCapacity != mHistCapacity) {
+        wgpu::BufferDescriptor hd{};
+        hd.size = (uint64_t)particles.bufCapacity * mLength * 16;
+        hd.usage = wgpu::BufferUsage::Storage; // zero-init: empty rings
+        mHistory = ctx.device.CreateBuffer(&hd);
+        mHistCapacity = particles.bufCapacity;
+        mTick = 0;
+    }
+
+    const uint32_t width = ctx.targetWidth, height = ctx.targetHeight;
+    if (!mColor || width != mWidth || height != mHeight) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { width, height, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
+        mColor = ctx.device.CreateTexture(&desc);
+        mWidth = width;
+        mHeight = height;
+    }
+
+    // Record a sample only when the simulation actually ticked — a
+    // re-render for a style change must not consume ring history.
+    const Node::Input& src = inputs[PortParticles];
+    const bool ticked =
+        src.srcNode && src.srcNode->outputs[src.srcPort].dirty;
+    if (ticked) {
+        ++mTick;
+    }
+
+    const float uniforms[12] = {
+        (float)width / (float)height,
+        (float)(mTick % mLength),
+        (float)mLength,
+        0.0f,
+        (float)inputValue(PortParallax).v[0],
+        (float)inputValue(PortParallax).v[1],
+        0.0f,
+        0.0f,
+        (float)inputValue(PortWidth).v[0],
+        (float)inputValue(PortTaper).v[0],
+        (float)inputValue(PortFade).v[0],
+        0.0f,
+    };
+    ctx.device.GetQueue().WriteBuffer(mUniforms, 0, uniforms,
+                                      sizeof(uniforms));
+
+    const uint64_t poolSize =
+        (uint64_t)particles.bufStride * particles.bufCapacity;
+    const uint64_t histSize = (uint64_t)mHistCapacity * mLength * 16;
+    wgpu::BindGroupEntry entries[3] = {};
+    entries[0].binding = 0;
+    entries[0].buffer = mUniforms;
+    entries[0].size = 48;
+    entries[1].binding = 1;
+    entries[1].buffer = particles.buffer;
+    entries[1].size = poolSize;
+    entries[2].binding = 2;
+    entries[2].buffer = mHistory;
+    entries[2].size = histSize;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    if (ticked) {
+        wgpu::BindGroupDescriptor bgd{};
+        bgd.layout = mRecord.GetBindGroupLayout(0);
+        bgd.entryCount = 3;
+        bgd.entries = entries;
+        wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgd);
+        wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+        pass.SetPipeline(mRecord);
+        pass.SetBindGroup(0, group);
+        pass.DispatchWorkgroups((mHistCapacity + 63) / 64, 1, 1);
+        pass.End();
+    }
+
+    wgpu::BindGroupDescriptor bgd{};
+    bgd.layout = mPipeline.GetBindGroupLayout(0);
+    bgd.entryCount = 3;
+    bgd.entries = entries;
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgd);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mColor.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+    wgpu::RenderPassDescriptor rpd{};
+    rpd.colorAttachmentCount = 1;
+    rpd.colorAttachments = &attachment;
+
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rpd);
+    pass.SetPipeline(mPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(2 * (kSubdiv * (mLength - 1) + 1), particles.bufCapacity);
     pass.End();
     wgpu::CommandBuffer commands = encoder.Finish();
     ctx.device.GetQueue().Submit(1, &commands);

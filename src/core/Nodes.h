@@ -294,48 +294,130 @@ public:
         PortDirection, PortSpread, PortSpeed, PortLifetime, PortSize,
         PortSpin, PortColorStart, PortColorEnd, PortFadeIn, PortSizeEnd,
         PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
-        PortAttractor, PortAttract, PortVortex, PortTime, PortCount,
+        PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
+        PortRing, PortDepth, PortCollide, PortBounce, PortSpawn,
+        PortInherit, PortSpawnPrev, PortTime, PortCount,
     };
-    static constexpr uint32_t kStride = 64; // the Particle contract
+    // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
+    // EfCount extra input ports per entry after PortCount, in this order —
+    // the loader's kEmitterFields table must match. An entry field that was
+    // not set falls back to the base port at evaluation time (mMasks).
+    enum EmitterField : size_t {
+        EfOrigin, EfExtent, EfDirection, EfSpread, EfSpeed, EfLifetime,
+        EfSize, EfSpin, EfColorStart, EfColorEnd, EfDepth, EfDelay,
+        EfDuration, EfWeight, EfCount,
+    };
+    static constexpr uint32_t kStride = 64;      // the Particle contract
+    static constexpr uint32_t kMaxEmitters = 8;  // §18.5.3
+    static constexpr uint32_t kEmitterStride = 112; // EmitterP, WGSL layout
 
-    ParticlesNode(uint32_t capacity, Emitter emitter);
+    // One entry per emitter: its shape and the bitmask (1 << EmitterField)
+    // of fields the document set on it. Single-emitter nodes pass one entry
+    // with mask 0. spawnCount > 0 selects sub-emitter mode (§18.5.4): the
+    // loader derives capacity as spawn.capacity × spawnCount and wires the
+    // hidden spawnPrev feedback edge for death detection.
+    ParticlesNode(uint32_t capacity, std::vector<Emitter> emitters,
+                  std::vector<uint32_t> overrideMasks,
+                  uint32_t spawnCount = 0);
     void evaluate(FrameContext& ctx) override;
 
 private:
     bool ensurePipeline(FrameContext& ctx);
+    Value emitterValue(size_t e, EmitterField f) const;
 
     const uint32_t mCapacity;
-    const Emitter mEmitter;
+    const std::vector<Emitter> mEmitters;
+    const std::vector<uint32_t> mMasks;
+    const uint32_t mSpawnCount; // §18.5.4: children per death; 0 = ring mode
     WgslInterface mIface; // built-in kernel reflection: the layout oracle
 
     wgpu::ComputePipeline mPipeline;
     wgpu::Buffer mUniforms;
+    wgpu::Buffer mEmitterUniforms; // EmitterP[kMaxEmitters] storage block
+    wgpu::Sampler mSampler;  // collide mask sampling (§18.5.2)
+    bool mCollide = false;   // pipeline permutation: collide port bound
     wgpu::Buffer mState[2]; // ping-pong pool
     int mFront = 0;
-    double mAccum = 0.0;    // fractional emissions carried between frames
+    // Fractional emissions carried between frames, per emitter (§18.5.3:
+    // the rate splits across emitters by weight, deterministically).
+    std::array<double, kMaxEmitters> mAccum{};
     double mEmitted = 0.0;  // total emissions: the RNG ordinal base
     uint32_t mCursor = 0;   // next emission slot (ring)
+    double mSimTime = 0.0;  // accumulated sim ticks: the §18.5.2 window clock
 };
 
-// §18.3 sprites: instanced draw of a Particle buffer into an output-sized
-// premultiplied layer — one quad per slot, dead slots degenerate. The
-// fragment is either a built-in soft disc or the optional sprite texture.
+// §18.3/§18.5.5 sprites: instanced draw of a Particle buffer into an
+// output-sized premultiplied layer. A prepare pass compacts live slots into
+// an index list and sizes an indirect draw; 'over' additionally sorts the
+// list back-to-front (z descending, then oldest-first) with a bitonic
+// network, so order is deterministic. The fragment is either a built-in
+// soft disc or the optional sprite texture, with §18.5.5 spritesheet frame
+// animation and per-particle parallax applied in the vertex stage.
 class SpritesNode : public Node {
 public:
     enum class Blend { Add, Over };
-    explicit SpritesNode(Blend blend);
+    enum Port : size_t {
+        PortParticles, PortTexture, PortFrameRate, PortParallax,
+    };
+    // sheetCols/Rows 0 = whole texture (no sheet).
+    SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows);
+    void evaluate(FrameContext& ctx) override;
+
+private:
+    bool ensurePipeline(FrameContext& ctx);
+    void ensurePool(FrameContext& ctx, uint32_t capacity);
+
+    const Blend mBlend;
+    const uint32_t mSheetCols, mSheetRows;
+    wgpu::RenderPipeline mPipeline;
+    wgpu::ComputePipeline mPrepare;
+    wgpu::ComputePipeline mSort;
+    bool mTextured = false;
+    wgpu::Buffer mUniforms;
+    wgpu::Sampler mSampler;
+    wgpu::Texture mColor;
+    uint32_t mWidth = 0, mHeight = 0;
+    // §18.5.5 draw list: alive slot indices (padded to a power of two for
+    // the sort network; padding is a sentinel that sinks) + indirect args.
+    wgpu::Buffer mIndices;
+    wgpu::Buffer mIndirect;
+    uint32_t mPadded = 0;
+    std::vector<wgpu::Buffer> mSortUniforms; // one (j, k) pair per stage
+    // Sort bind groups reference the producer's ping-pong buffer, so cache
+    // one set per source buffer object.
+    std::map<WGPUBuffer, std::vector<wgpu::BindGroup>> mSortGroups;
+};
+
+// §18.5.6 trails: Catmull-Rom ribbons through per-particle position
+// history, over the public Particle contract. A record pass appends one
+// ring sample per particle per sim tick (a fresh emission resets its whole
+// ring, so recycled slots never streak); the render pass extrudes a
+// tessellated strip per live particle, tapering width and alpha toward the
+// tail.
+class TrailsNode : public Node {
+public:
+    enum class Blend { Add, Over };
+    enum Port : size_t {
+        PortParticles, PortWidth, PortTaper, PortFade, PortParallax,
+    };
+    static constexpr uint32_t kSubdiv = 4; // tessellation per history segment
+
+    TrailsNode(Blend blend, uint32_t length);
     void evaluate(FrameContext& ctx) override;
 
 private:
     bool ensurePipeline(FrameContext& ctx);
 
     const Blend mBlend;
+    const uint32_t mLength; // history samples per particle (§18.5.6: 2-64)
+    wgpu::ComputePipeline mRecord;
     wgpu::RenderPipeline mPipeline;
-    bool mTextured = false;
     wgpu::Buffer mUniforms;
-    wgpu::Sampler mSampler;
+    wgpu::Buffer mHistory; // capacity × length × vec4(pos.xy, size, alive)
+    uint32_t mHistCapacity = 0;
     wgpu::Texture mColor;
     uint32_t mWidth = 0, mHeight = 0;
+    uint32_t mTick = 0; // ring head = mTick % mLength
 };
 
 // §9.6 output: blits the final linear texture to the platform target with

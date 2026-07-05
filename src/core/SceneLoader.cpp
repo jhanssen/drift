@@ -291,13 +291,66 @@ const PortDef kParticlesInputs[] = {
     { "attractor", ValueType::Vec2, false, { 0.5, 0.5 } },
     { "attract", ValueType::Scalar, false, { 0 } },
     { "vortex", ValueType::Scalar, false, { 0 } },
+    { "delay", ValueType::Scalar, false, { 0 } },
+    { "duration", ValueType::Scalar, false, { 0 } },
+    { "ring", ValueType::Scalar, false, { 0 } },
+    { "depth", ValueType::Vec2, false, { 0, 0 } },
+    { "collide", ValueType::Texture, false },
+    { "bounce", ValueType::Scalar, false, { 0.5 } },
+    { "spawn", ValueType::Buffer, false, {}, false, ParticlesNode::kStride },
+    { "inherit", ValueType::Scalar, false, { 0 } },
+    // Hidden §18.5.4 feedback edge: injected by the loader when 'spawn' is
+    // connected (death detection needs the source's previous tick).
+    { "spawnPrev", ValueType::Buffer, false, {}, false,
+      ParticlesNode::kStride },
     { "time", ValueType::Scalar, true },
 };
+// Order must match SpritesNode::Port.
 const PortDef kSpritesInputs[] = {
     { "particles", ValueType::Buffer, true, {}, false,
       ParticlesNode::kStride },
     { "texture", ValueType::Texture, false },
+    { "frameRate", ValueType::Scalar, false, { 0 } },
+    { "parallax", ValueType::Vec2, false, { 0, 0 } },
 };
+// Order must match TrailsNode::Port.
+const PortDef kTrailsInputs[] = {
+    { "particles", ValueType::Buffer, true, {}, false,
+      ParticlesNode::kStride },
+    { "width", ValueType::Scalar, false, { 1 } },
+    { "taper", ValueType::Scalar, false, { 0 } },
+    { "fade", ValueType::Scalar, false, { 0 } },
+    { "parallax", ValueType::Vec2, false, { 0, 0 } },
+};
+// §18.5.3 emitter-entry fields — order must match ParticlesNode::EmitterField
+// exactly. Entries inject real input ports named "emitters[i].<field>".
+const struct {
+    const char* name;
+    ValueType type;
+} kEmitterFields[] = {
+    { "origin", ValueType::Vec2 }, { "extent", ValueType::Vec2 },
+    { "direction", ValueType::Vec2 }, { "spread", ValueType::Scalar },
+    { "speed", ValueType::Vec2 }, { "lifetime", ValueType::Vec2 },
+    { "size", ValueType::Vec2 }, { "spin", ValueType::Vec2 },
+    { "colorStart", ValueType::Vec4 }, { "colorEnd", ValueType::Vec4 },
+    { "depth", ValueType::Vec2 }, { "delay", ValueType::Scalar },
+    { "duration", ValueType::Scalar }, { "weight", ValueType::Scalar },
+};
+static_assert(std::size(kEmitterFields) == ParticlesNode::EfCount);
+
+bool parseEmitterShape(const std::string& kind, ParticlesNode::Emitter& out)
+{
+    if (kind == "point") {
+        out = ParticlesNode::Emitter::Point;
+    } else if (kind == "box") {
+        out = ParticlesNode::Emitter::Box;
+    } else if (kind == "disc") {
+        out = ParticlesNode::Emitter::Disc;
+    } else {
+        return false;
+    }
+    return true;
+}
 
 struct OutputPortDef {
     const char* name;
@@ -338,6 +391,10 @@ private:
 
     bool parseParameters(const glz::generic& json);
     bool parseNodes(const glz::generic& json);
+    // §18.5.3: validates the 'emitters' property, injects entry fields into
+    // raw.inputs as "emitters[i].<field>" ports (so topo sort, parameters,
+    // and type checking see them), and records shapes + override masks.
+    bool parseEmitters(RawNode& raw, const glz::generic& json);
     bool topoSort();
     bool instantiate(const RawNode& raw);
     Node* makeNode(const RawNode& raw, std::vector<PortDef>& portsOut);
@@ -368,6 +425,14 @@ private:
     const wgpu::Device& mDevice;
     std::vector<std::string>& mErrors;
     std::vector<std::string>& mWarnings;
+
+    // §18.5.3 parsed emitter entries per particles node: shape (-1 =
+    // inherit the node-level 'emitter' property) and override mask.
+    struct EmitterSpec {
+        std::vector<int> kinds;
+        std::vector<uint32_t> masks;
+    };
+    std::map<std::string, EmitterSpec> mEmitterSpecs;
 
     std::vector<Param> mParams;
     std::map<std::string, int> mParamIndex;
@@ -548,8 +613,10 @@ bool Loader::parseNodes(const glz::generic& json)
             { "sequence", { "duration", "loop", "tracks" } },
             { "shader", { "shader", "size" } },
             { "compute", { "shader", "capacity", "dispatch" } },
-            { "particles", { "capacity", "emitter" } },
-            { "sprites", { "blend" } },
+            { "particles",
+              { "capacity", "emitter", "emitters", "spawnCount" } },
+            { "sprites", { "blend", "sheet" } },
+            { "trails", { "blend", "length" } },
             { "image", { "src" } },
             { "video", { "src", "loop" } },
             { "transform", {} },
@@ -591,9 +658,102 @@ bool Loader::parseNodes(const glz::generic& json)
                 raw.inputs[port] = std::move(in);
             }
         }
+        if (raw.type == "particles") {
+            if (auto emIt = obj.find("emitters"); emIt != obj.end()) {
+                if (!parseEmitters(raw, emIt->second)) {
+                    return false;
+                }
+            }
+            // §18.5.4: death detection compares the spawn source against
+            // its previous tick — wire the hidden feedback edge here so
+            // the history machinery (§10) picks it up.
+            if (auto spIt = raw.inputs.find("spawn");
+                spIt != raw.inputs.end()) {
+                if (spIt->second.kind != RawInput::Kind::Conn ||
+                    spIt->second.conn.previous) {
+                    fail("node '" + raw.id + "': 'spawn' must be a direct "
+                         "(non-feedback) connection (§18.5.4)");
+                    return false;
+                }
+                RawInput prev = spIt->second;
+                prev.conn.previous = true;
+                raw.inputs["spawnPrev"] = std::move(prev);
+            }
+        }
         mRawIndex[raw.id] = mRawNodes.size();
         mRawNodes.push_back(std::move(raw));
     }
+    return true;
+}
+
+bool Loader::parseEmitters(RawNode& raw, const glz::generic& json)
+{
+    if (!json.is_array() || json.get_array().empty() ||
+        json.get_array().size() > ParticlesNode::kMaxEmitters) {
+        fail("node '" + raw.id + "': 'emitters' must be an array of 1-" +
+             std::to_string(ParticlesNode::kMaxEmitters) +
+             " objects (§18.5.3)");
+        return false;
+    }
+    EmitterSpec spec;
+    size_t index = 0;
+    for (const auto& entry : json.get_array()) {
+        if (!entry.is_object()) {
+            fail("node '" + raw.id + "': 'emitters' entries must be objects");
+            return false;
+        }
+        int kind = -1;
+        uint32_t mask = 0;
+        for (const auto& [key, value] : entry.get_object()) {
+            if (key == "emitter") {
+                ParticlesNode::Emitter shape;
+                if (!value.is_string() ||
+                    !parseEmitterShape(value.get_string(), shape)) {
+                    fail("node '" + raw.id + "' emitters[" +
+                         std::to_string(index) +
+                         "]: 'emitter' must be \"point\", \"box\", or "
+                         "\"disc\"");
+                    return false;
+                }
+                kind = (int)shape;
+                continue;
+            }
+            int field = -1;
+            for (size_t f = 0; f < std::size(kEmitterFields); ++f) {
+                if (key == kEmitterFields[f].name) {
+                    field = (int)f;
+                    break;
+                }
+            }
+            if (field < 0) {
+                fail("node '" + raw.id + "' emitters[" +
+                     std::to_string(index) + "]: '" + key +
+                     "' is not an emission-time input (§18.5.3)");
+                return false;
+            }
+            RawInput in;
+            std::string err;
+            if (!parseRawInput(value, in, err)) {
+                fail("node '" + raw.id + "' emitters[" +
+                     std::to_string(index) + "]." + key + ": " + err);
+                return false;
+            }
+            forEachConn(in, [&](const RawConn& conn) {
+                if (conn.node == "time") {
+                    mNeedsTime = true;
+                } else if (conn.node == "mouse") {
+                    mNeedsMouse = true;
+                }
+            });
+            raw.inputs["emitters[" + std::to_string(index) + "]." + key] =
+                std::move(in);
+            mask |= 1u << field;
+        }
+        spec.kinds.push_back(kind);
+        spec.masks.push_back(mask);
+        ++index;
+    }
+    mEmitterSpecs[raw.id] = std::move(spec);
     return true;
 }
 
@@ -1252,17 +1412,82 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             }
             capacity = (uint32_t)capIt->second.get_number();
         }
+        // §18.5.4 sub-emitter mode: capacity derives from the spawn source
+        // so every death has a statically assigned brood.
+        uint32_t spawnCount = 0;
+        if (raw.inputs.count("spawn")) {
+            spawnCount = 4;
+            if (auto scIt = obj.find("spawnCount"); scIt != obj.end()) {
+                if (!scIt->second.is_number() ||
+                    scIt->second.get_number() < 1 ||
+                    scIt->second.get_number() !=
+                        (double)(uint32_t)scIt->second.get_number()) {
+                    fail("node '" + raw.id +
+                         "': 'spawnCount' must be a positive integer");
+                    return nullptr;
+                }
+                spawnCount = (uint32_t)scIt->second.get_number();
+            }
+            if (mEmitterSpecs.count(raw.id)) {
+                fail("node '" + raw.id + "': 'emitters' does not combine "
+                     "with 'spawn' (§18.5.4)");
+                return nullptr;
+            }
+            const RawConn& conn = raw.inputs.at("spawn").conn;
+            Node* src = mInstances.count(conn.node) ? mInstances[conn.node]
+                                                    : nullptr;
+            int srcPort = 0;
+            if (src && !conn.port.empty()) {
+                srcPort = -1;
+                for (const auto& p : producerPorts(conn.node)) {
+                    if (conn.port == p.name) {
+                        srcPort = p.index;
+                        break;
+                    }
+                }
+            }
+            if (!src || srcPort < 0 ||
+                (size_t)srcPort >= src->outputs.size() ||
+                src->outputs[srcPort].value.type != ValueType::Buffer) {
+                fail("node '" + raw.id +
+                     "': 'spawn' must connect to a buffer output (§18.5.4)");
+                return nullptr;
+            }
+            const uint64_t derived =
+                (uint64_t)src->outputs[srcPort].value.bufCapacity *
+                spawnCount;
+            if (derived == 0 || derived > (1u << 22)) {
+                fail("node '" + raw.id + "': derived capacity " +
+                     std::to_string(derived) +
+                     " exceeds the pool limit (§18.5.7)");
+                return nullptr;
+            }
+            if (obj.count("capacity")) {
+                warn("node '" + raw.id + "': 'capacity' is ignored — "
+                     "sub-emitters derive it from the spawn source "
+                     "(§18.5.4)");
+            }
+            if (obj.count("emitter")) {
+                warn("node '" + raw.id +
+                     "': 'emitter' does not apply with 'spawn' (§18.5.4)");
+            }
+            for (const char* dead :
+                 { "rate", "burst", "burstCount", "origin", "extent",
+                   "delay", "duration" }) {
+                if (raw.inputs.count(dead)) {
+                    warn("node '" + raw.id + "': input '" + dead +
+                         "' does not apply with 'spawn' (§18.5.4)");
+                }
+            }
+            capacity = (uint32_t)derived;
+        } else if (obj.count("spawnCount")) {
+            warn("node '" + raw.id +
+                 "': 'spawnCount' without 'spawn' is ignored (§18.5.4)");
+        }
         ParticlesNode::Emitter emitter = ParticlesNode::Emitter::Point;
         if (auto emitIt = obj.find("emitter"); emitIt != obj.end()) {
-            const std::string kind =
-                emitIt->second.is_string() ? emitIt->second.get_string() : "";
-            if (kind == "point") {
-                emitter = ParticlesNode::Emitter::Point;
-            } else if (kind == "box") {
-                emitter = ParticlesNode::Emitter::Box;
-            } else if (kind == "disc") {
-                emitter = ParticlesNode::Emitter::Disc;
-            } else {
+            if (!emitIt->second.is_string() ||
+                !parseEmitterShape(emitIt->second.get_string(), emitter)) {
                 fail("node '" + raw.id +
                      "': 'emitter' must be \"point\", \"box\", or \"disc\"");
                 return nullptr;
@@ -1280,7 +1505,30 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         }
         portsOut.assign(std::begin(kParticlesInputs),
                         std::end(kParticlesInputs));
-        return new ParticlesNode(capacity, emitter);
+        // §18.5.3: entries append one port per emitter field; an entry's
+        // unset fields stay unbound (the node falls back to the base port).
+        std::vector<ParticlesNode::Emitter> kinds;
+        std::vector<uint32_t> masks;
+        if (auto specIt = mEmitterSpecs.find(raw.id);
+            specIt != mEmitterSpecs.end()) {
+            const EmitterSpec& spec = specIt->second;
+            for (size_t e = 0; e < spec.kinds.size(); ++e) {
+                kinds.push_back(spec.kinds[e] < 0
+                                    ? emitter
+                                    : (ParticlesNode::Emitter)spec.kinds[e]);
+                for (const auto& field : kEmitterFields) {
+                    portsOut.push_back(
+                        { "emitters[" + std::to_string(e) + "]." + field.name,
+                          field.type, false });
+                }
+            }
+            masks = spec.masks;
+        } else {
+            kinds = { emitter };
+            masks = { 0 };
+        }
+        return new ParticlesNode(capacity, std::move(kinds),
+                                 std::move(masks), spawnCount);
     }
 
     if (raw.type == "sprites") {
@@ -1299,8 +1547,67 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
                 return nullptr;
             }
         }
+        // §18.5.5 spritesheet grid.
+        uint32_t sheetCols = 0, sheetRows = 0;
+        if (auto sheetIt = obj.find("sheet"); sheetIt != obj.end()) {
+            const auto bad = [&] {
+                fail("node '" + raw.id + "': 'sheet' must be [cols, rows], "
+                     "integers >= 1 (§18.5.5)");
+                return nullptr;
+            };
+            if (!sheetIt->second.is_array() ||
+                sheetIt->second.get_array().size() != 2) {
+                return bad();
+            }
+            for (const auto& v : sheetIt->second.get_array()) {
+                if (!v.is_number() || v.get_number() < 1 ||
+                    v.get_number() != (double)(uint32_t)v.get_number()) {
+                    return bad();
+                }
+            }
+            sheetCols = (uint32_t)sheetIt->second.get_array()[0].get_number();
+            sheetRows = (uint32_t)sheetIt->second.get_array()[1].get_number();
+            if (!raw.inputs.count("texture")) {
+                fail("node '" + raw.id +
+                     "': 'sheet' requires the 'texture' input (§18.5.5)");
+                return nullptr;
+            }
+        }
         portsOut.assign(std::begin(kSpritesInputs), std::end(kSpritesInputs));
-        return new SpritesNode(blend);
+        return new SpritesNode(blend, sheetCols, sheetRows);
+    }
+
+    if (raw.type == "trails") {
+        const auto& obj = raw.json->get_object();
+        TrailsNode::Blend blend = TrailsNode::Blend::Add;
+        if (auto blendIt = obj.find("blend"); blendIt != obj.end()) {
+            const std::string mode =
+                blendIt->second.is_string() ? blendIt->second.get_string() : "";
+            if (mode == "add") {
+                blend = TrailsNode::Blend::Add;
+            } else if (mode == "over") {
+                blend = TrailsNode::Blend::Over;
+            } else {
+                fail("node '" + raw.id +
+                     "': 'blend' must be \"add\" or \"over\"");
+                return nullptr;
+            }
+        }
+        uint32_t length = 16;
+        if (auto lenIt = obj.find("length"); lenIt != obj.end()) {
+            if (!lenIt->second.is_number() ||
+                lenIt->second.get_number() < 2 ||
+                lenIt->second.get_number() > 64 ||
+                lenIt->second.get_number() !=
+                    (double)(uint32_t)lenIt->second.get_number()) {
+                fail("node '" + raw.id +
+                     "': 'length' must be an integer in 2-64 (§18.5.6)");
+                return nullptr;
+            }
+            length = (uint32_t)lenIt->second.get_number();
+        }
+        portsOut.assign(std::begin(kTrailsInputs), std::end(kTrailsInputs));
+        return new TrailsNode(blend, length);
     }
 
     if (raw.type == "transform") {
