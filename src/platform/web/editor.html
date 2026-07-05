@@ -1488,9 +1488,38 @@ function buildGraph() {
       add(source, false);
     }
   }
+  // Parameters draw as source nodes (Unreal-style): "$name" bindings become
+  // visible wires, and a declared-but-unused parameter stays grabbable.
+  // Graph ids are '$name' — a namespace no §3 node id can enter.
+  for (const [name, decl] of Object.entries(sceneSource.parameters ?? {})) {
+    if (typeof decl !== 'object' || decl === null) {
+      continue;
+    }
+    const { type: valueType, ...rest } = decl;
+    const node = {
+      id: '$' + name, param: name, decl, type: 'parameter',
+      source: { id: '$' + name, type: 'parameter', valueType, ...rest },
+      implicit: false, inputs: [],
+      outputs: [[valueType ?? 'value', 'value']],
+      w: G.W, h: G.HEAD + G.ROW + G.PAD, x: 0, y: 0,
+    };
+    nodes.push(node);
+    byId.set(node.id, node);
+  }
   const edges = [];
   for (const node of nodes.slice()) {
     for (const input of node.inputs) {
+      if (input.param) {
+        const from = byId.get('$' + input.param);
+        if (from) {
+          input.paramEdge = true; // the wire replaces the pin's text label
+          input.category ??= 'value';
+          edges.push({ from: from.id, fromPort: from.outputs[0][0],
+                       to: node.id, toPort: input.name,
+                       category: 'value', previous: false });
+        }
+        continue;
+      }
       if (!input.conn) {
         continue;
       }
@@ -1722,9 +1751,17 @@ function startWireDrag(pin) {
   if (pin.side === 'out') {
     return { seek: 'in',
              from: { node: pin.node.id, port: pin.output[0],
-                     category: pin.output[1] } };
+                     category: pin.output[1],
+                     param: pin.node.param ?? null } };
   }
   const input = pin.input;
+  if (input.paramEdge) {
+    const producer = graph.byId.get('$' + input.param);
+    return { seek: 'in', raw: '$' + input.param,
+             detach: { node: pin.node, entry: input },
+             from: { node: producer.id, port: producer.outputs[0][0],
+                     category: 'value', param: input.param } };
+  }
   if (input.conn) {
     const raw = input.arrayOf
         ? pin.node.source.inputs[input.arrayOf.base][input.arrayOf.index]
@@ -1804,7 +1841,9 @@ function applyWireDrop(drag, pin) {
                      `${drag.to.entry.category} port`);
       return;
     }
-    writeInput(drag.to.node, drag.to.entry, refFor(pin.node.id, pin.output[0]));
+    writeInput(drag.to.node, drag.to.entry,
+               pin.node.param ? '$' + pin.node.param
+                              : refFor(pin.node.id, pin.output[0]));
     pushFromGraph();
     return;
   }
@@ -1831,7 +1870,8 @@ function applyWireDrop(drag, pin) {
                    `${target.input.category} port`);
     return;
   }
-  const raw = drag.raw ?? refFor(drag.from.node, drag.from.port);
+  const raw = drag.raw ?? (drag.from.param
+      ? '$' + drag.from.param : refFor(drag.from.node, drag.from.port));
   const sameArray = drag.detach?.entry.arrayOf &&
       drag.detach.node.id === target.node.id &&
       (target.input.arrayOf?.base ?? target.input.append) ===
@@ -1891,7 +1931,8 @@ function setGraphStatus(text) {
 // immediately); nodes with required texture ports (transform, output-like)
 // stay a draft until wired — that is the expected add-then-wire flow.
 const NODE_PALETTE = ['image', 'video', 'shader', 'transform', 'compositor',
-                      'sequence', 'wave', 'remap', 'combine', 'split'];
+                      'sequence', 'wave', 'remap', 'combine', 'split',
+                      'parameter'];
 const NODE_DEFAULT_INPUTS = {
   wave: { input: '@time.seconds' },
   sequence: { time: '@time.seconds' },
@@ -1911,8 +1952,41 @@ function freeNodeId(type) {
   }
 }
 
+// Parameters are declarations (§6), not nodes, but they are created and
+// placed from the same palette; the graph draws them as source nodes.
+function addParameter() {
+  const name = prompt('parameter name:');
+  if (!name) {
+    return;
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
+      sceneSource.parameters?.[name]) {
+    alert('invalid or duplicate parameter name');
+    return;
+  }
+  const type = (prompt("type: 'scalar', 'vec2', 'vec3' or 'vec4'",
+                       'scalar') ?? '').trim();
+  const arity = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[type];
+  if (!arity) {
+    return;
+  }
+  const decl = arity === 1 ? { type, default: 0, min: 0, max: 1 }
+                           : { type, default: Array(arity).fill(0) };
+  (sceneSource.parameters ??= {})[name] = decl;
+  const cx = graphCanvas.clientWidth / 2 / graphView.scale - graphView.x;
+  const cy = graphCanvas.clientHeight / 2 / graphView.scale - graphView.y;
+  ((sceneSource.editor ??= {}).positions ??= {})['$' + name] =
+      [Math.round(cx - G.W / 2), Math.round(cy - 20)];
+  selectedNodeId = '$' + name;
+  pushFromGraph();
+}
+
 function addNodeOfType(type) {
   if (!sceneSource?.nodes) {
+    return;
+  }
+  if (type === 'parameter') {
+    addParameter();
     return;
   }
   let props = {};
@@ -1962,9 +2036,29 @@ function deleteSelectedNode() {
   if (!node || node.implicit) {
     return;
   }
-  if (!confirm(`delete node '${node.id}'? wires to it are removed; a ` +
-               'required port left unbound keeps the scene a draft until ' +
-               'rewired')) {
+  if (!confirm(`delete ${node.param ? 'parameter' : 'node'} '${node.id}'? ` +
+               'wires to it are removed; a required port left unbound ' +
+               'keeps the scene a draft until rewired')) {
+    return;
+  }
+  if (node.param) {
+    delete sceneSource.parameters[node.param];
+    const ref = '$' + node.param;
+    for (const other of sceneSource.nodes) {
+      for (const [name, value] of Object.entries(other.inputs ?? {})) {
+        if (Array.isArray(value)) {
+          const kept = value.filter((el) => el !== ref);
+          if (kept.length !== value.length) {
+            other.inputs[name] = kept;
+          }
+        } else if (value === ref) {
+          unbindPort(other.id, other.inputs, name);
+        }
+      }
+    }
+    delete sceneSource.editor?.positions?.[node.id];
+    selectedNodeId = null;
+    pushFromGraph();
     return;
   }
   const id = node.id;
@@ -2106,7 +2200,7 @@ function drawGraph() {
     const selected = node.id === selectedNodeId;
     const draft = graphDraftIds.has(node.id);
     ctx.beginPath();
-    ctx.roundRect(node.x, node.y, node.w, node.h, 6);
+    ctx.roundRect(node.x, node.y, node.w, node.h, node.param ? 12 : 6);
     ctx.fillStyle = '#1e2128';
     ctx.fill();
     ctx.strokeStyle = draft ? '#e3c56d' : selected ? '#6aa1ff' : '#2c3038';
@@ -2118,7 +2212,8 @@ function drawGraph() {
     ctx.beginPath();
     ctx.rect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
     ctx.clip();
-    ctx.fillStyle = node.implicit ? '#8a8f98' : '#d6d9de';
+    ctx.fillStyle = node.param ? '#7fd490'
+                  : node.implicit ? '#8a8f98' : '#d6d9de';
     ctx.font = '11px system-ui';
     ctx.fillText(node.id, node.x + 8, node.y + 15);
     ctx.fillStyle = '#8a8f98';
@@ -2136,7 +2231,7 @@ function drawGraph() {
       const y = pinY(node, i);
       ctx.fillStyle = input.unbound || input.append ? '#8a8f98' : '#c6cad1';
       ctx.fillText(input.name, node.x + 8, y + 3);
-      const binding = input.param ? '$' + input.param
+      const binding = input.param ? (input.paramEdge ? null : '$' + input.param)
                     : input.literal !== undefined ? shortLit(input.literal)
                     : null;
       if (binding) {
@@ -2145,6 +2240,11 @@ function drawGraph() {
                      node.x + 10 + ctx.measureText(input.name).width, y + 3);
       }
     });
+    if (node.param) {
+      // The one row shows the declared default; the panel owns live values.
+      ctx.fillStyle = '#8a8f98';
+      ctx.fillText(shortLit(node.decl.default), node.x + 8, pinY(node, 0) + 3);
+    }
     ctx.textAlign = 'right';
     node.outputs.forEach(([name, category], i) => {
       ctx.fillStyle = GRAPH_COLORS[category];
@@ -2160,7 +2260,7 @@ function drawGraph() {
       const y = pinY(node, i);
       ctx.beginPath();
       ctx.arc(node.x, y, 3, 0, Math.PI * 2);
-      if (input.conn) {
+      if (input.conn || input.paramEdge) {
         ctx.fillStyle = GRAPH_COLORS[input.category ?? 'value'];
         ctx.fill();
       } else {

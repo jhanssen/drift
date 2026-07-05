@@ -58,9 +58,11 @@ Keys defined so far (tools must preserve keys they do not understand):
 - `positions` (object): graph-view placement — node id → `[x, y]`, the node's
   top-left corner in abstract canvas units (pixels at zoom 1, +y down). The
   reserved implicit ids `time` and `mouse` (§3) may appear as keys; they can
-  never clash with authored nodes. Entries whose id no longer exists in
-  `nodes` are ignored and may be dropped on save. Nodes without an entry are
-  auto-laid-out by the tool.
+  never clash with authored nodes. A `$`-prefixed key holds the placement of
+  a *parameter* for graph tools that draw parameters as source nodes — `$`
+  cannot begin a node id (§3), so the namespaces cannot collide. Entries
+  whose id (or parameter) no longer exists are ignored and may be dropped on
+  save. Nodes without an entry are auto-laid-out by the tool.
 
 ## 3. Identifiers
 
