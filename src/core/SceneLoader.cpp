@@ -2606,6 +2606,8 @@ bool Loader::bindInputs(const RawNode& raw, Node* node,
             }
             break;
         }
+        case RawInput::Kind::Array:
+            break; // unreachable: resolveInputType rejects arrays here
         }
     }
 
