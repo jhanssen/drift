@@ -390,6 +390,7 @@ const PortDef kSpritesInputs[] = {
     { "parallax", ValueType::Vec2, false, { 0, 0 } },
     { "flutter", ValueType::Vec2, false, { 0, 0 } },
     { "flutterRate", ValueType::Scalar, false, { 1 } },
+    { "stretch", ValueType::Vec2, false, { 1, 1 } },
 };
 // Order must match TrailsNode::Port.
 const PortDef kTrailsInputs[] = {

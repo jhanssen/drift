@@ -443,7 +443,7 @@ public:
     enum class Blend { Add, Over };
     enum Port : size_t {
         PortParticles, PortTexture, PortFrameRate, PortParallax,
-        PortFlutter, PortFlutterRate,
+        PortFlutter, PortFlutterRate, PortStretch,
     };
     // sheetCols/Rows 0 = whole texture (no sheet).
     SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows);

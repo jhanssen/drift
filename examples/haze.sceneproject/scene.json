@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "name": "Haze",
+  "description": "§18.5.5 stretch: non-uniform sprite scale — soft wisps of fog smeared wide, drifting slowly across the frame.",
+  "parameters": {
+    "drift": { "type": "scalar", "default": 0.5, "min": 0, "max": 1,
+               "label": "Drift" }
+  },
+  "nodes": [
+    { "id": "push", "type": "remap",
+      "inputs": { "value": "$drift", "inMin": 0, "inMax": 1,
+                  "outMin": 0.01, "outMax": 0.05 } },
+    { "id": "breeze", "type": "combine",
+      "inputs": { "x": "@push", "y": 0 } },
+
+    { "id": "wisps", "type": "particles", "capacity": 60, "emitter": "box",
+      "inputs": { "time": "@time.delta", "rate": 4, "prewarm": 10,
+                  "origin": [-0.1, 0.6], "extent": [0.02, 0.35],
+                  "speed": [0, 0], "lifetime": [12, 20],
+                  "size": [0.03, 0.08], "depth": [0, 1],
+                  "gravity": "@breeze", "turbulence": 0.01,
+                  "turbulenceScale": 2, "fadeIn": 2, "sizeEnd": 1.6,
+                  "tintVary": [0.55, 0.65, 0.8, 1],
+                  "colorStart": [0.5, 0.55, 0.62, 0.35],
+                  "colorEnd": [0.4, 0.45, 0.55, 0] } },
+
+    { "id": "fog", "type": "sprites",
+      "inputs": { "particles": "@wisps", "stretch": [7, 1],
+                  "flutter": [0, 0.01], "flutterRate": 0.15 } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@fog" } }
+  ]
+}

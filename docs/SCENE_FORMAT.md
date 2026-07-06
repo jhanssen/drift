@@ -1137,7 +1137,8 @@ pointer parallax, sorted `over` sprites),
 `examples/fireworks.sceneproject` (multi-emitter windows, sub-emitter
 bursts, spritesheet twinkle, texture collision), and
 `examples/embers.sceneproject` (per-particle `twinkle`, feathered
-trail streaks, prewarm).
+trail streaks, prewarm), and `examples/haze.sceneproject` (non-uniform
+sprite `stretch`, slow flutter).
 
 #### 18.5.1 Contract errata
 
@@ -1300,12 +1301,21 @@ New surface on `sprites`:
 | input    | `parallax`  | `vec2`   | `[0, 0]` | screen offset per unit z, output space |
 | input    | `flutter`   | `vec2`   | `[0, 0]` | per-axis sine-sway amplitude, uv units (adopted 2026-07-05) |
 | input    | `flutterRate` | `scalar` | `1`    | flutter cycles per second        |
+| input    | `stretch`   | `vec2`   | `[1, 1]` | non-uniform sprite scale, output space (adopted 2026-07-05) |
 
 - **Flutter.** A deterministic per-axis sine offset about the integrated
   path, phase-decorrelated per particle and per axis from `seed` — the
   drifting-snowflake / floating-ember sway. Draw-time only: it does not
   feed back into velocity or collisions, and `trails` does not apply it.
 
+- **Stretch.** A per-axis scale on each sprite's quad — elongated soft
+  particles: haze and fog wisps, smeared glows. Applied *after* the
+  particle's rotation, in output space (x in the same aspect-corrected
+  units as `size`), so `[10, 1]` reads as ten times wider than tall on
+  screen no matter how the particle's random rotation and `spin` land;
+  the texture, sheet frame, and built-in disc stretch with the quad
+  (the disc becomes an axis-aligned ellipse). Draw-time only — the
+  simulation, collisions, and `trails` are untouched.
 - **Spritesheet.** Frames are read row-major. With `frameRate = 0` a
   particle plays the whole sheet exactly once over its lifetime; with
   `frameRate > 0` it advances at that rate and loops, starting on a

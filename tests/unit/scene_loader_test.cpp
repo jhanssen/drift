@@ -1351,7 +1351,7 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
                       "twinkleRate": [0.8, 3.2] } },
         { "id": "s", "type": "sprites",
           "inputs": { "particles": "@p", "frameRate": 8,
-                      "parallax": [0.1, 0] } })");
+                      "parallax": [0.1, 0], "stretch": [10, 1] } })");
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());

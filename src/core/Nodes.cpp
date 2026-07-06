@@ -2866,8 +2866,9 @@ struct Particle {
     size: f32, rotation: f32, seed: f32, emitter: f32,
 }
 
-// misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,-,-);
-// flut = (flutter.xy amplitude, flutterRate, -) — §18.5.5 flutter.
+// misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,
+// stretch.xy — §18.5.5 stretch); flut = (flutter.xy amplitude, flutterRate,
+// -) — §18.5.5 flutter.
 struct Params { misc: vec4f, par: vec4f, flut: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -2905,8 +2906,11 @@ fn drift_sprite_vs(@builtin(vertex_index) v: u32,
     let c = cos(radians(p.rotation));
     let s = sin(radians(p.rotation));
     // size is a fraction of output height (§18.3); x corrects for aspect.
+    // §18.5.5 stretch: a per-axis scale on the rotated quad, in output
+    // space — axis-aligned on screen whatever the particle's rotation, so
+    // elongated soft particles read as stretched, not randomly oriented.
     let r = vec2f(c * corner.x - s * corner.y, s * corner.x + c * corner.y) *
-            p.size;
+            p.size * params.par.zw;
     // §18.5.5 parallax: a per-particle offset linear in z.
     // §18.5.5 flutter: deterministic per-axis sine sway about the
     // integrated path — a draw-time offset (no feedback into velocity or
@@ -3116,8 +3120,8 @@ void SpritesNode::evaluate(FrameContext& ctx)
         (float)mSheetRows,
         (float)inputValue(PortParallax).v[0],
         (float)inputValue(PortParallax).v[1],
-        0.0f,
-        0.0f,
+        (float)inputValue(PortStretch).v[0],
+        (float)inputValue(PortStretch).v[1],
         (float)inputValue(PortFlutter).v[0],
         (float)inputValue(PortFlutter).v[1],
         (float)inputValue(PortFlutterRate).v[0],
