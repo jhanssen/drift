@@ -1141,8 +1141,9 @@ trail streaks, prewarm), `examples/haze.sceneproject` (non-uniform
 sprite `stretch`, slow flutter), `examples/plume.sceneproject`
 (sheet `frameBlend` cross-fade), and `examples/cinders.sceneproject`
 (velocity `align`, `turbulenceMask`, tint box, `fadeOut`/`sizeWindow`,
-squashed annulus emission), and `examples/wisps.sceneproject`
-(`life`-mode sub-emitters).
+squashed annulus emission), `examples/wisps.sceneproject`
+(`life`-mode sub-emitters), and `examples/fireflies.sceneproject`
+(sprite `hardness` falloff shaping).
 
 #### 18.5.1 Contract errata
 
@@ -1366,6 +1367,7 @@ New surface on `sprites`:
 | input    | `stretch`   | `vec2`   | `[1, 1]` | non-uniform sprite scale, output space (adopted 2026-07-05) |
 | input    | `frameBlend` | `scalar` | `0`     | cross-fade between adjacent sheet frames, 0–1 (adopted 2026-07-05) |
 | input    | `align`     | `scalar` | `0`      | > 0: orient each sprite to its velocity; `stretch` then elongates along the motion (adopted 2026-07-05) |
+| input    | `hardness`  | `scalar` | `1`      | exponent on sprite coverage; > 1 tightens a soft falloff toward a crisp core, < 1 softens (adopted 2026-07-05) |
 
 - **Flutter.** A deterministic per-axis sine offset about the integrated
   path, phase-decorrelated per particle and per axis from `seed` — the
@@ -1391,6 +1393,16 @@ New surface on `sprites`:
   elongates along the motion, so a stretched soft disc reads as a
   motion-oriented ellipse — the middle-bulging streak. A momentarily
   stationary particle keeps its unaligned orientation.
+- **Hardness.** An exponent on the sprite's coverage, for narrowing (or
+  widening) a soft texture's alpha skirt without swapping the asset:
+  `3` turns a broad fuzzy halo into a tight bright core with a thin
+  skirt. It reshapes in premultiplied space — the sample scales by
+  `a^(hardness-1)`, so alpha becomes `a^hardness` and RGB tracks the
+  coverage — which is what makes it effective under `add`, where only
+  RGB reaches the target. Applies to the built-in soft disc and to
+  textures alike (after `frameBlend`'s cross-fade, before the particle
+  color). Hardening removes energy: a tightened sprite reads dimmer, so
+  compensate with the scene's color/alpha, not a bigger particle.
 - **Frame cross-fade.** By default sheet playback snaps to the nearest
   frame, which visibly steps on low-frame-count sheets. With
   `frameBlend > 0` the fractional frame position linearly blends the

@@ -453,7 +453,7 @@ public:
     enum Port : size_t {
         PortParticles, PortTexture, PortFrameRate, PortParallax,
         PortFlutter, PortFlutterRate, PortStretch, PortFrameBlend,
-        PortAlign,
+        PortAlign, PortHardness,
     };
     // sheetCols/Rows 0 = whole texture (no sheet).
     SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows);

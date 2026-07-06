@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "name": "Fireflies",
+  "description": "§18.5.5 hardness: fireflies carry an over-soft halo texture tightened into a bright core at draw time, stretched along their wandering flight.",
+  "nodes": [
+    { "id": "halo", "type": "shader", "shader": "shaders/halo.wgsl",
+      "size": [128, 128] },
+
+    { "id": "flies", "type": "particles", "capacity": 30, "emitter": "box",
+      "inputs": { "time": "@time.delta", "rate": 2.5, "prewarm": 10,
+                  "origin": [0.5, 0.62], "extent": [0.48, 0.3],
+                  "speed": [0.01, 0.03], "lifetime": [6, 12],
+                  "size": [0.015, 0.028], "fadeIn": 1, "fadeOut": 1.5,
+                  "turbulence": 0.06, "turbulenceScale": 2.5,
+                  "twinkle": [0.25, 1], "twinkleRate": [0.5, 1.6],
+                  "tintVary": [1, 0.95, 0.55, 1],
+                  "tintVaryMax": [0.75, 1, 0.45, 1],
+                  "colorStart": [1, 1, 0.7, 0.9],
+                  "colorEnd": [0.9, 1, 0.5, 0.7] } },
+
+    { "id": "glow", "type": "sprites",
+      "inputs": { "particles": "@flies", "texture": "@halo",
+                  "align": 1, "stretch": [2.2, 1], "hardness": 3 } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@glow" } }
+  ]
+}

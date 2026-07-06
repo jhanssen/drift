@@ -399,6 +399,7 @@ const PortDef kSpritesInputs[] = {
     { "stretch", ValueType::Vec2, false, { 1, 1 } },
     { "frameBlend", ValueType::Scalar, false, { 0 } },
     { "align", ValueType::Scalar, false, { 0 } },
+    { "hardness", ValueType::Scalar, false, { 1 } },
 };
 // Order must match TrailsNode::Port.
 const PortDef kTrailsInputs[] = {

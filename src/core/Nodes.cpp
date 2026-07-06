@@ -2956,7 +2956,8 @@ struct Particle {
 // misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,
 // stretch.xy — §18.5.5 stretch); flut = (flutter.xy amplitude, flutterRate
 // — §18.5.5 flutter, frameBlend — §18.5.5 frame cross-fade); extra =
-// (align — §18.5.5 velocity alignment, -, -, -).
+// (align — §18.5.5 velocity alignment, hardness — §18.5.5 falloff
+// exponent, -, -).
 struct Params { misc: vec4f, par: vec4f, flut: vec4f, extra: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -3082,15 +3083,27 @@ fn drift_sprite_fs(@location(0) uv: vec2f,
 }
 )";
 
+// §18.5.5 hardness (extra.y): an exponent on the sprite's coverage — > 1
+// tightens a soft skirt toward a crisp core, < 1 softens. Applied in
+// premultiplied space (the whole sample scales by a^(h-1), so alpha
+// becomes a^h and RGB tracks coverage), which is what makes it visible
+// under additive blend too. 1 skips the reshape entirely.
 const char* kSpriteDiscFragment = R"(
     let d2 = dot(uv * 2.0 - 1.0, uv * 2.0 - 1.0);
     let a = max(0.0, 1.0 - d2);
+    if (params.extra.y != 1.0) {
+        return color * pow(a * a, max(params.extra.y, 0.001));
+    }
     return color * a * a;
 )";
 
 const char* kSpriteTexturedFragment = R"(
-    return mix(textureSample(sprite, sprite_sampler, uv),
-               textureSample(sprite, sprite_sampler, uv1), blend) * color;
+    var s = mix(textureSample(sprite, sprite_sampler, uv),
+                textureSample(sprite, sprite_sampler, uv1), blend);
+    if (params.extra.y != 1.0 && s.a > 0.0) {
+        s = s * pow(s.a, max(params.extra.y, 0.001) - 1.0);
+    }
+    return s * color;
 )";
 
 const char* kSpriteTextureBindings = R"(
@@ -3254,7 +3267,7 @@ void SpritesNode::evaluate(FrameContext& ctx)
         (float)inputValue(PortFlutterRate).v[0],
         (float)inputValue(PortFrameBlend).v[0],
         (float)inputValue(PortAlign).v[0],
-        0.0f,
+        (float)inputValue(PortHardness).v[0],
         0.0f,
         0.0f,
     };
