@@ -116,11 +116,22 @@ EM_JS(int, wcPoll, (int id, double seconds, uint32_t* dims), {
   }
 
   // Feed ahead until decode covers the requested time (plus margin) or the
-  // in-flight window fills; wrap or flush at end of stream.
+  // in-flight window fills; wrap at end of stream, flush only at a true
+  // end. A loop wrap must NOT flush(): draining and refilling the decoder
+  // forfeits the decode lead at every seam, and on streams the browser
+  // decodes barely faster than realtime the lead never rebuilds — the
+  // first sample is a keyframe and loopBase keeps timestamps growing, so
+  // the decoder streams straight across the wrap.
   const covered = () => state.queue.length &&
       state.queue[state.queue.length - 1].timestamp / 1e6 >= seconds + 0.2;
-  while (state.next < state.count && !covered() &&
-         state.decoder.decodeQueueSize < 8) {
+  while (!covered() && state.decoder.decodeQueueSize < 8) {
+    if (state.next >= state.count) {
+      if (!state.loop || state.count == 0) {
+        break;
+      }
+      state.loopBase += state.duration;
+      state.next = 0;
+    }
     const i = state.next++;
     state.fedMax = state.loopBase + HEAPF64[(state.pts >> 3) + i];
     try {
@@ -131,23 +142,13 @@ EM_JS(int, wcPoll, (int id, double seconds, uint32_t* dims), {
       return -1;
     }
   }
-  if (state.next >= state.count && !state.flushing) {
-    if (state.loop) {
-      // Flush the tail of this lap, then continue seamlessly with the next
-      // lap's timestamps; scene time keeps growing, so ours must too.
-      state.flushing = true;
-      state.decoder.flush().then(() => {
-        state.flushing = false;
-        state.loopBase += state.duration;
-        state.next = 0;
-      }).catch(() => {}); // reset() aborted us; the seek path re-arms
-    } else if (!state.eosFlushed) {
-      state.flushing = true;
-      state.decoder.flush().then(() => {
-        state.flushing = false;
-        state.eosFlushed = true;
-      }).catch(() => {});
-    }
+  if (!state.loop && state.next >= state.count && !state.flushing &&
+      !state.eosFlushed) {
+    state.flushing = true;
+    state.decoder.flush().then(() => {
+      state.flushing = false;
+      state.eosFlushed = true;
+    }).catch(() => {}); // reset() aborted us; the seek path re-arms
   }
 
   // Pick the newest decoded frame at or before the requested time.
