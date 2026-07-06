@@ -372,7 +372,7 @@ public:
         PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
         PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
         PortRing, PortDepth, PortCollide, PortBounce, PortTintVary,
-        PortVelocityMin, PortVelocityMax, PortSpawn,
+        PortVelocityMin, PortVelocityMax, PortPrewarm, PortSpawn,
         PortInherit, PortSpawnPrev, PortTime, PortCount,
     };
     // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
@@ -411,6 +411,8 @@ private:
     const std::vector<uint32_t> mMasks;
     const uint32_t mSpawnCount; // §18.5.4: children per death; 0 = ring mode
     bool mVelocityBox = false;  // §18.5.2 spawn-velocity box vs cone
+    bool mPrewarmed = false;    // §18.5.2 prewarm ran (first evaluate)
+    double mDtOverride = -1.0;  // ≥ 0 during prewarm sub-steps
     WgslInterface mIface; // built-in kernel reflection: the layout oracle
 
     wgpu::ComputePipeline mPipeline;

@@ -1167,6 +1167,23 @@ New inputs on `particles` (all optional):
 | input | `tintVary` | `vec4`    | `[1,1,1,1]`| per-particle constant tint: each particle holds `mix(white, tintVary, rand)` for life, multiplied onto the `colorStart`→`colorEnd` ramp (adopted 2026-07-05) |
 | input | `velocityMin` | `vec2` | `[0, 0]`   | with `velocityMax`: binding either replaces the `direction`/`spread`/`speed` cone with an axis-independent uniform box (adopted 2026-07-05; node-level, not per-emitter) |
 | input | `velocityMax` | `vec2` | `[0, 0]`   | see `velocityMin`                |
+| input | `prewarm`  | `scalar`  | `0`        | seconds of simulation advanced at load, before the first frame; sampled once, clamped to `[0, 60]` (adopted 2026-07-05) |
+
+- **Prewarm.** A looping ambience (snow, dust, embers) should start
+  *full*, not visibly fill over its first `lifetime` seconds. With
+  `prewarm > 0` the node fast-forwards its simulation by that many
+  seconds at load, before the first presented frame: N uniform sub-steps
+  of at most 1/30 s each, all inputs frozen at their load values (the
+  upstream graph is not re-evaluated per sub-step). The sim clock, the
+  emission ordinals (per-particle `seed`), and the fractional emission
+  accumulators advance exactly as in live ticks, so the live simulation
+  continues the same deterministic sequence — `delay`/`duration` measure
+  against the warmed clock (a `duration` shorter than `prewarm` has
+  already closed at load), identical documents warm identically on every
+  machine, and a prewarmed scene is golden-stable. Sampled once at load;
+  later changes take effect on the next scene load. Death-driven
+  (`spawn`-bound) nodes warm their clock but not their pool: the spawn
+  feed's death history cannot advance within load.
 
 - **Emission windows.** Sim time is the accumulated sum of `time` deltas
   since load (not `@time.seconds` — deterministic under the sim tick).

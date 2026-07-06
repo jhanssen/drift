@@ -370,6 +370,7 @@ const PortDef kParticlesInputs[] = {
     { "tintVary", ValueType::Vec4, false, { 1, 1, 1, 1 } },
     { "velocityMin", ValueType::Vec2, false, { 0, 0 } },
     { "velocityMax", ValueType::Vec2, false, { 0, 0 } },
+    { "prewarm", ValueType::Scalar, false, { 0 } },
     { "spawn", ValueType::Buffer, false, {}, false, ParticlesNode::kStride },
     { "inherit", ValueType::Scalar, false, { 0 } },
     // Hidden §18.5.4 feedback edge: injected by the loader when 'spawn' is

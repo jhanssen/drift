@@ -2515,9 +2515,34 @@ void ParticlesNode::evaluate(FrameContext& ctx)
         return; // the spawn source (or its first history copy) isn't there yet
     }
 
+    // §18.5.2 prewarm: fast-forward the pool before the first live tick
+    // by running N normal sub-steps inside this evaluate. Inputs are
+    // naturally frozen at their load values (nothing upstream re-runs
+    // between sub-steps); only dt differs. The sim clock, the emission
+    // ordinals, and the fractional accumulators all advance as in live
+    // ticks, so this is a genuine fast-forward. Death-driven
+    // (spawn-bound) nodes warm their clock but see no deaths: the spawn
+    // feed's history cannot move within load.
+    if (!mPrewarmed) {
+        mPrewarmed = true;
+        const double warm =
+            std::min(std::max(inputValue(PortPrewarm).v[0], 0.0), 60.0);
+        if (warm > 0.0) {
+            const int steps =
+                std::max(1, (int)std::ceil(warm * 30.0)); // dt <= 1/30
+            mDtOverride = warm / steps;
+            for (int i = 0; i < steps; ++i) {
+                evaluate(ctx); // a normal tick; cannot recurse further
+            }
+            mDtOverride = -1.0;
+        }
+    }
+
     // Deterministic emission accounting: rate accumulates fractionally,
     // bursts land whole, and the ring cursor maps the window onto slots.
-    const double dt = std::max(0.0, inputValue(PortTime).v[0]);
+    const double dt = mDtOverride >= 0.0
+        ? mDtOverride
+        : std::max(0.0, inputValue(PortTime).v[0]);
     const size_t emitterCount = mEmitters.size();
     // §18.5.2/§18.5.3: per-emitter windows on the accumulated sim clock
     // (not @time.seconds), and rate/burst shares proportional to weight.
