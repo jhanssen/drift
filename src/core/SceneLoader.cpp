@@ -370,6 +370,8 @@ const PortDef kParticlesInputs[] = {
     { "tintVary", ValueType::Vec4, false, { 1, 1, 1, 1 } },
     { "velocityMin", ValueType::Vec2, false, { 0, 0 } },
     { "velocityMax", ValueType::Vec2, false, { 0, 0 } },
+    { "twinkle", ValueType::Vec2, false, { 1, 1 } },
+    { "twinkleRate", ValueType::Vec2, false, { 1, 2 } },
     { "prewarm", ValueType::Scalar, false, { 0 } },
     { "spawn", ValueType::Buffer, false, {}, false, ParticlesNode::kStride },
     { "inherit", ValueType::Scalar, false, { 0 } },
@@ -397,6 +399,7 @@ const PortDef kTrailsInputs[] = {
     { "taper", ValueType::Scalar, false, { 0 } },
     { "fade", ValueType::Scalar, false, { 0 } },
     { "parallax", ValueType::Vec2, false, { 0, 0 } },
+    { "feather", ValueType::Scalar, false, { 0 } },
 };
 // §18.5.3 emitter-entry fields — order must match ParticlesNode::EmitterField
 // exactly. Entries inject real input ports named "emitters[i].<field>".

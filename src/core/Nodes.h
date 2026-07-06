@@ -372,8 +372,9 @@ public:
         PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
         PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
         PortRing, PortDepth, PortCollide, PortBounce, PortTintVary,
-        PortVelocityMin, PortVelocityMax, PortPrewarm, PortSpawn,
-        PortInherit, PortSpawnPrev, PortTime, PortCount,
+        PortVelocityMin, PortVelocityMax, PortTwinkle, PortTwinkleRate,
+        PortPrewarm, PortSpawn, PortInherit, PortSpawnPrev, PortTime,
+        PortCount,
     };
     // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
     // EfCount extra input ports per entry after PortCount, in this order —
@@ -478,12 +479,13 @@ private:
 // ring sample per particle per sim tick (a fresh emission resets its whole
 // ring, so recycled slots never streak); the render pass extrudes a
 // tessellated strip per live particle, tapering width and alpha toward the
-// tail.
+// tail and optionally feathering alpha across the width.
 class TrailsNode : public Node {
 public:
     enum class Blend { Add, Over };
     enum Port : size_t {
         PortParticles, PortWidth, PortTaper, PortFade, PortParallax,
+        PortFeather,
     };
     static constexpr uint32_t kSubdiv = 4; // tessellation per history segment
 

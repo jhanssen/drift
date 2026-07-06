@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "name": "Embers",
+  "description": "§18.5 twinkle + trail feather: wind-carried embers flicker as they rise on soft-edged streaks.",
+  "parameters": {
+    "wind": { "type": "scalar", "default": 0.6, "min": 0, "max": 1.5,
+              "label": "Wind" }
+  },
+  "nodes": [
+    { "id": "gust", "type": "remap",
+      "inputs": { "value": "$wind", "inMin": 0, "inMax": 1.5,
+                  "outMin": 0, "outMax": 0.09 } },
+    { "id": "lift", "type": "combine",
+      "inputs": { "x": "@gust", "y": -0.02 } },
+
+    { "id": "embers", "type": "particles", "capacity": 240, "emitter": "box",
+      "inputs": { "time": "@time.delta", "rate": 42, "prewarm": 4,
+                  "origin": [0.45, 1.04], "extent": [0.5, 0.02],
+                  "direction": [0.3, -1], "spread": 24,
+                  "speed": [0.08, 0.22], "lifetime": [4, 7],
+                  "size": [0.005, 0.014], "depth": [0, 1],
+                  "gravity": "@lift", "drag": 0.15,
+                  "turbulence": 0.05, "turbulenceScale": 3,
+                  "fadeIn": 0.3,
+                  "twinkle": [0.2, 1], "twinkleRate": [0.8, 3.2],
+                  "tintVary": [1, 0.5, 0.2, 1],
+                  "colorStart": [1, 0.8, 0.45, 0.9],
+                  "colorEnd": [0.9, 0.25, 0.05, 0] } },
+
+    { "id": "streaks", "type": "trails", "length": 10,
+      "inputs": { "particles": "@embers", "width": 0.8, "taper": 0.25,
+                  "fade": 0, "feather": 1 } },
+
+    { "id": "sparks", "type": "sprites",
+      "inputs": { "particles": "@embers" } },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@streaks", "@sparks"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

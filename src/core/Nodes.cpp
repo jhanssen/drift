@@ -2122,6 +2122,7 @@ struct Params {
     spawnCount: f32, inherit: f32,
     tintVary: vec4f,
     velocityMin: vec2f, velocityMax: vec2f,
+    twinkle: vec2f, twinkleRate: vec2f,
     velocityBox: f32,
 }
 
@@ -2163,6 +2164,20 @@ fn rnd(n: u32, k: u32) -> f32 {
 fn tintOf(n: u32) -> vec4f {
     let t = mix(vec4f(1.0), params.tintVary, rnd(n, 12u));
     return vec4f(t.rgb * t.a, t.a);
+}
+
+// §18.5.2 twinkle: a per-particle brightness oscillation. The multiplier
+// swings across [twinkle.x, twinkle.y] at a rate drawn once per particle
+// from [twinkleRate.x, twinkleRate.y] cycles/second, phase decorrelated
+// from the seed; applied to the premultiplied color, so 'add' and 'over'
+// consumers both read it as brightness. [1, 1] (the default) is identity.
+fn twinkleOf(n: u32, age: f32) -> f32 {
+    if (params.twinkle.x == 1.0 && params.twinkle.y == 1.0) {
+        return 1.0;
+    }
+    let rate = mix(params.twinkleRate.x, params.twinkleRate.y, rnd(n, 17u));
+    let ph = (age * rate + rnd(n, 18u)) * 6.2831853;
+    return mix(params.twinkle.x, params.twinkle.y, 0.5 + 0.5 * sin(ph));
 }
 
 // Life curves: premultiplied tint (§18.3 contract) with the fade-in ramp.
@@ -2242,7 +2257,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     p.size = emitSize * mix(1.0, params.sizeEnd, t);
     p.rotation += mix(E.spin.x, E.spin.y, rnd(n, 7u)) * params.dt;
     p.color = shade(E.colorStart, E.colorEnd, p.age, p.lifetime) *
-              tintOf(u32(p.seed));
+              tintOf(u32(p.seed)) * twinkleOf(u32(p.seed), p.age);
     state[i] = p;
 }
 )";
@@ -2302,7 +2317,7 @@ const char* kParticleEmitRing = R"(
         p.seed = f32(n % 16777216u); // f32-exact emission ordinal
         p.emitter = f32(em);
         p.color = shade(E.colorStart, E.colorEnd, 0.0, p.lifetime) *
-            tintOf(u32(p.seed));
+            tintOf(u32(p.seed)) * twinkleOf(u32(p.seed), 0.0);
         state[i] = p;
         return;
     }
@@ -2358,7 +2373,7 @@ const char* kParticleEmitSpawn = R"(
             p.seed = f32(n);
             p.emitter = 0.0;
             p.color = shade(E.colorStart, E.colorEnd, 0.0, p.lifetime) *
-            tintOf(u32(p.seed));
+            tintOf(u32(p.seed)) * twinkleOf(u32(p.seed), 0.0);
             state[i] = p;
             return;
         }
@@ -2655,6 +2670,8 @@ void ParticlesNode::evaluate(FrameContext& ctx)
                 { "ring", PortRing }, { "tintVary", PortTintVary },
                 { "velocityMin", PortVelocityMin },
                 { "velocityMax", PortVelocityMax },
+                { "twinkle", PortTwinkle },
+                { "twinkleRate", PortTwinkleRate },
             };
             v = inputValue(kByName.at(field.name));
         }
@@ -3229,7 +3246,8 @@ struct Particle {
 }
 
 // misc = (aspect, tick, length, -); par = parallax; style = (width, taper,
-// fade, -). Shared with the render stage; the record pass reads misc only.
+// fade, feather). Shared with the render stage; the record pass reads misc
+// only.
 struct Params { misc: vec4f, par: vec4f, style: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -3267,6 +3285,7 @@ struct Particle {
     size: f32, rotation: f32, seed: f32, emitter: f32,
 }
 
+// style = (width, taper, fade, feather) — matches the record pass comment.
 struct Params { misc: vec4f, par: vec4f, style: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -3276,6 +3295,7 @@ struct Params { misc: vec4f, par: vec4f, style: vec4f }
 struct VsOut {
     @builtin(position) pos: vec4f,
     @location(0) color: vec4f,
+    @location(1) side: f32, // signed cross-width coordinate, -1..1
 }
 
 // Sample k ticks ago (0 = the sample recorded this tick), aspect-corrected
@@ -3328,12 +3348,21 @@ fn drift_trail_vs(@builtin(vertex_index) v: u32,
     let fin = vec2f(pc.x / params.misc.x, pc.y) + params.par.xy * p.pos.z;
     out.pos = vec4f(fin.x * 2.0 - 1.0, 1.0 - fin.y * 2.0, 0.0, 1.0);
     out.color = p.color * mix(1.0, params.style.z, u);
+    out.side = side;
     return out;
 }
 
+// §18.5.6 feather: style.w is the fraction of the half-width that fades
+// to transparent at each edge; 0 (the default) keeps the solid ribbon.
+// Premultiplied color, so the whole vector scales.
 @fragment
-fn drift_trail_fs(@location(0) color: vec4f) -> @location(0) vec4f {
-    return color;
+fn drift_trail_fs(@location(0) color: vec4f,
+                  @location(1) side: f32) -> @location(0) vec4f {
+    let e = clamp(params.style.w, 0.0, 1.0);
+    if (e == 0.0) {
+        return color;
+    }
+    return color * smoothstep(0.0, e, 1.0 - abs(side));
 }
 )";
 
@@ -3452,7 +3481,7 @@ void TrailsNode::evaluate(FrameContext& ctx)
         (float)inputValue(PortWidth).v[0],
         (float)inputValue(PortTaper).v[0],
         (float)inputValue(PortFade).v[0],
-        0.0f,
+        (float)inputValue(PortFeather).v[0],
     };
     ctx.device.GetQueue().WriteBuffer(mUniforms, 0, uniforms,
                                       sizeof(uniforms));

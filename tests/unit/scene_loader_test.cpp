@@ -1317,7 +1317,8 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
         { "id": "p", "type": "particles",
           "inputs": { "time": "@time.delta" } },
         { "id": "t", "type": "trails", "length": 24, "blend": "over",
-          "inputs": { "particles": "@p", "width": 0.5, "fade": 0.2 } })");
+          "inputs": { "particles": "@p", "width": 0.5, "fade": 0.2,
+                      "feather": 0.6 } })");
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());
@@ -1346,7 +1347,8 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
         { "id": "p", "type": "particles",
           "inputs": { "time": "@time.delta", "delay": 1, "duration": 4,
                       "ring": 0.2, "depth": [0, 1], "collide": "@mask",
-                      "bounce": 0.8 } },
+                      "bounce": 0.8, "twinkle": [0.2, 1],
+                      "twinkleRate": [0.8, 3.2] } },
         { "id": "s", "type": "sprites",
           "inputs": { "particles": "@p", "frameRate": 8,
                       "parallax": [0.1, 0] } })");

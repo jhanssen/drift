@@ -1133,9 +1133,11 @@ Status: **adopted and implemented 2026-07-04**. Everything here extends
 that reproduces the old behavior, and the `Particle` contract keeps its
 64-byte layout. Runnable, golden-tested examples:
 `examples/comets.sceneproject` (trails over a ring vortex, depth +
-pointer parallax, sorted `over` sprites) and
+pointer parallax, sorted `over` sprites),
 `examples/fireworks.sceneproject` (multi-emitter windows, sub-emitter
-bursts, spritesheet twinkle, texture collision).
+bursts, spritesheet twinkle, texture collision), and
+`examples/embers.sceneproject` (per-particle `twinkle`, feathered
+trail streaks, prewarm).
 
 #### 18.5.1 Contract errata
 
@@ -1167,6 +1169,8 @@ New inputs on `particles` (all optional):
 | input | `tintVary` | `vec4`    | `[1,1,1,1]`| per-particle constant tint: each particle holds `mix(white, tintVary, rand)` for life, multiplied onto the `colorStart`→`colorEnd` ramp (adopted 2026-07-05) |
 | input | `velocityMin` | `vec2` | `[0, 0]`   | with `velocityMax`: binding either replaces the `direction`/`spread`/`speed` cone with an axis-independent uniform box (adopted 2026-07-05; node-level, not per-emitter) |
 | input | `velocityMax` | `vec2` | `[0, 0]`   | see `velocityMin`                |
+| input | `twinkle`  | `vec2`    | `[1, 1]`   | per-particle brightness oscillation range `[lo, hi]`, multiplied onto the color; `[1, 1]` = off (adopted 2026-07-05) |
+| input | `twinkleRate` | `vec2` | `[1, 2]`   | twinkle cycles per second, sampled per particle |
 | input | `prewarm`  | `scalar`  | `0`        | seconds of simulation advanced at load, before the first frame; sampled once, clamped to `[0, 60]` (adopted 2026-07-05) |
 
 - **Prewarm.** A looping ambience (snow, dust, embers) should start
@@ -1185,6 +1189,15 @@ New inputs on `particles` (all optional):
   (`spawn`-bound) nodes warm their clock but not their pool: the spawn
   feed's death history cannot advance within load.
 
+- **Twinkle.** A per-particle brightness oscillation — the ember /
+  starfield flicker. Each particle's multiplier swings sinusoidally
+  across `[twinkle.x, twinkle.y]` at a rate drawn once from
+  `twinkleRate` (cycles per second) and a phase decorrelated from
+  `seed`, so pools never strobe in sync. It multiplies the premultiplied
+  color after `tintVary`, so both `sprites` and `trails` read it as
+  brightness under `add` and as opacity under `over`. Deterministic like
+  every other life curve: identical documents stepped identically
+  twinkle identically.
 - **Emission windows.** Sim time is the accumulated sum of `time` deltas
   since load (not `@time.seconds` — deterministic under the sim tick).
   Emission (both `rate` and `burst`) is active only while
@@ -1325,6 +1338,7 @@ position history, over the same public buffer contract:
 | input    | `taper`     | `scalar`  | `0`      | width multiplier at the tail |
 | input    | `fade`      | `scalar`  | `0`      | alpha multiplier at the tail |
 | input    | `parallax`  | `vec2`    | `[0, 0]` | as §18.5.5, applied per history sample |
+| input    | `feather`   | `scalar`  | `0`      | fraction of the half-width that fades to transparent at each edge, 0–1; 0 = solid ribbon (adopted 2026-07-05) |
 | output   | `result`†   | `texture` |          | output-sized, premultiplied  |
 
 - Each time the input buffer produces (each sim tick), the node records
@@ -1339,6 +1353,11 @@ position history, over the same public buffer contract:
   the tail; alpha runs the particle's color alpha at the head to
   `fade ×` it at the tail. Color is the particle's current premultiplied
   tint. Dead slots draw nothing.
+- **Feather.** By default the ribbon is solid edge to edge. With
+  `feather > 0` alpha falls off smoothly (smoothstep) across the outer
+  `feather` fraction of each half-width — `1` fades from the centerline,
+  the soft-streak / comet look. Cross-width shading only; `width`,
+  `taper`, and the spine are untouched.
 - Determinism matches §18.3: identical documents stepped with identical
   deltas produce identical ribbons.
 
