@@ -371,7 +371,8 @@ public:
         PortSpin, PortColorStart, PortColorEnd, PortFadeIn, PortSizeEnd,
         PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
         PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
-        PortRing, PortDepth, PortCollide, PortBounce, PortSpawn,
+        PortRing, PortDepth, PortCollide, PortBounce, PortTintVary,
+        PortVelocityMin, PortVelocityMax, PortSpawn,
         PortInherit, PortSpawnPrev, PortTime, PortCount,
     };
     // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
@@ -397,6 +398,10 @@ public:
                   uint32_t spawnCount = 0);
     void evaluate(FrameContext& ctx) override;
 
+    // §18.5.2: binding velocityMin/velocityMax selects the axis-
+    // independent spawn-velocity box over the direction/spread/speed cone.
+    void setVelocityBox(bool on) { mVelocityBox = on; }
+
 private:
     bool ensurePipeline(FrameContext& ctx);
     Value emitterValue(size_t e, EmitterField f) const;
@@ -405,6 +410,7 @@ private:
     const std::vector<Emitter> mEmitters;
     const std::vector<uint32_t> mMasks;
     const uint32_t mSpawnCount; // §18.5.4: children per death; 0 = ring mode
+    bool mVelocityBox = false;  // §18.5.2 spawn-velocity box vs cone
     WgslInterface mIface; // built-in kernel reflection: the layout oracle
 
     wgpu::ComputePipeline mPipeline;
@@ -434,6 +440,7 @@ public:
     enum class Blend { Add, Over };
     enum Port : size_t {
         PortParticles, PortTexture, PortFrameRate, PortParallax,
+        PortFlutter, PortFlutterRate,
     };
     // sheetCols/Rows 0 = whole texture (no sheet).
     SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows);

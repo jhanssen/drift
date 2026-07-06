@@ -1164,6 +1164,9 @@ New inputs on `particles` (all optional):
 | input | `depth`    | `vec2`    | `[0, 0]`   | [min, max] initial z, sampled per particle |
 | input | `collide`  | `texture` | —          | collision mask; alpha ≥ 0.5 is solid |
 | input | `bounce`   | `scalar`  | `0.5`      | restitution on collision, 0..1   |
+| input | `tintVary` | `vec4`    | `[1,1,1,1]`| per-particle constant tint: each particle holds `mix(white, tintVary, rand)` for life, multiplied onto the `colorStart`→`colorEnd` ramp (adopted 2026-07-05) |
+| input | `velocityMin` | `vec2` | `[0, 0]`   | with `velocityMax`: binding either replaces the `direction`/`spread`/`speed` cone with an axis-independent uniform box (adopted 2026-07-05; node-level, not per-emitter) |
+| input | `velocityMax` | `vec2` | `[0, 0]`   | see `velocityMin`                |
 
 - **Emission windows.** Sim time is the accumulated sum of `time` deltas
   since load (not `@time.seconds` — deterministic under the sim tick).
@@ -1265,6 +1268,13 @@ New surface on `sprites`:
 | property | `sheet`     | `[cols, rows]` | —  | grid layout of `texture`; requires `texture` |
 | input    | `frameRate` | `scalar` | `0`      | frames/second; 0 = one pass over the sheet across each particle's lifetime |
 | input    | `parallax`  | `vec2`   | `[0, 0]` | screen offset per unit z, output space |
+| input    | `flutter`   | `vec2`   | `[0, 0]` | per-axis sine-sway amplitude, uv units (adopted 2026-07-05) |
+| input    | `flutterRate` | `scalar` | `1`    | flutter cycles per second        |
+
+- **Flutter.** A deterministic per-axis sine offset about the integrated
+  path, phase-decorrelated per particle and per axis from `seed` — the
+  drifting-snowflake / floating-ember sway. Draw-time only: it does not
+  feed back into velocity or collisions, and `trails` does not apply it.
 
 - **Spritesheet.** Frames are read row-major. With `frameRate = 0` a
   particle plays the whole sheet exactly once over its lifetime; with

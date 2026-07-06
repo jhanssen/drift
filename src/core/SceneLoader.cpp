@@ -367,6 +367,9 @@ const PortDef kParticlesInputs[] = {
     { "depth", ValueType::Vec2, false, { 0, 0 } },
     { "collide", ValueType::Texture, false },
     { "bounce", ValueType::Scalar, false, { 0.5 } },
+    { "tintVary", ValueType::Vec4, false, { 1, 1, 1, 1 } },
+    { "velocityMin", ValueType::Vec2, false, { 0, 0 } },
+    { "velocityMax", ValueType::Vec2, false, { 0, 0 } },
     { "spawn", ValueType::Buffer, false, {}, false, ParticlesNode::kStride },
     { "inherit", ValueType::Scalar, false, { 0 } },
     // Hidden §18.5.4 feedback edge: injected by the loader when 'spawn' is
@@ -382,6 +385,8 @@ const PortDef kSpritesInputs[] = {
     { "texture", ValueType::Texture, false },
     { "frameRate", ValueType::Scalar, false, { 0 } },
     { "parallax", ValueType::Vec2, false, { 0, 0 } },
+    { "flutter", ValueType::Vec2, false, { 0, 0 } },
+    { "flutterRate", ValueType::Scalar, false, { 1 } },
 };
 // Order must match TrailsNode::Port.
 const PortDef kTrailsInputs[] = {
@@ -2245,8 +2250,11 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             kinds = { emitter };
             masks = { 0 };
         }
-        return new ParticlesNode(capacity, std::move(kinds),
-                                 std::move(masks), spawnCount);
+        auto* node = new ParticlesNode(capacity, std::move(kinds),
+                                       std::move(masks), spawnCount);
+        node->setVelocityBox(raw.inputs.count("velocityMin") ||
+                             raw.inputs.count("velocityMax"));
+        return node;
     }
 
     if (raw.type == "sprites") {
