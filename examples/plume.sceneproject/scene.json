@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "name": "Plume",
+  "description": "§18.5.5 frameBlend: smoke puffs play a sixteen-frame sheet once over their lifetime, cross-faded between frames so the low frame rate reads as smooth.",
+  "nodes": [
+    { "id": "puff", "type": "shader", "shader": "shaders/puff.wgsl",
+      "size": [256, 256] },
+
+    { "id": "smoke", "type": "particles", "capacity": 40, "emitter": "box",
+      "inputs": { "time": "@time.delta", "rate": 6, "prewarm": 6,
+                  "origin": [0.5, 0.95], "extent": [0.06, 0.02],
+                  "direction": [0, -1], "spread": 18,
+                  "speed": [0.08, 0.14], "lifetime": [3.5, 6],
+                  "size": [0.05, 0.1], "sizeEnd": 2.2, "drag": 0.12,
+                  "turbulence": 0.02, "turbulenceScale": 2, "fadeIn": 0.5,
+                  "tintVary": [0.6, 0.62, 0.68, 1],
+                  "colorStart": [0.7, 0.72, 0.78, 0.5],
+                  "colorEnd": [0.55, 0.57, 0.63, 0] } },
+
+    { "id": "puffs", "type": "sprites", "blend": "over", "sheet": [4, 4],
+      "inputs": { "particles": "@smoke", "texture": "@puff",
+                  "frameBlend": 1 } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@puffs" } }
+  ]
+}

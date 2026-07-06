@@ -1137,8 +1137,9 @@ pointer parallax, sorted `over` sprites),
 `examples/fireworks.sceneproject` (multi-emitter windows, sub-emitter
 bursts, spritesheet twinkle, texture collision), and
 `examples/embers.sceneproject` (per-particle `twinkle`, feathered
-trail streaks, prewarm), and `examples/haze.sceneproject` (non-uniform
-sprite `stretch`, slow flutter).
+trail streaks, prewarm), `examples/haze.sceneproject` (non-uniform
+sprite `stretch`, slow flutter), and `examples/plume.sceneproject`
+(sheet `frameBlend` cross-fade).
 
 #### 18.5.1 Contract errata
 
@@ -1302,6 +1303,7 @@ New surface on `sprites`:
 | input    | `flutter`   | `vec2`   | `[0, 0]` | per-axis sine-sway amplitude, uv units (adopted 2026-07-05) |
 | input    | `flutterRate` | `scalar` | `1`    | flutter cycles per second        |
 | input    | `stretch`   | `vec2`   | `[1, 1]` | non-uniform sprite scale, output space (adopted 2026-07-05) |
+| input    | `frameBlend` | `scalar` | `0`     | cross-fade between adjacent sheet frames, 0–1 (adopted 2026-07-05) |
 
 - **Flutter.** A deterministic per-axis sine offset about the integrated
   path, phase-decorrelated per particle and per axis from `seed` — the
@@ -1321,6 +1323,15 @@ New surface on `sprites`:
   `frameRate > 0` it advances at that rate and loops, starting on a
   per-particle random frame (hashed from `seed`) so pools don't strobe
   in sync.
+- **Frame cross-fade.** By default sheet playback snaps to the nearest
+  frame, which visibly steps on low-frame-count sheets. With
+  `frameBlend > 0` the fractional frame position linearly blends the
+  current frame toward the next, scaled by `frameBlend` — `1` is a full
+  cross-fade. Playing once, the last frame clamps (no fade back to the
+  first at death); looping, it wraps. Caveat: if the sheet has no
+  inter-cell gutter, linear filtering can bleed at cell borders — the
+  same pre-existing concern as nearest-frame sampling, not materially
+  worsened.
 - **Parallax.** Each particle is offset by `parallax × z` at draw time
   (the simulation is untouched — several `sprites` with different
   `parallax` wires can draw one pool at several apparent distances).

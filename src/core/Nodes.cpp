@@ -2867,8 +2867,8 @@ struct Particle {
 }
 
 // misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,
-// stretch.xy — §18.5.5 stretch); flut = (flutter.xy amplitude, flutterRate,
-// -) — §18.5.5 flutter.
+// stretch.xy — §18.5.5 stretch); flut = (flutter.xy amplitude, flutterRate
+// — §18.5.5 flutter, frameBlend — §18.5.5 frame cross-fade).
 struct Params { misc: vec4f, par: vec4f, flut: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -2890,6 +2890,8 @@ struct VsOut {
     @builtin(position) pos: vec4f,
     @location(0) uv: vec2f,
     @location(1) color: vec4f,
+    @location(2) uv1: vec2f,  // §18.5.5 frameBlend: the next sheet frame
+    @location(3) blend: f32,  // cross-fade factor toward uv1
 }
 
 @vertex
@@ -2926,32 +2928,53 @@ fn drift_sprite_vs(@builtin(vertex_index) v: u32,
               params.par.xy * p.pos.z + sway;
     out.pos = vec4f(pos.x * 2.0 - 1.0, 1.0 - pos.y * 2.0, 0.0, 1.0);
     var uv = corner * 0.5 + 0.5;
+    var uv1 = uv;
+    var blend = 0.0;
     let cols = params.misc.z;
     let rows = params.misc.w;
     if (cols > 0.0) {
         // §18.5.5 spritesheet: frameRate 0 plays the sheet once over the
         // particle's lifetime; > 0 loops at that rate from a per-particle
-        // random start frame.
+        // random start frame. §18.5.5 frameBlend: the fractional frame
+        // position cross-fades toward the next frame — clamped at the last
+        // frame when playing once (no fade back to the first at death),
+        // wrapped when looping.
         let frames = cols * rows;
         var fi: f32;
+        var f1: f32;
+        var frac: f32;
         if (params.misc.y <= 0.0) {
-            fi = floor(clamp(p.age / p.lifetime, 0.0, 0.99999) * frames);
+            let raw = clamp(p.age / p.lifetime, 0.0, 0.99999) * frames;
+            fi = floor(raw);
+            frac = raw - fi;
+            f1 = min(fi + 1.0, frames - 1.0);
         } else {
             let start = floor(rnd(u32(p.seed), 11u) * frames);
-            fi = floor(start + p.age * params.misc.y);
+            let raw = start + p.age * params.misc.y;
+            fi = floor(raw);
+            frac = raw - fi;
             fi = fi - floor(fi / frames) * frames;
+            f1 = fi + 1.0;
+            f1 = f1 - floor(f1 / frames) * frames;
         }
+        blend = frac * params.flut.w;
+        uv1 = (vec2f(f1 - floor(f1 / cols) * cols, floor(f1 / cols)) + uv) /
+              vec2f(cols, rows);
         uv = (vec2f(fi - floor(fi / cols) * cols, floor(fi / cols)) + uv) /
              vec2f(cols, rows);
     }
     out.uv = uv;
+    out.uv1 = uv1;
+    out.blend = blend;
     out.color = p.color;
     return out;
 }
 
 @fragment
 fn drift_sprite_fs(@location(0) uv: vec2f,
-                   @location(1) color: vec4f) -> @location(0) vec4f {
+                   @location(1) color: vec4f,
+                   @location(2) uv1: vec2f,
+                   @location(3) blend: f32) -> @location(0) vec4f {
     //FRAGMENT
 }
 )";
@@ -2963,7 +2986,8 @@ const char* kSpriteDiscFragment = R"(
 )";
 
 const char* kSpriteTexturedFragment = R"(
-    return textureSample(sprite, sprite_sampler, uv) * color;
+    return mix(textureSample(sprite, sprite_sampler, uv),
+               textureSample(sprite, sprite_sampler, uv1), blend) * color;
 )";
 
 const char* kSpriteTextureBindings = R"(
@@ -3125,7 +3149,7 @@ void SpritesNode::evaluate(FrameContext& ctx)
         (float)inputValue(PortFlutter).v[0],
         (float)inputValue(PortFlutter).v[1],
         (float)inputValue(PortFlutterRate).v[0],
-        0.0f,
+        (float)inputValue(PortFrameBlend).v[0],
     };
     ctx.device.GetQueue().WriteBuffer(mUniforms, 0, uniforms,
                                       sizeof(uniforms));
