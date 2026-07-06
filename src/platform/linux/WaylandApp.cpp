@@ -6,6 +6,7 @@
 #include <cstring>
 #include <ctime>
 
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -100,6 +101,23 @@ const wl_pointer_listener kPointerListener = {
     pointerEnter, pointerLeave, pointerMotion, pointerButton, pointerAxis
 };
 
+void keyboardKeymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t)
+{
+    close(fd); // raw evdev keycodes suffice; no xkb mapping kept
+}
+void keyboardEnter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
+void keyboardLeave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
+void keyboardKey(void* data, wl_keyboard*, uint32_t, uint32_t, uint32_t key,
+                 uint32_t state)
+{
+    static_cast<WaylandApp*>(data)->onKey(key, state);
+}
+void keyboardModifiers(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t,
+                       uint32_t, uint32_t) {}
+const wl_keyboard_listener kKeyboardListener = {
+    keyboardKeymap, keyboardEnter, keyboardLeave, keyboardKey, keyboardModifiers
+};
+
 void fractionalScalePreferred(void* data, wp_fractional_scale_v1*,
                               uint32_t scale120)
 {
@@ -190,6 +208,7 @@ WaylandApp::~WaylandApp()
     while (!mSurfaces.empty()) {
         destroyOutputSurface(mSurfaces.back().get());
     }
+    if (mKeyboard) wl_keyboard_destroy(mKeyboard);
     if (mPointer) wl_pointer_destroy(mPointer);
     if (mSeat) wl_seat_destroy(mSeat);
     if (mFractionalScaleManager)
@@ -342,6 +361,25 @@ void WaylandApp::onSeatCapabilities(uint32_t capabilities)
             surf->pointerOver = false;
         }
     }
+
+    // Keyboard only matters for the toplevel modes (Esc closes); wallpaper
+    // layer surfaces opt out of keyboard interactivity entirely.
+    const bool wantKeyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) &&
+                              mMode != SurfaceMode::Wallpaper;
+    if (wantKeyboard && !mKeyboard) {
+        mKeyboard = wl_seat_get_keyboard(mSeat);
+        wl_keyboard_add_listener(mKeyboard, &kKeyboardListener, this);
+    } else if (!wantKeyboard && mKeyboard) {
+        wl_keyboard_destroy(mKeyboard);
+        mKeyboard = nullptr;
+    }
+}
+
+void WaylandApp::onKey(uint32_t key, uint32_t state)
+{
+    if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+        mRunning = false;
+    }
 }
 
 WaylandApp::OutputSurface* WaylandApp::surfaceFor(wl_surface* surface)
@@ -421,7 +459,7 @@ void WaylandApp::onLayerConfigure(OutputSurface* surf, uint32_t serial,
 
 void WaylandApp::onSurfaceClosed(OutputSurface* surf)
 {
-    if (mMode == SurfaceMode::Windowed) {
+    if (mMode != SurfaceMode::Wallpaper) {
         mRunning = false;
         return;
     }
@@ -491,6 +529,11 @@ bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
         xdg_toplevel_add_listener(surf->toplevel, &kToplevelListener, surf.get());
         xdg_toplevel_set_title(surf->toplevel, "drift");
         xdg_toplevel_set_app_id(surf->toplevel, "drift");
+        if (mMode == SurfaceMode::Fullscreen) {
+            // nullptr output: the compositor picks (the one the surface
+            // maps on); the configure event carries the output size.
+            xdg_toplevel_set_fullscreen(surf->toplevel, nullptr);
+        }
         surf->pendingWidth = mInitialWidth;
         surf->pendingHeight = mInitialHeight;
     }

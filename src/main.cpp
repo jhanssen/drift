@@ -29,6 +29,8 @@ void usage(const char* argv0)
             "usage: %s [scene.sceneproject] [options]\n"
             "  (default)          run as wallpaper (wlr-layer-shell background)\n"
             "  -w, --windowed     run in a regular window (dev mode)\n"
+            "  -f, --fullscreen   run as a fullscreen window (preview without\n"
+            "                     other windows covering the wallpaper)\n"
             "      --headless N   render N frames offscreen and write PNGs\n"
             "      --frames LIST  only write the comma-separated frame indices\n"
             "                     (still evaluates every frame up to the last;\n"
@@ -309,6 +311,10 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
         return 1;
     }
 
+    // Declared before app: ~WaylandApp tears down surfaces, which fires the
+    // output-removed callback into this map, so it must still be alive then.
+    std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
+
     drift::platform::WaylandApp app;
     if (!app.setup(gpu, mode, width, height)) {
         return 1;
@@ -340,7 +346,6 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     const wgpu::TextureFormat format = app.targetFormat();
     const bool animated = !firstScene || firstScene->animated();
 
-    std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
     app.setOutputRemoved([&scenes](uint32_t outputId) {
         scenes.erase(outputId);
     });
@@ -616,6 +621,7 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
 int main(int argc, char** argv)
 {
     bool windowed = false;
+    bool fullscreen = false;
     int headlessFrames = -1;
     uint16_t listenPort = 0;
     uint32_t width = 0, height = 0;
@@ -629,6 +635,8 @@ int main(int argc, char** argv)
         const char* arg = argv[i];
         if (!strcmp(arg, "-w") || !strcmp(arg, "--windowed")) {
             windowed = true;
+        } else if (!strcmp(arg, "-f") || !strcmp(arg, "--fullscreen")) {
+            fullscreen = true;
         } else if (!strcmp(arg, "--headless") && i + 1 < argc) {
             headlessFrames = atoi(argv[++i]);
         } else if (!strcmp(arg, "--frames") && i + 1 < argc) {
@@ -700,7 +708,8 @@ int main(int argc, char** argv)
     }
     if (width == 0) { width = 1280; height = 720; }
     return runWayland(scenePath,
-                      windowed ? drift::platform::SurfaceMode::Windowed
-                               : drift::platform::SurfaceMode::Wallpaper,
+                      fullscreen ? drift::platform::SurfaceMode::Fullscreen
+                      : windowed ? drift::platform::SurfaceMode::Windowed
+                                 : drift::platform::SurfaceMode::Wallpaper,
                       width, height, overrides, listenPort);
 }

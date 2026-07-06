@@ -25,6 +25,7 @@ struct wl_buffer;
 struct wl_callback;
 struct wl_seat;
 struct wl_pointer;
+struct wl_keyboard;
 struct wl_output;
 struct xdg_wm_base;
 struct xdg_surface;
@@ -41,8 +42,9 @@ struct wp_fractional_scale_v1;
 namespace drift::platform {
 
 enum class SurfaceMode {
-    Wallpaper, // wlr-layer-shell background layer per output
-    Windowed,  // single xdg toplevel dev window
+    Wallpaper,  // wlr-layer-shell background layer per output
+    Windowed,   // single xdg toplevel dev window
+    Fullscreen, // single xdg toplevel, fullscreened by the compositor
 };
 
 class WaylandApp {
@@ -178,6 +180,7 @@ public:
     void onPointerEnter(wl_surface* surface, double x, double y);
     void onPointerLeave(wl_surface* surface);
     void onPointerMotion(double x, double y);
+    void onKey(uint32_t key, uint32_t state);
     void onXdgSurfaceConfigure(OutputSurface* surf, uint32_t serial);
     void onToplevelConfigure(OutputSurface* surf, int32_t width, int32_t height);
     void onLayerConfigure(OutputSurface* surf, uint32_t serial, uint32_t width,
@@ -220,6 +223,7 @@ private:
 
     wl_seat* mSeat = nullptr;
     wl_pointer* mPointer = nullptr;
+    wl_keyboard* mKeyboard = nullptr; // toplevel modes only (Esc closes)
     wl_surface* mPointerSurface = nullptr; // surface under the pointer
 
     std::vector<std::unique_ptr<OutputSurface>> mSurfaces;
