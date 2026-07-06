@@ -454,6 +454,17 @@ function connectLive(port) {
       document.getElementById('connectBtn').textContent = 'Connect';
       setStatus('liveStatus', 'live: not connected');
       console.log('editor: live disconnected');
+      // The panel falls back to the preview manifest — re-describe it
+      // first, or the widgets rebuild from values captured at load and
+      // silently revert every parameter set during the live session.
+      if (wasm) {
+        try {
+          const manifest = JSON.parse(wasm.describe());
+          if (manifest.scene) {
+            wasmManifest = manifest;
+          }
+        } catch { /* no preview scene; the panel shows none-yet */ }
+      }
       refreshPanel();
     }
   };
