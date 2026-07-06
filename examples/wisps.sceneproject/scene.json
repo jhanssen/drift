@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "Wisps",
+  "description": "§18.5.4 life sub-emitters: slow-drifting motes each continuously shed a soft halo that lingers along their path.",
+  "nodes": [
+    { "id": "motes", "type": "particles", "capacity": 8, "emitter": "box",
+      "inputs": { "time": "@time.delta", "rate": 0.8, "prewarm": 8,
+                  "origin": [0.5, 1.05], "extent": [0.45, 0.02],
+                  "direction": [0, -1], "spread": 25,
+                  "speed": [0.05, 0.09], "lifetime": [9, 14],
+                  "size": [0.006, 0.01], "fadeIn": 0.5,
+                  "turbulence": 0.03, "turbulenceScale": 2,
+                  "colorStart": [0.9, 1.0, 0.8, 1],
+                  "colorEnd": [0.5, 0.9, 0.6, 0.6] } },
+
+    { "id": "halos", "type": "particles", "spawnMode": "life",
+      "spawnCount": 24,
+      "inputs": { "time": "@time.delta", "spawn": "@motes", "spawnRate": 5,
+                  "inherit": 0.2, "speed": [0, 0.01],
+                  "lifetime": [2, 3.5], "size": [0.02, 0.045],
+                  "sizeEnd": 2.5, "fadeIn": 0.15,
+                  "colorStart": [0.25, 0.7, 0.4, 0.28],
+                  "colorEnd": [0.1, 0.35, 0.5, 0] } },
+
+    { "id": "glow", "type": "sprites",
+      "inputs": { "particles": "@halos" } },
+    { "id": "dots", "type": "sprites",
+      "inputs": { "particles": "@motes" } },
+
+    { "id": "comp", "type": "compositor",
+      "inputs": { "layers": ["@glow", "@dots"] } },
+    { "id": "out", "type": "output", "inputs": { "color": "@comp" } }
+  ]
+}

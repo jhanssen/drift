@@ -1261,6 +1261,33 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
     CHECK(r.scene == nullptr);
     CHECK(r.hasError("'spawnCount'"));
 
+    // §18.5.4 spawnMode: birth/life load with spawn, invalid values are
+    // rejected, and the property warns without spawn.
+    r = scene(R"(
+        { "id": "src", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles", "spawnMode": "life",
+          "inputs": { "time": "@time.delta", "spawn": "@src",
+                      "spawnRate": 6, "inherit": 0.3 } },
+        { "id": "sub2", "type": "particles", "spawnMode": "birth",
+          "inputs": { "time": "@time.delta", "spawn": "@src" } },
+        { "id": "s", "type": "sprites", "inputs": { "particles": "@sub" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+    r = scene(R"(
+        { "id": "src", "type": "particles",
+          "inputs": { "time": "@time.delta" } },
+        { "id": "sub", "type": "particles", "spawnMode": "orbit",
+          "inputs": { "time": "@time.delta", "spawn": "@src" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("'spawnMode'"));
+    r = scene(R"(
+        { "id": "p", "type": "particles", "spawnMode": "life",
+          "inputs": { "time": "@time.delta" } })");
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.hasWarning("'spawnMode' without 'spawn'"));
+
     // emitters and spawn do not combine.
     r = scene(R"(
         { "id": "src", "type": "particles",

@@ -364,6 +364,8 @@ private:
 class ParticlesNode : public Node {
 public:
     enum class Emitter { Point, Box, Disc };
+    // §18.5.4 spawnMode: which parent event the owned child range emits on.
+    enum class SpawnMode { Death, Birth, Life };
     // Input port order — the loader's port table must match.
     enum Port : size_t {
         PortRate, PortBurst, PortBurstCount, PortOrigin, PortExtent,
@@ -374,8 +376,8 @@ public:
         PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
         PortRing, PortDepth, PortCollide, PortBounce, PortTintVary,
         PortTintVaryMax, PortVelocityMin, PortVelocityMax, PortTwinkle,
-        PortTwinkleRate, PortPrewarm, PortSpawn, PortInherit, PortSpawnPrev,
-        PortTime, PortCount,
+        PortTwinkleRate, PortPrewarm, PortSpawn, PortInherit, PortSpawnRate,
+        PortSpawnPrev, PortTime, PortCount,
     };
     // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
     // EfCount extra input ports per entry after PortCount, in this order —
@@ -397,7 +399,8 @@ public:
     // hidden spawnPrev feedback edge for death detection.
     ParticlesNode(uint32_t capacity, std::vector<Emitter> emitters,
                   std::vector<uint32_t> overrideMasks,
-                  uint32_t spawnCount = 0);
+                  uint32_t spawnCount = 0,
+                  SpawnMode spawnMode = SpawnMode::Death);
     void evaluate(FrameContext& ctx) override;
 
     // §18.5.2: binding velocityMin/velocityMax selects the axis-
@@ -414,7 +417,8 @@ private:
     const uint32_t mCapacity;
     const std::vector<Emitter> mEmitters;
     const std::vector<uint32_t> mMasks;
-    const uint32_t mSpawnCount; // §18.5.4: children per death; 0 = ring mode
+    const uint32_t mSpawnCount; // §18.5.4: children per parent; 0 = ring mode
+    const SpawnMode mSpawnMode = SpawnMode::Death; // §18.5.4 trigger
     bool mVelocityBox = false;  // §18.5.2 spawn-velocity box vs cone
     bool mTintBox = false;      // §18.5.2 per-channel tint box
     bool mPrewarmed = false;    // §18.5.2 prewarm ran (first evaluate)

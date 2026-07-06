@@ -1141,7 +1141,8 @@ trail streaks, prewarm), `examples/haze.sceneproject` (non-uniform
 sprite `stretch`, slow flutter), `examples/plume.sceneproject`
 (sheet `frameBlend` cross-fade), and `examples/cinders.sceneproject`
 (velocity `align`, `turbulenceMask`, tint box, `fadeOut`/`sizeWindow`,
-squashed annulus emission).
+squashed annulus emission), and `examples/wisps.sceneproject`
+(`life`-mode sub-emitters).
 
 #### 18.5.1 Contract errata
 
@@ -1194,9 +1195,9 @@ New inputs on `particles` (all optional):
   against the warmed clock (a `duration` shorter than `prewarm` has
   already closed at load), identical documents warm identically on every
   machine, and a prewarmed scene is golden-stable. Sampled once at load;
-  later changes take effect on the next scene load. Death-driven
-  (`spawn`-bound) nodes warm their clock but not their pool: the spawn
-  feed's death history cannot advance within load.
+  later changes take effect on the next scene load. `spawn`-bound nodes
+  (§18.5.4, any mode) warm their clock but not their pool: the spawn
+  feed cannot advance within load.
 
 - **Tint box.** With only `tintVary` bound, per-particle tint is one
   random draw along the white↔`tintVary` segment (all channels move
@@ -1288,31 +1289,64 @@ sources sharing a pool, forces, and life curves:
 - Without an `emitters` property the node behaves exactly as §18.3 (one
   emitter, index 0).
 
-#### 18.5.4 Sub-emitters (spawn on death)
+#### 18.5.4 Sub-emitters (spawn from parent particles)
 
-A `particles` node whose `spawn` input is connected emits from *deaths*
-in the source buffer instead of from an emitter shape:
+A `particles` node whose `spawn` input is connected emits from events in
+the source buffer — its particles' deaths, births, or lives — instead of
+from an emitter shape:
 
-| Kind     | Name         | Type     | Default | Notes                        |
-|----------|--------------|----------|---------|------------------------------|
-| input    | `spawn`      | `buffer` | —       | `Particle` source; emission sites are its deaths this tick |
-| property | `spawnCount` | `scalar` | `4`     | children per death (load-time constant) |
-| input    | `inherit`    | `scalar` | `0`     | fraction of the parent's velocity added to children |
+| Kind     | Name         | Type     | Default   | Notes                      |
+|----------|--------------|----------|-----------|----------------------------|
+| input    | `spawn`      | `buffer` | —         | `Particle` source; emission sites come from its particles |
+| property | `spawnCount` | `scalar` | `4`       | children per parent slot (load-time constant) |
+| property | `spawnMode`  | `string` | `"death"` | `death`, `birth`, or `life` — which parent event emits (adopted 2026-07-05) |
+| input    | `inherit`    | `scalar` | `0`       | fraction of the parent's velocity added to children |
+| input    | `spawnRate`  | `scalar` | `0`       | `life` mode only: children per second per living parent (adopted 2026-07-05) |
 
-- A death is a source slot whose `lifetime` was > 0 on the previous tick
-  and is 0 now (the runtime keeps the one-frame history; the author wires
-  only `spawn`). Particles culled by pool recycling also count — they
-  died, just early.
-- Children emit at the parent's last position (z included — the node's
-  `depth` input does not apply), with the node's own
-  `direction`/`spread`/`speed`/`lifetime`/`size`/`spin`/colors, plus
-  `inherit` × the parent's final velocity.
-- **Capacity is derived**: `spawn.capacity × spawnCount`, so every death
-  has a home and slot assignment is static — source slot *s* owns child
-  slots `[s·spawnCount, (s+1)·spawnCount)`. A redeath of a recycled
+- **Ownership is static in every mode**: capacity is derived as
+  `spawn.capacity × spawnCount`, and source slot *s* owns child slots
+  `[s·spawnCount, (s+1)·spawnCount)` — no atomics, deterministic slot
+  assignment. A `capacity` property on a spawn-connected node is ignored
+  with a warning. The mode only changes *when* the owned range emits and
+  *where* the sites come from:
+
+  | mode    | trigger (per parent slot, per tick)      | site              |
+  |---------|------------------------------------------|-------------------|
+  | `death` | alive last tick, dead this tick          | parent's last position |
+  | `birth` | dead last tick, alive this tick          | parent's spawn position |
+  | `life`  | parent alive, metered by `spawnRate`     | parent's current position |
+
+- **`death`** (the default — existing documents are unchanged): one
+  burst per death. A death is a source slot whose `lifetime` was > 0 on
+  the previous tick and is 0 now (the runtime keeps the one-frame
+  history; the author wires only `spawn`). Particles culled by pool
+  recycling also count — they died, just early. A redeath of a recycled
   source slot re-emits over its own children (its previous brood is the
-  stalest by construction). A `capacity` property on a spawn-connected
-  node is ignored with a warning.
+  stalest by construction).
+- **`birth`**: one burst when a parent slot comes alive, at its spawn
+  point — a mark dropped where each parent is born. Trigger and site
+  aside, identical to `death` (same seeding, same determinism).
+- **`life`**: each *living* parent continuously sheds children at
+  `spawnRate` per second, sampled at the parent's current position — the
+  aura / trailing-wisp case. Cadence derives from the parent's age
+  (children emitted so far = ⌊age × spawnRate⌋), so it is deterministic
+  with no traversal-order dependence; a `spawnRate` change re-derives
+  the count against the new rate. The owned range is a ring:
+  `spawnCount` bounds the *simultaneous* children per parent (the oldest
+  recycles), `spawnRate` sets the cadence, and each emission salts the
+  child's random stream with its per-parent ordinal, so ring reuse draws
+  fresh streams. `spawnRate` 0 (the default) emits nothing. Children are
+  *not* rigidly attached: once emitted they live and move independently
+  under the node's own inputs — rigid attachment (a body tracking a
+  parent frame-to-frame) is deliberately out of scope.
+- In every mode children emit at the parent's sampled position (z
+  included — the node's `depth` input does not apply), with the node's
+  own `direction`/`spread`/`speed`/`lifetime`/`size`/`spin`/colors, plus
+  `inherit` × the parent's velocity at the trigger tick (final velocity
+  for `death`, current for `birth`/`life`).
+- The co-located, *unparented* case — a second system that merely spawns
+  at the same origin as another — needs none of this: author a second
+  `particles` node with the same `origin`/`extent` and no `spawn`.
 - `rate`, `burst`, `burstCount`, `origin`, `extent`, `emitter`, `delay`,
   and `duration` do not apply when `spawn` is connected (warning if set);
   combining `emitters` with `spawn` is an error. Chaining sub-emitters is
@@ -1420,10 +1454,12 @@ position history, over the same public buffer contract:
 
 `emitters` empty, longer than 8, containing a non-object, or an entry
 field that is not an emission-time input; `sheet` malformed, non-integral,
-< 1, or set without `texture`; `spawnCount` non-integral or < 1; `spawn`
-stride mismatch (§18.1 rule); `length` outside 2–64; derived sub-emitter
-capacity exceeding the implementation pool limit; warnings per §18.5.4
-for inapplicable emission inputs and ignored `capacity`.
+< 1, or set without `texture`; `spawnCount` non-integral or < 1;
+`spawnMode` not one of `death`/`birth`/`life` (and ignored with a warning
+without `spawn`); `spawn` stride mismatch (§18.1 rule); `length` outside
+2–64; derived sub-emitter capacity exceeding the implementation pool
+limit; warnings per §18.5.4 for inapplicable emission inputs and ignored
+`capacity`.
 
 ### 18.6 Reserved Growth
 

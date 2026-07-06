@@ -2119,7 +2119,7 @@ struct Params {
     fadeIn: f32, sizeEnd: f32, drag: f32, turbulence: f32,
     turbulenceScale: f32, attract: f32, vortex: f32, ring: f32,
     bounce: f32, dt: f32, emitStart: f32, seedBase: f32,
-    spawnCount: f32, inherit: f32,
+    spawnCount: f32, inherit: f32, spawnRate: f32,
     tintVary: vec4f,
     velocityMin: vec2f, velocityMax: vec2f,
     twinkle: vec2f, twinkleRate: vec2f,
@@ -2371,20 +2371,20 @@ const char* kParticleEmitSpawn = R"(
     let ps = i / sc;
     if (ps < arrayLength(&spawn)) {
         let parent = spawn[ps];
-        if (spawnPrev[ps].lifetime > 0.0 && parent.lifetime == 0.0) {
-            // Randoms hash the parent's emission ordinal (its seed), so
-            // every life of a recycled parent slot gets a fresh stream —
-            // folded to 24 bits up front so the stored seed replays the
-            // same stream in later frames.
-            let n = ((u32(parent.seed) * sc + (i % sc)) ^
-                     (ps * 2654435761u)) % 16777216u;
+        // The trigger permutation (§18.5.4 spawnMode) decides whether this
+        // slot fires this tick and derives n, the child's emission ordinal:
+        // randoms hash the parent's own ordinal (its seed), so every life
+        // of a recycled parent slot gets a fresh stream — folded to 24 bits
+        // up front so the stored seed replays the same stream later.
+//SPAWN_TRIGGER
+        if (fire) {
             let E = emitters[0];
             var p: Particle;
             let base = atan2(E.direction.y, E.direction.x);
             let theta = base + radians(E.spread) * (rnd(n, 3u) - 0.5);
             let speed = mix(E.speed.x, E.speed.y, rnd(n, 4u));
-            // Children start where the parent ended (z included) and
-            // inherit a fraction of its final velocity.
+            // Children start at the parent's sampled position (z included)
+            // and inherit a fraction of its velocity at the trigger tick.
             p.pos = parent.pos;
             // §18.5.2 velocity box: when bound, initial velocity samples an
             // axis-independent range instead of the direction/spread/speed
@@ -2411,6 +2411,41 @@ const char* kParticleEmitSpawn = R"(
             return;
         }
     }
+)";
+
+// §18.5.4 spawnMode triggers, one spliced at //SPAWN_TRIGGER. Each sets
+// `fire` (does this child slot emit this tick?) and `n` (the child's
+// emission ordinal).
+const char* kSpawnTriggerDeath = R"(
+        let fire = spawnPrev[ps].lifetime > 0.0 && parent.lifetime == 0.0;
+        let n = ((u32(parent.seed) * sc + (i % sc)) ^
+                 (ps * 2654435761u)) % 16777216u;
+)";
+// Birth: fire once when the parent slot comes alive; the parent's position
+// this tick is its spawn point (it has not integrated yet).
+const char* kSpawnTriggerBirth = R"(
+        let fire = spawnPrev[ps].lifetime == 0.0 && parent.lifetime > 0.0;
+        let n = ((u32(parent.seed) * sc + (i % sc)) ^
+                 (ps * 2654435761u)) % 16777216u;
+)";
+// Life: living parents emit continuously at spawnRate. The cadence derives
+// statelessly from the parent's age — children emitted so far =
+// floor(age * spawnRate) — deterministic with no per-slot accumulator (a
+// spawnRate change re-derives the count against the new rate). The owned
+// range is a ring: a slot fires when this tick's emission window covers
+// its offset, and e (the per-parent child ordinal) replaces the static
+// slot index in n so ring reuse draws fresh streams.
+const char* kSpawnTriggerLife = R"(
+        let rr = max(params.spawnRate, 0.0);
+        let before = floor(max(parent.age - params.dt, 0.0) * rr);
+        let k = floor(parent.age * rr) - before;
+        let scf = f32(sc);
+        let c = before - floor(before / scf) * scf;
+        var q = f32(i % sc) - c;
+        q = q - floor(q / scf) * scf;
+        let fire = parent.lifetime > 0.0 && k > 0.0 && q < k;
+        let n = ((u32(parent.seed) * sc + u32(before + q)) ^
+                 (ps * 2654435761u)) % 16777216u;
 )";
 
 // §18.5.2 collision permutation, spliced in when the collide port is bound.
@@ -2471,9 +2506,10 @@ const char* kParticleCollideCode = R"(
 
 ParticlesNode::ParticlesNode(uint32_t capacity, std::vector<Emitter> emitters,
                              std::vector<uint32_t> overrideMasks,
-                             uint32_t spawnCount)
+                             uint32_t spawnCount, SpawnMode spawnMode)
     : mCapacity(capacity), mEmitters(std::move(emitters)),
-      mMasks(std::move(overrideMasks)), mSpawnCount(spawnCount)
+      mMasks(std::move(overrideMasks)), mSpawnCount(spawnCount),
+      mSpawnMode(spawnMode)
 {
     std::string err;
     WgslInterface::parse(kParticleSimWgsl, mIface, err); // own source: cannot fail
@@ -2519,6 +2555,12 @@ bool ParticlesNode::ensurePipeline(FrameContext& ctx)
     replace("//COLLIDE_BINDINGS", mCollide ? kParticleCollideBindings : "");
     replace("//SPAWN_BINDINGS", mSpawnCount ? kParticleSpawnBindings : "");
     replace("//EMISSION", mSpawnCount ? kParticleEmitSpawn : kParticleEmitRing);
+    if (mSpawnCount) {
+        replace("//SPAWN_TRIGGER",
+                mSpawnMode == SpawnMode::Birth  ? kSpawnTriggerBirth
+                : mSpawnMode == SpawnMode::Life ? kSpawnTriggerLife
+                                                : kSpawnTriggerDeath);
+    }
     replace("//COLLIDE", mCollide ? kParticleCollideCode : "");
     wgpu::ShaderModule module = makeModule(ctx.device, source);
     if (!module) {
@@ -2711,6 +2753,7 @@ void ParticlesNode::evaluate(FrameContext& ctx)
                 { "twinkle", PortTwinkle },
                 { "twinkleRate", PortTwinkleRate },
                 { "emitScale", PortEmitScale },
+                { "spawnRate", PortSpawnRate },
             };
             v = inputValue(kByName.at(field.name));
         }
@@ -2780,17 +2823,22 @@ void ParticlesNode::evaluate(FrameContext& ctx)
     }
     if (mSpawnCount) {
         const Value cur = inputValue(PortSpawn);
-        const Value prev = inputValue(PortSpawnPrev);
         wgpu::BindGroupEntry c{};
         c.binding = 6;
         c.buffer = cur.buffer;
         c.size = (uint64_t)cur.bufStride * cur.bufCapacity;
         entries.push_back(c);
-        wgpu::BindGroupEntry h{};
-        h.binding = 7;
-        h.buffer = prev.buffer;
-        h.size = (uint64_t)prev.bufStride * prev.bufCapacity;
-        entries.push_back(h);
+        // §18.5.4 life needs no death detection: its trigger never reads
+        // spawnPrev, the auto layout prunes the binding, and supplying an
+        // entry the layout lacks would fail bind-group validation.
+        if (mSpawnMode != SpawnMode::Life) {
+            const Value prev = inputValue(PortSpawnPrev);
+            wgpu::BindGroupEntry h{};
+            h.binding = 7;
+            h.buffer = prev.buffer;
+            h.size = (uint64_t)prev.bufStride * prev.bufCapacity;
+            entries.push_back(h);
+        }
     }
     wgpu::BindGroupDescriptor bgd{};
     bgd.layout = mPipeline.GetBindGroupLayout(0);

@@ -380,6 +380,7 @@ const PortDef kParticlesInputs[] = {
     { "prewarm", ValueType::Scalar, false, { 0 } },
     { "spawn", ValueType::Buffer, false, {}, false, ParticlesNode::kStride },
     { "inherit", ValueType::Scalar, false, { 0 } },
+    { "spawnRate", ValueType::Scalar, false, { 0 } },
     // Hidden §18.5.4 feedback edge: injected by the loader when 'spawn' is
     // connected (death detection needs the source's previous tick).
     { "spawnPrev", ValueType::Buffer, false, {}, false,
@@ -2148,10 +2149,24 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             capacity = (uint32_t)capIt->second.get_number();
         }
         // §18.5.4 sub-emitter mode: capacity derives from the spawn source
-        // so every death has a statically assigned brood.
+        // so every parent has a statically assigned brood.
         uint32_t spawnCount = 0;
+        auto spawnMode = ParticlesNode::SpawnMode::Death;
         if (raw.inputs.count("spawn")) {
             spawnCount = 4;
+            if (auto smIt = obj.find("spawnMode"); smIt != obj.end()) {
+                const std::string mode = smIt->second.is_string()
+                    ? smIt->second.get_string() : std::string();
+                if (mode == "birth") {
+                    spawnMode = ParticlesNode::SpawnMode::Birth;
+                } else if (mode == "life") {
+                    spawnMode = ParticlesNode::SpawnMode::Life;
+                } else if (mode != "death") {
+                    fail("node '" + raw.id + "': 'spawnMode' must be "
+                         "\"death\", \"birth\", or \"life\" (§18.5.4)");
+                    return nullptr;
+                }
+            }
             if (auto scIt = obj.find("spawnCount"); scIt != obj.end()) {
                 if (!scIt->second.is_number() ||
                     scIt->second.get_number() < 1 ||
@@ -2219,6 +2234,10 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             warn("node '" + raw.id +
                  "': 'spawnCount' without 'spawn' is ignored (§18.5.4)");
         }
+        if (!raw.inputs.count("spawn") && obj.count("spawnMode")) {
+            warn("node '" + raw.id +
+                 "': 'spawnMode' without 'spawn' is ignored (§18.5.4)");
+        }
         ParticlesNode::Emitter emitter = ParticlesNode::Emitter::Point;
         if (auto emitIt = obj.find("emitter"); emitIt != obj.end()) {
             if (!emitIt->second.is_string() ||
@@ -2263,7 +2282,8 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             masks = { 0 };
         }
         auto* node = new ParticlesNode(capacity, std::move(kinds),
-                                       std::move(masks), spawnCount);
+                                       std::move(masks), spawnCount,
+                                       spawnMode);
         node->setVelocityBox(raw.inputs.count("velocityMin") ||
                              raw.inputs.count("velocityMax"));
         node->setTintBox(raw.inputs.count("tintVaryMax"));

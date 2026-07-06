@@ -44,6 +44,8 @@ inline constexpr NodePropDef kNodeProps[] = {
     { "particles", "emitter", "enum", false, "\"point\"",
       "point box disc" },
     { "particles", "spawnCount", "int", false, nullptr, nullptr },
+    { "particles", "spawnMode", "enum", false, "\"death\"",
+      "death birth life" },
     { "particles", "emitters", "json", false, nullptr, nullptr },
     { "sprites", "blend", "enum", false, "\"add\"", "add over" },
     { "sprites", "sheet", "json", false, nullptr, nullptr },
