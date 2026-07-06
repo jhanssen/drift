@@ -367,14 +367,15 @@ public:
     // Input port order — the loader's port table must match.
     enum Port : size_t {
         PortRate, PortBurst, PortBurstCount, PortOrigin, PortExtent,
-        PortDirection, PortSpread, PortSpeed, PortLifetime, PortSize,
-        PortSpin, PortColorStart, PortColorEnd, PortFadeIn, PortSizeEnd,
-        PortGravity, PortDrag, PortTurbulence, PortTurbulenceScale,
+        PortEmitScale, PortDirection, PortSpread, PortSpeed, PortLifetime,
+        PortSize, PortSpin, PortColorStart, PortColorEnd, PortFadeIn,
+        PortFadeOut, PortSizeEnd, PortSizeWindow, PortGravity, PortDrag,
+        PortTurbulence, PortTurbulenceScale, PortTurbulenceMask,
         PortAttractor, PortAttract, PortVortex, PortDelay, PortDuration,
         PortRing, PortDepth, PortCollide, PortBounce, PortTintVary,
-        PortVelocityMin, PortVelocityMax, PortTwinkle, PortTwinkleRate,
-        PortPrewarm, PortSpawn, PortInherit, PortSpawnPrev, PortTime,
-        PortCount,
+        PortTintVaryMax, PortVelocityMin, PortVelocityMax, PortTwinkle,
+        PortTwinkleRate, PortPrewarm, PortSpawn, PortInherit, PortSpawnPrev,
+        PortTime, PortCount,
     };
     // §18.5.3 per-emitter override fields. Multi-emitter nodes carry
     // EfCount extra input ports per entry after PortCount, in this order —
@@ -402,6 +403,9 @@ public:
     // §18.5.2: binding velocityMin/velocityMax selects the axis-
     // independent spawn-velocity box over the direction/spread/speed cone.
     void setVelocityBox(bool on) { mVelocityBox = on; }
+    // §18.5.2: binding tintVaryMax switches tintVary to independent
+    // per-channel draws in the [tintVary, tintVaryMax] box.
+    void setTintBox(bool on) { mTintBox = on; }
 
 private:
     bool ensurePipeline(FrameContext& ctx);
@@ -412,6 +416,7 @@ private:
     const std::vector<uint32_t> mMasks;
     const uint32_t mSpawnCount; // §18.5.4: children per death; 0 = ring mode
     bool mVelocityBox = false;  // §18.5.2 spawn-velocity box vs cone
+    bool mTintBox = false;      // §18.5.2 per-channel tint box
     bool mPrewarmed = false;    // §18.5.2 prewarm ran (first evaluate)
     double mDtOverride = -1.0;  // ≥ 0 during prewarm sub-steps
     WgslInterface mIface; // built-in kernel reflection: the layout oracle
@@ -444,6 +449,7 @@ public:
     enum Port : size_t {
         PortParticles, PortTexture, PortFrameRate, PortParallax,
         PortFlutter, PortFlutterRate, PortStretch, PortFrameBlend,
+        PortAlign,
     };
     // sheetCols/Rows 0 = whole texture (no sheet).
     SpritesNode(Blend blend, uint32_t sheetCols, uint32_t sheetRows);

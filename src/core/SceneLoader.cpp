@@ -344,6 +344,7 @@ const PortDef kParticlesInputs[] = {
     { "burstCount", ValueType::Scalar, false, { 32 } },
     { "origin", ValueType::Vec2, false, { 0.5, 0.5 } },
     { "extent", ValueType::Vec2, false, { 0, 0 } },
+    { "emitScale", ValueType::Vec2, false, { 1, 1 } },
     { "direction", ValueType::Vec2, false, { 0, -1 } },
     { "spread", ValueType::Scalar, false, { 180 } },
     { "speed", ValueType::Vec2, false, { 0.05, 0.15 } },
@@ -353,11 +354,14 @@ const PortDef kParticlesInputs[] = {
     { "colorStart", ValueType::Vec4, false, { 1, 1, 1, 1 } },
     { "colorEnd", ValueType::Vec4, false, { 1, 1, 1, 0 } },
     { "fadeIn", ValueType::Scalar, false, { 0.1 } },
+    { "fadeOut", ValueType::Scalar, false, { 0 } },
     { "sizeEnd", ValueType::Scalar, false, { 1 } },
+    { "sizeWindow", ValueType::Vec2, false, { 0, 1 } },
     { "gravity", ValueType::Vec2, false, { 0, 0 } },
     { "drag", ValueType::Scalar, false, { 0 } },
     { "turbulence", ValueType::Scalar, false, { 0 } },
     { "turbulenceScale", ValueType::Scalar, false, { 4 } },
+    { "turbulenceMask", ValueType::Vec2, false, { 1, 1 } },
     { "attractor", ValueType::Vec2, false, { 0.5, 0.5 } },
     { "attract", ValueType::Scalar, false, { 0 } },
     { "vortex", ValueType::Scalar, false, { 0 } },
@@ -368,6 +372,7 @@ const PortDef kParticlesInputs[] = {
     { "collide", ValueType::Texture, false },
     { "bounce", ValueType::Scalar, false, { 0.5 } },
     { "tintVary", ValueType::Vec4, false, { 1, 1, 1, 1 } },
+    { "tintVaryMax", ValueType::Vec4, false, { 1, 1, 1, 1 } },
     { "velocityMin", ValueType::Vec2, false, { 0, 0 } },
     { "velocityMax", ValueType::Vec2, false, { 0, 0 } },
     { "twinkle", ValueType::Vec2, false, { 1, 1 } },
@@ -392,6 +397,7 @@ const PortDef kSpritesInputs[] = {
     { "flutterRate", ValueType::Scalar, false, { 1 } },
     { "stretch", ValueType::Vec2, false, { 1, 1 } },
     { "frameBlend", ValueType::Scalar, false, { 0 } },
+    { "align", ValueType::Scalar, false, { 0 } },
 };
 // Order must match TrailsNode::Port.
 const PortDef kTrailsInputs[] = {
@@ -2260,6 +2266,7 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
                                        std::move(masks), spawnCount);
         node->setVelocityBox(raw.inputs.count("velocityMin") ||
                              raw.inputs.count("velocityMax"));
+        node->setTintBox(raw.inputs.count("tintVaryMax"));
         return node;
     }
 

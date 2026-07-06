@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "name": "Cinders",
+  "description": "§18.5.2/§18.5.5 porting fidelity: cinders lift off a squashed ember ring on motion-aligned ellipses — X-only turbulence wander, boxed tint, hold-then-shrink, late fade.",
+  "parameters": {
+    "wind": { "type": "scalar", "default": 0.5, "min": 0, "max": 1.5,
+              "label": "Wind" }
+  },
+  "nodes": [
+    { "id": "gust", "type": "remap",
+      "inputs": { "value": "$wind", "inMin": 0, "inMax": 1.5,
+                  "outMin": 0, "outMax": 0.06 } },
+    { "id": "lift", "type": "combine",
+      "inputs": { "x": "@gust", "y": -0.055 } },
+
+    { "id": "cinders", "type": "particles", "capacity": 300,
+      "emitter": "disc",
+      "inputs": { "time": "@time.delta", "rate": 48, "prewarm": 5,
+                  "origin": [0.5, 0.78], "extent": [0.3, 0.24],
+                  "emitScale": [1, 0.32],
+                  "direction": [0, -1], "spread": 14,
+                  "speed": [0.02, 0.05], "lifetime": [2.5, 5],
+                  "size": [0.004, 0.009],
+                  "sizeEnd": 0.25, "sizeWindow": [0.55, 1],
+                  "gravity": "@lift", "drag": 0.2,
+                  "turbulence": 0.05, "turbulenceScale": 3,
+                  "turbulenceMask": [1, 0],
+                  "fadeIn": 0.2, "fadeOut": 0.8,
+                  "twinkle": [0.35, 1], "twinkleRate": [0.8, 3.2],
+                  "tintVary": [1.0, 0.75, 0.3, 0.75],
+                  "tintVaryMax": [1.0, 0.35, 0.1, 1],
+                  "colorStart": [1, 0.9, 0.6, 0.9],
+                  "colorEnd": [0.9, 0.3, 0.08, 0.4] } },
+
+    { "id": "sparks", "type": "sprites",
+      "inputs": { "particles": "@cinders", "stretch": [3.2, 1],
+                  "align": 1 } },
+
+    { "id": "out", "type": "output", "inputs": { "color": "@sparks" } }
+  ]
+}

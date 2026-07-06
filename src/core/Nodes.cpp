@@ -2123,7 +2123,9 @@ struct Params {
     tintVary: vec4f,
     velocityMin: vec2f, velocityMax: vec2f,
     twinkle: vec2f, twinkleRate: vec2f,
-    velocityBox: f32,
+    tintVaryMax: vec4f,
+    turbulenceMask: vec2f, sizeWindow: vec2f, emitScale: vec2f,
+    fadeOut: f32, velocityBox: f32, tintBox: f32,
 }
 
 // §18.5.3: one block per emitter; emission-time quantities come from the
@@ -2160,9 +2162,17 @@ fn rnd(n: u32, k: u32) -> f32 {
 
 // §18.5.2 tintVary: a constant per-particle tint, sampled once from the
 // seed — mix(white, tintVary, rand) — returned in premultiplied form so
-// it composes onto shade()'s output by plain multiplication.
+// it composes onto shade()'s output by plain multiplication. §18.5.2
+// tint box: binding tintVaryMax instead draws every channel (and alpha)
+// independently in [tintVary, tintVaryMax], decoupling color from alpha.
 fn tintOf(n: u32) -> vec4f {
-    let t = mix(vec4f(1.0), params.tintVary, rnd(n, 12u));
+    var t: vec4f;
+    if (params.tintBox > 0.5) {
+        t = mix(params.tintVary, params.tintVaryMax,
+                vec4f(rnd(n, 19u), rnd(n, 20u), rnd(n, 21u), rnd(n, 22u)));
+    } else {
+        t = mix(vec4f(1.0), params.tintVary, rnd(n, 12u));
+    }
     return vec4f(t.rgb * t.a, t.a);
 }
 
@@ -2180,13 +2190,18 @@ fn twinkleOf(n: u32, age: f32) -> f32 {
     return mix(params.twinkle.x, params.twinkle.y, 0.5 + 0.5 * sin(ph));
 }
 
-// Life curves: premultiplied tint (§18.3 contract) with the fade-in ramp.
+// Life curves: premultiplied tint (§18.3 contract) with the fade-in ramp
+// and the §18.5.2 fadeOut ramp over the last fadeOut seconds — together
+// they shape a trapezoid (or triangle) without touching the color ramp.
 fn shade(cs: vec4f, ce: vec4f, age: f32, lifetime: f32) -> vec4f {
     let t = age / lifetime;
     let c = mix(cs, ce, t);
     var a = c.a;
     if (params.fadeIn > 0.0) {
         a = a * clamp(age / params.fadeIn, 0.0, 1.0);
+    }
+    if (params.fadeOut > 0.0) {
+        a = a * clamp((lifetime - age) / params.fadeOut, 0.0, 1.0);
     }
     return vec4f(c.rgb * a, a);
 }
@@ -2229,7 +2244,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if (params.turbulence != 0.0) {
         let q = p.pos.xy * params.turbulenceScale;
         let phase = rnd(n, 8u) * 6.2831853;
-        v += params.turbulence *
+        // §18.5.2 turbulenceMask: per-axis wander weights — [1, 0] wobbles
+        // only horizontally, leaving the other axis to the deterministic
+        // forces.
+        v += params.turbulence * params.turbulenceMask *
              vec2f(sin(q.y * 6.2831853 + p.age + phase),
                    cos(q.x * 6.2831853 - p.age + phase)) * params.dt;
     }
@@ -2254,7 +2272,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // ranges come from the particle's own emitter (§18.5.3).
     let E = emitters[min(u32(p.emitter), 7u)];
     let emitSize = mix(E.size.x, E.size.y, rnd(n, 6u));
-    p.size = emitSize * mix(1.0, params.sizeEnd, t);
+    // §18.5.2 sizeWindow: the life-fraction window over which size runs
+    // 1 → sizeEnd; it holds at 1 before and at sizeEnd after. [0, 1] (the
+    // default) is the plain full-life ramp.
+    let ts = clamp((t - params.sizeWindow.x) /
+                       max(params.sizeWindow.y - params.sizeWindow.x, 1e-6),
+                   0.0, 1.0);
+    p.size = emitSize * mix(1.0, params.sizeEnd, ts);
     p.rotation += mix(E.spin.x, E.spin.y, rnd(n, 7u)) * params.dt;
     p.color = shade(E.colorStart, E.colorEnd, p.age, p.lifetime) *
               tintOf(u32(p.seed)) * twinkleOf(u32(p.seed), p.age);
@@ -2287,11 +2311,20 @@ const char* kParticleEmitRing = R"(
         var p: Particle;
         var origin = E.origin;
         let kind = u32(E.kind);
+        // §18.5.2 emitScale squashes the sampled shape offset per axis
+        // (elliptical discs and rings); [1, 1] is the shape as declared.
         if (kind == 1u) { // box
-            origin += (vec2f(rnd(n, 1u), rnd(n, 2u)) * 2.0 - 1.0) * E.extent;
-        } else if (kind == 2u) { // disc, area-uniform
+            origin += (vec2f(rnd(n, 1u), rnd(n, 2u)) * 2.0 - 1.0) * E.extent *
+                      params.emitScale;
+        } else if (kind == 2u) { // disc, area-uniform; extent.y > 0 hollows
+            // it into an annulus with that inner radius (§18.5.2)
             let ang = rnd(n, 1u) * 6.2831853;
-            origin += sqrt(rnd(n, 2u)) * E.extent.x * vec2f(cos(ang), sin(ang));
+            var rr = sqrt(rnd(n, 2u)) * E.extent.x;
+            if (E.extent.y > 0.0) {
+                rr = sqrt(mix(E.extent.y * E.extent.y,
+                              E.extent.x * E.extent.x, rnd(n, 2u)));
+            }
+            origin += rr * vec2f(cos(ang), sin(ang)) * params.emitScale;
         }
         let base = atan2(E.direction.y, E.direction.x);
         let theta = base + radians(E.spread) * (rnd(n, 3u) - 0.5);
@@ -2658,20 +2691,26 @@ void ParticlesNode::evaluate(FrameContext& ctx)
             v.v[0] = inputValue(PortInherit).v[0];
         } else if (field.name == "velocityBox") {
             v.v[0] = mVelocityBox ? 1.0 : 0.0;
+        } else if (field.name == "tintBox") {
+            v.v[0] = mTintBox ? 1.0 : 0.0;
         } else {
             // The kernel's port fields are named exactly like the input
             // ports; Port enum order matches the loader's table.
             static const std::map<std::string, Port> kByName = {
                 { "gravity", PortGravity }, { "attractor", PortAttractor },
-                { "fadeIn", PortFadeIn }, { "sizeEnd", PortSizeEnd },
+                { "fadeIn", PortFadeIn }, { "fadeOut", PortFadeOut },
+                { "sizeEnd", PortSizeEnd }, { "sizeWindow", PortSizeWindow },
                 { "drag", PortDrag }, { "turbulence", PortTurbulence },
                 { "turbulenceScale", PortTurbulenceScale },
+                { "turbulenceMask", PortTurbulenceMask },
                 { "attract", PortAttract }, { "vortex", PortVortex },
                 { "ring", PortRing }, { "tintVary", PortTintVary },
+                { "tintVaryMax", PortTintVaryMax },
                 { "velocityMin", PortVelocityMin },
                 { "velocityMax", PortVelocityMax },
                 { "twinkle", PortTwinkle },
                 { "twinkleRate", PortTwinkleRate },
+                { "emitScale", PortEmitScale },
             };
             v = inputValue(kByName.at(field.name));
         }
@@ -2868,8 +2907,9 @@ struct Particle {
 
 // misc = (aspect, frameRate, sheetCols, sheetRows); par = (parallax.xy,
 // stretch.xy — §18.5.5 stretch); flut = (flutter.xy amplitude, flutterRate
-// — §18.5.5 flutter, frameBlend — §18.5.5 frame cross-fade).
-struct Params { misc: vec4f, par: vec4f, flut: vec4f }
+// — §18.5.5 flutter, frameBlend — §18.5.5 frame cross-fade); extra =
+// (align — §18.5.5 velocity alignment, -, -, -).
+struct Params { misc: vec4f, par: vec4f, flut: vec4f, extra: vec4f }
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> pts: array<Particle>;
@@ -2905,14 +2945,29 @@ fn drift_sprite_vs(@builtin(vertex_index) v: u32,
     }
     let p = pts[slot];
     let corner = vec2f(f32(v & 1u), f32((v >> 1u) & 1u)) * 2.0 - 1.0;
-    let c = cos(radians(p.rotation));
-    let s = sin(radians(p.rotation));
     // size is a fraction of output height (§18.3); x corrects for aspect.
     // §18.5.5 stretch: a per-axis scale on the rotated quad, in output
     // space — axis-aligned on screen whatever the particle's rotation, so
     // elongated soft particles read as stretched, not randomly oriented.
-    let r = vec2f(c * corner.x - s * corner.y, s * corner.x + c * corner.y) *
-            p.size * params.par.zw;
+    // §18.5.5 align: the quad's +x follows the velocity direction instead
+    // of the particle's (random) rotation, and stretch moves into that
+    // frame — stretch.x elongates along the motion. The direction is
+    // aspect-corrected to match the space the quad is built in, so the
+    // on-screen orientation tracks the on-screen motion.
+    var r: vec2f;
+    let va = vec2f(p.vel.x * params.misc.x, p.vel.y);
+    let vl = dot(va, va);
+    if (params.extra.x > 0.5 && vl > 1e-12) {
+        let d = va / sqrt(vl);
+        let local = corner * params.par.zw;
+        r = vec2f(d.x * local.x - d.y * local.y,
+                  d.y * local.x + d.x * local.y) * p.size;
+    } else {
+        let c = cos(radians(p.rotation));
+        let s = sin(radians(p.rotation));
+        r = vec2f(c * corner.x - s * corner.y,
+                  s * corner.x + c * corner.y) * p.size * params.par.zw;
+    }
     // §18.5.5 parallax: a per-particle offset linear in z.
     // §18.5.5 flutter: deterministic per-axis sine sway about the
     // integrated path — a draw-time offset (no feedback into velocity or
@@ -3060,7 +3115,7 @@ bool SpritesNode::ensurePipeline(FrameContext& ctx)
     }
 
     wgpu::BufferDescriptor ud{};
-    ud.size = 48; // misc + par + flut vec4 rows
+    ud.size = 64; // misc + par + flut + extra vec4 rows
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     mUniforms = ctx.device.CreateBuffer(&ud);
     if (mTextured) {
@@ -3137,7 +3192,7 @@ void SpritesNode::evaluate(FrameContext& ctx)
         mHeight = height;
     }
 
-    const float uniforms[12] = {
+    const float uniforms[16] = {
         (float)width / (float)height,
         (float)inputValue(PortFrameRate).v[0],
         (float)mSheetCols,
@@ -3150,6 +3205,10 @@ void SpritesNode::evaluate(FrameContext& ctx)
         (float)inputValue(PortFlutter).v[1],
         (float)inputValue(PortFlutterRate).v[0],
         (float)inputValue(PortFrameBlend).v[0],
+        (float)inputValue(PortAlign).v[0],
+        0.0f,
+        0.0f,
+        0.0f,
     };
     ctx.device.GetQueue().WriteBuffer(mUniforms, 0, uniforms,
                                       sizeof(uniforms));
@@ -3215,7 +3274,7 @@ void SpritesNode::evaluate(FrameContext& ctx)
     }
 
     std::vector<wgpu::BindGroupEntry> entries;
-    entries.push_back(bufferEntry(0, mUniforms, 48));
+    entries.push_back(bufferEntry(0, mUniforms, 64));
     entries.push_back(bufferEntry(1, particles.buffer, poolSize));
     entries.push_back(bufferEntry(2, mIndices, (uint64_t)mPadded * 4));
     if (mTextured) {

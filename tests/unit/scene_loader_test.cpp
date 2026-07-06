@@ -1344,15 +1344,18 @@ TEST_CASE("particle growth: emitters, spawn, sheet, trails (§18.5)")
     r = scene(R"(
         { "id": "mask", "type": "shader", "shader": "shaders/minimal.wgsl",
           "inputs": { "phase": 0.5 } },
-        { "id": "p", "type": "particles",
+        { "id": "p", "type": "particles", "emitter": "disc",
           "inputs": { "time": "@time.delta", "delay": 1, "duration": 4,
                       "ring": 0.2, "depth": [0, 1], "collide": "@mask",
                       "bounce": 0.8, "twinkle": [0.2, 1],
-                      "twinkleRate": [0.8, 3.2] } },
+                      "twinkleRate": [0.8, 3.2], "fadeOut": 0.5,
+                      "sizeWindow": [0.5, 1], "turbulenceMask": [1, 0],
+                      "tintVaryMax": [1, 0.6, 0.3, 0.8],
+                      "extent": [0.2, 0.1], "emitScale": [1, 0.2] } },
         { "id": "s", "type": "sprites",
           "inputs": { "particles": "@p", "frameRate": 8,
                       "parallax": [0.1, 0], "stretch": [10, 1],
-                      "frameBlend": 1 } })");
+                      "frameBlend": 1, "align": 1 } })");
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());

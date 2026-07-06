@@ -1138,8 +1138,10 @@ pointer parallax, sorted `over` sprites),
 bursts, spritesheet twinkle, texture collision), and
 `examples/embers.sceneproject` (per-particle `twinkle`, feathered
 trail streaks, prewarm), `examples/haze.sceneproject` (non-uniform
-sprite `stretch`, slow flutter), and `examples/plume.sceneproject`
-(sheet `frameBlend` cross-fade).
+sprite `stretch`, slow flutter), `examples/plume.sceneproject`
+(sheet `frameBlend` cross-fade), and `examples/cinders.sceneproject`
+(velocity `align`, `turbulenceMask`, tint box, `fadeOut`/`sizeWindow`,
+squashed annulus emission).
 
 #### 18.5.1 Contract errata
 
@@ -1169,6 +1171,11 @@ New inputs on `particles` (all optional):
 | input | `collide`  | `texture` | —          | collision mask; alpha ≥ 0.5 is solid |
 | input | `bounce`   | `scalar`  | `0.5`      | restitution on collision, 0..1   |
 | input | `tintVary` | `vec4`    | `[1,1,1,1]`| per-particle constant tint: each particle holds `mix(white, tintVary, rand)` for life, multiplied onto the `colorStart`→`colorEnd` ramp (adopted 2026-07-05) |
+| input | `tintVaryMax` | `vec4` | `[1,1,1,1]`| binding it switches `tintVary` to independent per-channel draws in the box `[tintVary, tintVaryMax]` — decouples color channels and alpha (adopted 2026-07-05) |
+| input | `fadeOut`  | `scalar`  | `0`        | alpha ramp to 0 over the last `fadeOut` seconds; with `fadeIn` shapes a trapezoid or triangle (adopted 2026-07-05) |
+| input | `sizeWindow` | `vec2`  | `[0, 1]`   | life-fraction window over which size runs 1 → `sizeEnd`; holds outside it (adopted 2026-07-05) |
+| input | `turbulenceMask` | `vec2` | `[1, 1]` | per-axis turbulence weights; `[1, 0]` wanders only horizontally (adopted 2026-07-05) |
+| input | `emitScale` | `vec2`   | `[1, 1]`   | per-axis squash of the emitter-shape offset — elliptical discs and rings (adopted 2026-07-05) |
 | input | `velocityMin` | `vec2` | `[0, 0]`   | with `velocityMax`: binding either replaces the `direction`/`spread`/`speed` cone with an axis-independent uniform box (adopted 2026-07-05; node-level, not per-emitter) |
 | input | `velocityMax` | `vec2` | `[0, 0]`   | see `velocityMin`                |
 | input | `twinkle`  | `vec2`    | `[1, 1]`   | per-particle brightness oscillation range `[lo, hi]`, multiplied onto the color; `[1, 1]` = off (adopted 2026-07-05) |
@@ -1191,6 +1198,26 @@ New inputs on `particles` (all optional):
   (`spawn`-bound) nodes warm their clock but not their pool: the spawn
   feed's death history cannot advance within load.
 
+- **Tint box.** With only `tintVary` bound, per-particle tint is one
+  random draw along the white↔`tintVary` segment (all channels move
+  together). Binding `tintVaryMax` replaces that with four independent
+  draws — each RGB channel and alpha sampled uniformly in
+  `[tintVary, tintVaryMax]` — so hue can scatter while alpha stays
+  fixed, or alpha can vary on a constant color.
+- **Life-curve shaping.** `fadeOut` mirrors `fadeIn` at the end of
+  life: alpha ramps to 0 over the last `fadeOut` seconds, independent of
+  the `colorStart`→`colorEnd` alpha ramp. `sizeWindow` bounds the size
+  curve: size holds at the emitted value until the window opens, runs to
+  `sizeEnd ×` across it, and holds after — `[0.5, 1]` is "full size for
+  the first half of life, then shrink".
+- **Anisotropic turbulence and emission.** `turbulenceMask` weights the
+  turbulence wander per axis (`[1, 0]` wobbles only horizontally).
+  `emitScale` squashes the sampled emitter-shape offset per axis, making
+  discs and rings elliptical; it applies to `box` and `disc` shapes and
+  is node-level (all emitters share it). A `disc` emitter with
+  `extent: [outer, inner]`, `inner > 0`, hollows into an area-uniform
+  annulus — `extent.y` was previously unused for discs, so existing
+  documents are unaffected.
 - **Twinkle.** A per-particle brightness oscillation — the ember /
   starfield flicker. Each particle's multiplier swings sinusoidally
   across `[twinkle.x, twinkle.y]` at a rate drawn once from
@@ -1304,6 +1331,7 @@ New surface on `sprites`:
 | input    | `flutterRate` | `scalar` | `1`    | flutter cycles per second        |
 | input    | `stretch`   | `vec2`   | `[1, 1]` | non-uniform sprite scale, output space (adopted 2026-07-05) |
 | input    | `frameBlend` | `scalar` | `0`     | cross-fade between adjacent sheet frames, 0–1 (adopted 2026-07-05) |
+| input    | `align`     | `scalar` | `0`      | > 0: orient each sprite to its velocity; `stretch` then elongates along the motion (adopted 2026-07-05) |
 
 - **Flutter.** A deterministic per-axis sine offset about the integrated
   path, phase-decorrelated per particle and per axis from `seed` — the
@@ -1323,6 +1351,12 @@ New surface on `sprites`:
   `frameRate > 0` it advances at that rate and loops, starting on a
   per-particle random frame (hashed from `seed`) so pools don't strobe
   in sync.
+- **Align.** With `align > 0` the sprite's +x axis follows its
+  on-screen velocity direction instead of the particle's rotation (and
+  `spin` is ignored). `stretch` moves into that frame: `stretch.x`
+  elongates along the motion, so a stretched soft disc reads as a
+  motion-oriented ellipse — the middle-bulging streak. A momentarily
+  stationary particle keeps its unaligned orientation.
 - **Frame cross-fade.** By default sheet playback snaps to the nearest
   frame, which visibly steps on low-frame-count sheets. With
   `frameBlend > 0` the fractional frame position linearly blends the
