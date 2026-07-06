@@ -21,8 +21,11 @@ namespace drift::web {
 // already be resolved and confined by the caller. Returns nullptr with
 // error set when the file cannot be read or demuxed; a codec the browser
 // cannot decode surfaces asynchronously as one black frame plus a console
-// error (the load itself cannot await the probe).
+// error (the load itself cannot await the probe). device receives decoded
+// frames via copyExternalImageToTexture (GPU color conversion, no CPU
+// pixel round-trip); the canvas capture path remains as the fallback.
 std::unique_ptr<core::VideoDecoder> createVideoDecoder(
-    const std::string& absPath, bool loop, std::string& error);
+    const std::string& absPath, bool loop, const wgpu::Device& device,
+    std::string& error);
 
 } // namespace drift::web

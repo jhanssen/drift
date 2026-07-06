@@ -169,9 +169,41 @@ EM_JS(int, wcPoll, (int id, double seconds, uint32_t* dims), {
   return 1;
 });
 
+// GPU capture: hand the pending frame to WebGPU directly —
+// copyExternalImageToTexture performs the YUV matrix/range conversion on
+// the GPU, so no pixels round-trip through the CPU. On failure the frame
+// stays pending so the canvas path below can retake it. meta[0] = last
+// frame of a non-looping stream. queue/tex are WGPU handles; EM_JS shares
+// module scope with emdawnwebgpu's table, so getJsObject resolves them.
+EM_JS(int, wcCaptureGpu, (int id, void* queue, void* tex, int w, int h,
+                          uint32_t* meta), {
+  const state = Module.driftWc?.map.get(id);
+  const frame = state?.pending;
+  if (!frame) {
+    return 0;
+  }
+  try {
+    WebGPU.getJsObject(queue).copyExternalImageToTexture(
+        { source: frame },
+        { texture: WebGPU.getJsObject(tex), colorSpace: 'srgb' },
+        [w, h]);
+  } catch (e) {
+    console.warn(`drift: video: GPU frame import failed, ` +
+                 `falling back to canvas capture: ${e.message}`);
+    return 0;
+  }
+  state.pending = null;
+  const last = !state.loop &&
+      Math.abs(frame.timestamp / 1e6 - state.lastPts) < 1e-3;
+  frame.close();
+  HEAPU32[meta >> 2] = last ? 1 : 0;
+  return 1;
+});
+
 // Converts the pending frame to sRGB RGBA via canvas (drawImage handles the
 // YUV matrix/range) and releases it. meta[0] = last frame of a non-looping
-// stream.
+// stream. Fallback for browsers whose copyExternalImageToTexture cannot
+// take a VideoFrame source.
 EM_JS(int, wcCapture, (int id, uint8_t* out, int w, int h, uint32_t* meta), {
   const state = Module.driftWc?.map.get(id);
   const frame = state?.pending;
@@ -233,8 +265,10 @@ EM_JS(void, wcClose, (int id), {
 class VideoDecoderWebCodecs final : public drift::core::VideoDecoder {
 public:
     VideoDecoderWebCodecs(std::vector<uint8_t> file,
-                          drift::core::Mp4Track track, bool loop)
-        : mFile(std::move(file)), mTrack(std::move(track))
+                          drift::core::Mp4Track track, bool loop,
+                          wgpu::Device device)
+        : mFile(std::move(file)), mTrack(std::move(track)),
+          mDevice(std::move(device))
     {
         mOffsets.reserve(mTrack.samples.size());
         mSizes.reserve(mTrack.samples.size());
@@ -280,8 +314,35 @@ public:
         if (status == 0 || dims[0] == 0 || dims[1] == 0) {
             return mFrame.index >= 0 ? &mFrame : nullptr;
         }
-        mFrame.rgba.resize(size_t{dims[0]} * dims[1] * 4);
         uint32_t meta[1] = { 0 };
+        if (mGpu) {
+            if (!mTexture || dims[0] != mFrame.width ||
+                dims[1] != mFrame.height) {
+                wgpu::TextureDescriptor desc{};
+                // sRGB, like the CPU path's upload texture; RenderAttachment
+                // is required of copyExternalImageToTexture destinations.
+                desc.format = wgpu::TextureFormat::RGBA8UnormSrgb;
+                desc.size = { dims[0], dims[1], 1 };
+                desc.usage = wgpu::TextureUsage::TextureBinding |
+                             wgpu::TextureUsage::CopyDst |
+                             wgpu::TextureUsage::RenderAttachment;
+                mTexture = mDevice.CreateTexture(&desc);
+            }
+            if (wcCaptureGpu(mId, mDevice.GetQueue().Get(), mTexture.Get(),
+                             (int)dims[0], (int)dims[1], meta) > 0) {
+                mFrame.texture = mTexture;
+                mFrame.width = dims[0];
+                mFrame.height = dims[1];
+                mFrame.index = ++mIndex;
+                mFrame.last = meta[0] != 0;
+                return &mFrame;
+            }
+            // The frame is still pending; take it over the canvas instead.
+            mGpu = false;
+            mTexture = nullptr;
+            mFrame.texture = nullptr;
+        }
+        mFrame.rgba.resize(size_t{dims[0]} * dims[1] * 4);
         if (wcCapture(mId, mFrame.rgba.data(), (int)dims[0], (int)dims[1],
                       meta) <= 0) {
             return mFrame.index >= 0 ? &mFrame : nullptr;
@@ -308,6 +369,9 @@ private:
     std::vector<double> mPts;
     std::vector<uint8_t> mKeys;
     drift::core::VideoFrame mFrame;
+    wgpu::Device mDevice;
+    wgpu::Texture mTexture; // GPU capture target (frames land here)
+    bool mGpu = true;       // one failed GPU capture reverts to canvas
     int64_t mIndex = 0;
     int mId = 0;
 };
@@ -317,7 +381,8 @@ private:
 namespace drift::web {
 
 std::unique_ptr<core::VideoDecoder> createVideoDecoder(
-    const std::string& absPath, bool loop, std::string& error)
+    const std::string& absPath, bool loop, const wgpu::Device& device,
+    std::string& error)
 {
     std::ifstream in(absPath, std::ios::binary);
     if (!in) {
@@ -334,7 +399,8 @@ std::unique_ptr<core::VideoDecoder> createVideoDecoder(
         return nullptr;
     }
     return std::make_unique<VideoDecoderWebCodecs>(std::move(file),
-                                                   std::move(track), loop);
+                                                   std::move(track), loop,
+                                                   device);
 }
 
 } // namespace drift::web

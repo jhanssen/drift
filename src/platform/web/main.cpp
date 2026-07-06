@@ -99,15 +99,16 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
         return true;
     };
 
-    auto videoFactory = [confined](const std::string& relPath, bool loop,
-                                   std::string& error)
+    auto videoFactory = [confined, device](const std::string& relPath,
+                                           bool loop, std::string& error)
         -> std::unique_ptr<drift::core::VideoDecoder> {
         fs::path full;
         if (!confined(relPath, full)) {
             error = "path escapes the project root";
             return nullptr;
         }
-        return drift::web::createVideoDecoder(full.string(), loop, error);
+        return drift::web::createVideoDecoder(full.string(), loop, device,
+                                              error);
     };
 
     std::string sceneJson;

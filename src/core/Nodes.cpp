@@ -1088,6 +1088,20 @@ void VideoNode::evaluate(FrameContext& ctx)
         return; // already uploaded/imported this frame
     }
 
+    // GPU-path decoder (WebCodecs copyExternalImageToTexture): the frame
+    // already lives in a texture; sample it directly.
+    if (frame->texture) {
+        mLastIndex = frame->index;
+        Value out{};
+        out.type = ValueType::Texture;
+        out.texture = frame->texture;
+        out.texWidth = frame->width;
+        out.texHeight = frame->height;
+        outputs[0].value = out;
+        outputs[0].dirty = true;
+        return;
+    }
+
 #ifndef __EMSCRIPTEN__
     if (frame->planes.size() == 2) {
         if (evaluateZeroCopy(ctx, *frame)) {

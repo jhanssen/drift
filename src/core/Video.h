@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include <webgpu/webgpu_cpp.h>
+
 namespace drift::core {
 
 // One dmabuf plane of a zero-copy frame (Y or UV for NV12), described with
@@ -26,6 +28,11 @@ struct VideoPlane {
 struct VideoFrame {
     // CPU path: tightly packed RGBA, width*4 stride, sRGB, opaque.
     std::vector<uint8_t> rgba;
+    // GPU path (rgba and planes empty): the decoder already produced the
+    // frame in this texture (sRGB RGBA, opaque, TextureBinding usage).
+    // The contents stay valid until the next frameAt call; the consumer
+    // samples it directly instead of uploading.
+    wgpu::Texture texture;
     // Zero-copy path (rgba empty): dmabuf planes (Y then UV) of a decoder
     // surface. surfaceId is stable across the decoder's surface pool, so
     // consumers can cache their imports; the fds stay valid until the next
