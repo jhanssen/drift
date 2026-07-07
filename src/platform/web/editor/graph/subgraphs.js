@@ -39,7 +39,7 @@ export function enterSubgraph(path, viaInstance) {
   updateGraphChrome();
 }
 
-export function leaveSubgraph() {
+function leaveSubgraph() {
   viewStack.pop();
   setSelectedNodeId(null);
   selectedIds.clear();
@@ -51,7 +51,7 @@ export function leaveSubgraph() {
 // Writes a project file everywhere: the preview's MEMFS and, when a live
 // runtime is attached, its project directory (the write-asset verb).
 // Returns the live error, if any.
-export async function writeProjectFile(path, contents) {
+async function writeProjectFile(path, contents) {
   wasm?.writeAsset(projectRoot(), path, contents);
   projectWriteThrough(path, contents);
   graphDocs.delete(path);

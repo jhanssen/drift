@@ -2,6 +2,7 @@ import { wasm, wasmManifest } from './preview.js';
 import { live, liveManifest, liveSend } from './live.js';
 import { sceneSource } from './document.js';
 import { project, projectRoot, projectWriteThrough } from './project.js';
+import { TYPE_ARITY } from './nodedefs.js';
 import { refreshGraph } from './graph/build.js';
 import { refreshTimeline } from './timeline.js';
 
@@ -138,7 +139,7 @@ function buildWidget(param) {
       },
     });
   } else {
-    const arity = { vec2: 2, vec3: 3, vec4: 4 }[param.type] ?? values.length;
+    const arity = TYPE_ARITY[param.type] ?? values.length;
     const inputs = [];
     for (let i = 0; i < arity; ++i) {
       const input = document.createElement('input');

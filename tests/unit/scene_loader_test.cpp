@@ -4,6 +4,9 @@
 
 #include <ktx.h>
 
+#include <glaze/glaze.hpp>
+
+#include "core/NodeProps.h"
 #include "core/Scene.h"
 
 // Scene::load validation tests (SCENE_FORMAT.md §13). Load never touches the
@@ -2127,4 +2130,51 @@ TEST_CASE("fireEvent resolves event outputs by name")
     CHECK_FALSE(r.scene->fireEvent("seq", "nope"));
     CHECK_FALSE(r.scene->fireEvent("v", "result")); // texture, not event
     CHECK_FALSE(r.scene->fireEvent("ghost", "cue"));
+}
+
+TEST_CASE("nodePortsJson covers every node type and stays valid JSON")
+{
+    const std::string json = drift::core::nodePortsJson();
+    glz::generic doc;
+    REQUIRE(!glz::read_json(doc, json));
+    REQUIRE(doc.is_object());
+    const auto& types = doc.get_object();
+    // Every §9 type appears — a new node type must be added to
+    // nodePortsJson's entry table or editors silently lose its pins.
+    for (const char* type : drift::core::kNodeTypes) {
+        CAPTURE(type);
+        CHECK(types.contains(type));
+    }
+    // The implicit singletons (§9.7–9.8) ride along, marked as such.
+    REQUIRE(types.contains("time"));
+    CHECK(types.at("time").get_object().contains("implicit"));
+    REQUIRE(types.contains("mouse"));
+    // Hidden loader-injected ports never surface to editors.
+    const auto& particles = types.at("particles").get_object();
+    REQUIRE(particles.contains("inputs"));
+    bool sawRate = false;
+    for (const auto& port : particles.at("inputs").get_array()) {
+        const auto& name = port.get_object().at("name").get_string();
+        CHECK(name != "spawnPrev");
+        sawRate = sawRate || name == "rate";
+    }
+    CHECK(sawRate);
+}
+
+TEST_CASE("binding the hidden spawnPrev port is rejected")
+{
+    auto r = load(R"({
+        "version": 1, "name": "Hidden",
+        "nodes": [
+            { "id": "src", "type": "particles",
+              "inputs": { "time": "@time.delta" } },
+            { "id": "p", "type": "particles",
+              "inputs": { "time": "@time.delta", "spawn": "@src",
+                          "spawnPrev": "@src" } },
+            { "id": "s", "type": "sprites", "inputs": { "particles": "@p" } },
+            { "id": "out", "type": "output", "inputs": { "color": "@s" } }
+        ]
+    })");
+    REQUIRE(r.scene == nullptr);
+    CHECK(r.joined().find("loader-injected") != std::string::npos);
 }

@@ -5,8 +5,7 @@
 import { wasm } from '../preview.js';
 import { sceneSource } from '../document.js';
 import { G } from '../nodedefs.js';
-
-const graphCanvas = document.getElementById('graphCanvas');
+import { graphCanvas } from './canvas.js';
 
 // Drill-in navigation state (§19.5).
 export const viewStack = []; // { path, doc, viaInstance }; mutated in place
@@ -23,7 +22,6 @@ export function setGraphNeedsFit(value) { graphNeedsFit = value; }
 export const graphView = { x: 0, y: 0, scale: 1 }; // screen = (world + x/y) · scale
 export let graphDrag = null; // { kind: 'node'|'pan', ... }
 export let wireDrag = null;  // { seek: 'in'|'out', from?, to?, detach?, cursor }
-export let pinPress = null;  // in-pin mousedown; a no-move release edits the value
 
 export const graphWorldOf = (clientX, clientY) => {
   const rect = graphCanvas.getBoundingClientRect();
@@ -33,7 +31,6 @@ export const graphWorldOf = (clientX, clientY) => {
 
 export function setGraphDrag(value) { graphDrag = value; }
 export function setWireDrag(value) { wireDrag = value; }
-export function setPinPress(value) { pinPress = value; }
 
 // Drill-in navigation (§19.5): the canvas edits the top of the stack (the
 // state at the top of this module); an empty stack is the scene document

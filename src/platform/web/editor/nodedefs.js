@@ -7,8 +7,9 @@ import { wasm } from './preview.js';
 // Port tables come from the runtime too (drift_node_ports ← the loader's
 // own PortDef tables in SceneLoader.cpp), so a port added engine-side
 // appears here without an editor edit. Inputs convert to
-// [name, category, isArray, default] and outputs to [name, category] in
-// §9 declaration order (the first output is the default). Types whose
+// [name, category, isArray, default, required] and outputs to
+// [name, category], both in §9 declaration order (the first output is
+// the default). Types whose
 // ports are reflected or dynamic (shader/compute WGSL, §19.2 graph
 // interfaces, sequence tracks) have no static entry — the editor resolves
 // those from the document. Without a preview runtime the accessors return
@@ -16,23 +17,25 @@ import { wasm } from './preview.js';
 let nodePortsCache = null;
 function nodePorts() {
   if (!nodePortsCache && wasm) {
+    // A failure sticks as empty tables: one loud console line instead of
+    // re-marshalling the JSON out of the wasm heap on every accessor call.
+    const cache = { inputs: {}, outputs: {}, implicit: {} };
     try {
       const decls = JSON.parse(wasm.nodePorts());
-      nodePortsCache = { inputs: {}, outputs: {}, implicit: {} };
       for (const [type, decl] of Object.entries(decls)) {
         if (decl.inputs) {
-          nodePortsCache.inputs[type] =
-              decl.inputs.map((p) => [p.name, p.type, !!p.array, p.default]);
+          cache.inputs[type] = decl.inputs.map(
+              (p) => [p.name, p.type, !!p.array, p.default, !!p.required]);
         }
         if (decl.outputs) {
-          (decl.implicit ? nodePortsCache.implicit
-                         : nodePortsCache.outputs)[type] =
+          (decl.implicit ? cache.implicit : cache.outputs)[type] =
               decl.outputs.map((p) => [p.name, p.type]);
         }
       }
-    } catch {
-      nodePortsCache = null;
+    } catch (err) {
+      console.log(`editor: node ports: ${err}`);
     }
+    nodePortsCache = cache;
   }
   return nodePortsCache;
 }
@@ -53,32 +56,50 @@ export function nodePropDefs(type) {
     return [];
   }
 }
+export const TYPE_ARITY = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 };
+
 export const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c56d',
                        buffer: '#b48ade' };
 export const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
 
 // Node types the palette offers ('output' is exactly-one per scene, §9.6).
-// Defaults keep a fresh node valid where possible (wave/sequence tick along
-// immediately); nodes with required texture ports (transform, output-like)
-// stay a draft until wired — that is the expected add-then-wire flow.
 export const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'particles',
                       'sprites', 'trails', 'transform', 'fit', 'compositor',
                       'sequence', 'wave', 'noise', 'damp', 'remap', 'add',
                       'multiply', 'mix', 'clamp', 'edge', 'combine', 'split',
                       'parameter'];
-export const NODE_DEFAULT_INPUTS = {
+
+// Creation-time input policy beyond mere validity: sources that should
+// tick immediately wire to the clock, and a few defaults read better than
+// zero. Everything else needed to keep a fresh node valid is derived from
+// the port table below, so a required port added engine-side never leaves
+// the palette creating drafts.
+const NODE_DEFAULT_INPUTS = {
   particles: { time: '@time.delta' },
   wave: { input: '@time.seconds' },
   noise: { input: '@time.seconds' },
-  damp: { value: 0, time: '@time.delta' },
+  damp: { time: '@time.delta' },
   sequence: { time: '@time.seconds' },
-  remap: { value: 0 },
-  add: { a: 0 },
-  multiply: { a: 0 },
-  mix: { a: 0, b: 1 },
-  clamp: { value: 0 },
-  edge: { value: 0 },
-  combine: { x: 0, y: 0 },
+  mix: { b: 1 },
   split: { value: [0, 0] },
-  compositor: { layers: [] },
+  combine: { x: 0, y: 0 },
 };
+
+// The inputs a freshly created node starts with: the policy table plus
+// zero/empty fills for the remaining required value/array ports (§13).
+// Required texture/event/buffer pins stay unwired — that is the expected
+// add-then-wire flow.
+export function defaultInputsFor(type) {
+  const inputs = structuredClone(NODE_DEFAULT_INPUTS[type] ?? {});
+  for (const [name, category, isArray, , required] of nodeInputs(type) ?? []) {
+    if (!required || inputs[name] !== undefined) {
+      continue;
+    }
+    if (isArray) {
+      inputs[name] = [];
+    } else if (category === 'value') {
+      inputs[name] = 0;
+    }
+  }
+  return Object.keys(inputs).length ? inputs : null;
+}

@@ -1,5 +1,6 @@
-// UI primitives shared by every panel: the anchored quick form and the
-// status-line spans.
+// UI primitives shared by every panel: the anchored quick form, the
+// status-line spans, and the §3 identifier validator every naming dialog
+// applies.
 
 // ---- quick form (inline prompt() replacement) -------------------------------
 
@@ -107,3 +108,5 @@ export function setStatus(id, text, cls) {
   el.textContent = text;
   el.className = cls || '';
 }
+
+export const isIdentifier = (name) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);

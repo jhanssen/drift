@@ -1,22 +1,23 @@
 // ---- graph view: pan/zoom, node dragging, add/delete, asset drag-drop ------
 
+let pinPress = null; // in-pin mousedown; a no-move release edits the value
+
 import { wasm, Module } from '../preview.js';
-import { openQuickForm } from '../ui.js';
+import { openQuickForm, isIdentifier } from '../ui.js';
 import { sceneSource, pushFromGraph } from '../document.js';
 import { project, projectRoot, projectWriteThrough } from '../project.js';
-import { G, NODE_PALETTE, NODE_DEFAULT_INPUTS,
+import { G, NODE_PALETTE, TYPE_ARITY, defaultInputsFor,
          nodePropDefs } from '../nodedefs.js';
 import { graph, graphView, graphDrag, setGraphDrag, wireDrag, setWireDrag,
-         pinPress, setPinPress, selectedIds, setSelectedIds, selectedNodeId,
-         setSelectedNodeId, activeDoc, inSubgraph, graphWorldOf, pinAt,
-         setGraphStatus, updateGraphChrome } from './state.js';
+         selectedIds, setSelectedIds, selectedNodeId, setSelectedNodeId,
+         activeDoc, inSubgraph, graphWorldOf, pinAt, setGraphStatus,
+         updateGraphChrome } from './state.js';
 import { parseConnection } from './model.js';
+import { graphCanvas } from './canvas.js';
 import { startWireDrag, applyWireDrop, openPinEditor,
          unbindPort } from './wiring.js';
 import { enterSubgraph } from './subgraphs.js';
 import { renderInspector } from './inspector.js';
-
-const graphCanvas = document.getElementById('graphCanvas');
 
 export function fitGraphView() {
   const cw = graphCanvas.clientWidth, ch = graphCanvas.clientHeight;
@@ -40,8 +41,8 @@ graphCanvas.onmousedown = (e) => {
   const { x: wx, y: wy } = graphWorldOf(e.clientX, e.clientY);
   const pin = pinAt(wx, wy);
   if (pin) {
-    setPinPress(pin.side === 'in' ? { pin, cx: e.clientX, cy: e.clientY }
-                                  : null);
+    pinPress = pin.side === 'in' ? { pin, cx: e.clientX, cy: e.clientY }
+                                 : null;
     setWireDrag(startWireDrag(pin));
     if (wireDrag) {
       wireDrag.cursor = { x: wx, y: wy };
@@ -112,7 +113,7 @@ window.addEventListener('mousemove', (e) => {
 window.addEventListener('mouseup', (e) => {
   if (pinPress) {
     const press = pinPress;
-    setPinPress(null);
+    pinPress = null;
     if (wireDrag &&
         Math.hypot(e.clientX - press.cx, e.clientY - press.cy) < 4) {
       // A click, not a drag: edit the pin's value in place.
@@ -190,13 +191,13 @@ function addParameter(anchor) {
     { note: 'min/max bound the panel control (scalars); vector defaults ' +
             'are "x, y…"' },
   ], (v) => {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+    if (!isIdentifier(v.name)) {
       return 'name must be an identifier (§3)';
     }
     if (sceneSource.parameters?.[v.name]) {
       return `parameter '${v.name}' already exists`;
     }
-    const arity = { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[v.type];
+    const arity = TYPE_ARITY[v.type];
     const def = parseParamValue(v.default, arity);
     if (def === undefined) {
       return `default: expected ${arity} number(s)`;
@@ -255,7 +256,7 @@ function addNodeOfType(type, anchor, graphPath) {
       : type;
   fields.push({ key: 'id', label: 'id', value: freeNodeId(baseId) });
   openQuickForm(anchor, `add ${graphPath ?? type}`, fields, (v) => {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.id) || v.id === 'time' ||
+    if (!isIdentifier(v.id) || v.id === 'time' ||
         v.id === 'mouse' || doc.nodes.some((n) => n.id === v.id)) {
       return 'invalid, reserved, or duplicate id (§3)';
     }
@@ -294,8 +295,9 @@ function addNodeOfType(type, anchor, graphPath) {
       node.tracks = [{ name: 'level', kind: 'value', type: 'scalar',
                        interpolate: 'linear', keys: [{ t: 0, value: 0 }] }];
     }
-    if (NODE_DEFAULT_INPUTS[type]) {
-      node.inputs = structuredClone(NODE_DEFAULT_INPUTS[type]);
+    const defaults = defaultInputsFor(type);
+    if (defaults) {
+      node.inputs = defaults;
     }
     doc.nodes.push(node);
     placeAtViewCenter(v.id);

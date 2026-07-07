@@ -1,9 +1,8 @@
-import { openQuickForm } from '../ui.js';
+import { openQuickForm, isIdentifier } from '../ui.js';
 import { sceneSource, pushFromGraph } from '../document.js';
 import { activeDoc, inSubgraph, graph, setGraphStatus } from './state.js';
 import { parseConnection, refFor, specInputsOf, typeCategory } from './model.js';
-
-const graphCanvas = document.getElementById('graphCanvas');
+import { graphCanvas } from './canvas.js';
 
 // ---- graph view: wiring edits (§16.1: the graph owns *what*) ---------------
 
@@ -95,7 +94,7 @@ export function unbindPort(nodeId, inputs, name) {
   }
 }
 
-export function writeInput(node, entry, rawValue) {
+function writeInput(node, entry, rawValue) {
   const inputs = (node.source.inputs ??= {});
   if (entry.append) {
     (inputs[entry.append] ??= []).push(rawValue);
@@ -110,7 +109,7 @@ export function writeInput(node, entry, rawValue) {
   }
 }
 
-export function removeInput(node, entry) {
+function removeInput(node, entry) {
   const inputs = node.source.inputs;
   if (!inputs) {
     return;
@@ -307,7 +306,7 @@ function applyBindDrop(drag, pin) {
                   'buffer'],
         value: guess },
     ], (v) => {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+      if (!isIdentifier(v.name)) {
         return 'name must be an identifier (§3)';
       }
       if (doc.inputs?.[v.name]) {
@@ -367,7 +366,7 @@ function applyExportDrop(drag, pin) {
                   'new interface output', [
       { key: 'name', label: 'name', value: target.output[0] },
     ], (v) => {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+      if (!isIdentifier(v.name)) {
         return 'name must be an identifier (§3)';
       }
       if (doc.outputs?.[v.name]) {

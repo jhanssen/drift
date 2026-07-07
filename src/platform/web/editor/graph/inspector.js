@@ -1,6 +1,6 @@
 import { openQuickForm } from '../ui.js';
 import { pushFromGraph } from '../document.js';
-import { nodePropDefs } from '../nodedefs.js';
+import { nodePropDefs, TYPE_ARITY } from '../nodedefs.js';
 import { activeSequenceId, setActiveSequenceId,
          refreshTimeline } from '../timeline.js';
 import { graph, selectedNodeId } from './state.js';
@@ -86,8 +86,7 @@ export function renderInspector() {
     edit.style.marginTop = '10px';
     edit.onclick = (e) => {
       const decl = node.decl;
-      const arity =
-          { scalar: 1, vec2: 2, vec3: 3, vec4: 4 }[decl.type] ?? 1;
+      const arity = TYPE_ARITY[decl.type] ?? 1;
       const fields = [
         { key: 'default', label: 'default',
           value: Array.isArray(decl.default) ? decl.default.join(', ')

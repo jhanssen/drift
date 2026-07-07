@@ -4,8 +4,7 @@ import { graph, graphView, selectedNodeId, selectedIds, graphDraftIds,
          graphStatusText, graphNeedsFit, setGraphNeedsFit, wireDrag,
          pinY, inputPinPos, outputPinPos } from './state.js';
 import { fitGraphView } from './interact.js';
-
-const graphCanvas = document.getElementById('graphCanvas');
+import { graphCanvas } from './canvas.js';
 
 // ---- graph view: drawing ---------------------------------------------------
 

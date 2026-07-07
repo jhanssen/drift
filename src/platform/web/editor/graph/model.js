@@ -86,10 +86,10 @@ export function specInputsOf(source, base = activeDocRoot()) {
   return nodeInputs(source.type);
 }
 
-export const reflectCategory = (p) =>
+const reflectCategory = (p) =>
     p.type === 'texture' ? 'texture' : p.type === 'buffer' ? 'buffer' : 'value';
 
-export function reflectPorts(source, dir, base = activeDocRoot()) {
+function reflectPorts(source, dir, base = activeDocRoot()) {
   if (!wasm || typeof source.shader !== 'string') {
     return null;
   }

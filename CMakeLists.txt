@@ -112,18 +112,23 @@ if(EMSCRIPTEN)
     # propagate without relinking drift_web.
     file(GLOB_RECURSE DRIFT_EDITOR_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/platform/web/editor/*")
+    # Both OUTPUTs so a deleted build-dir module tree re-triggers the copy;
+    # the rm -rf prunes files that a source rename would otherwise strand.
     add_custom_command(
         OUTPUT "${CMAKE_BINARY_DIR}/editor.html"
+               "${CMAKE_BINARY_DIR}/editor/main.js"
         COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html"
             "${CMAKE_BINARY_DIR}/editor.html"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/editor"
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/src/platform/web/editor"
             "${CMAKE_BINARY_DIR}/editor"
         DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html"
                 ${DRIFT_EDITOR_SOURCES})
     add_custom_target(drift_editor ALL
-        DEPENDS "${CMAKE_BINARY_DIR}/editor.html")
+        DEPENDS "${CMAKE_BINARY_DIR}/editor.html"
+                "${CMAKE_BINARY_DIR}/editor/main.js")
     return()
 endif()
 
@@ -185,7 +190,8 @@ if(BUILD_TESTING)
         tests/unit/value_nodes_test.cpp
         src/platform/linux/WsCodec.cpp
     )
-    target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest ktx)
+    target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest
+                                              glaze::glaze ktx)
     # mp4_demux_test parses committed fixtures instead of embedding bytes.
     target_compile_definitions(drift_tests
         PRIVATE DRIFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

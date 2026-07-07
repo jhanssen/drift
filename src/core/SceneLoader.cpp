@@ -6,6 +6,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include "Json.h"
 #include "NodeProps.h"
 #include "Nodes.h"
 #include "Scene.h"
@@ -452,6 +453,10 @@ struct OutputPortDef {
 };
 
 // name -> output port index per node type; index 0 is the default output.
+// A NEW node type that produces textures/events/buffers must be added to
+// the category branches below — the silent default is 'value', and a wrong
+// category makes editors refuse legitimate wires (the loader itself never
+// reads it, so nothing else would catch the omission).
 std::vector<OutputPortDef> outputPortsFor(const std::string& type)
 {
     if (type == "time") return { { "seconds", 0 }, { "delta", 1 } };
@@ -823,7 +828,15 @@ bool Loader::parseRawNode(const glz::generic& entry, RawNode& raw,
         }
         // §18.5.4: death detection compares the spawn source against
         // its previous tick — wire the hidden feedback edge here so
-        // the history machinery (§10) picks it up.
+        // the history machinery (§10) picks it up. Hidden ports belong
+        // to the loader: a document binding one directly would either be
+        // silently clobbered by the injection below or skip its
+        // validation, so refuse it outright.
+        if (raw.inputs.count("spawnPrev")) {
+            fail("node '" + raw.id + "': 'spawnPrev' is loader-injected "
+                 "(§18.5.4) — bind 'spawn' instead");
+            return false;
+        }
         if (auto spIt = raw.inputs.find("spawn"); spIt != raw.inputs.end()) {
             if (spIt->second.kind != RawInput::Kind::Conn ||
                 spIt->second.conn.previous) {
@@ -2960,11 +2973,6 @@ std::string nodePortsJson()
         if (t == ValueType::Buffer) return "buffer";
         return "value"; // scalar, vectors, and the kPoly sentinel
     };
-    const auto number = [](double v) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%g", v);
-        return std::string(buf);
-    };
     std::string json = "{";
     for (const auto& e : kEntries) {
         if (json.size() > 1) {
@@ -2986,7 +2994,8 @@ std::string nodePortsJson()
                     continue;
                 }
                 json += std::string(firstPort ? "" : ",") + "{\"name\":\"" +
-                        p.name + "\",\"type\":\"" + category(p.type) + "\"";
+                        jsonEscape(p.name) + "\",\"type\":\"" +
+                        category(p.type) + "\"";
                 firstPort = false;
                 if (p.array) {
                     json += ",\"array\":true";
@@ -3002,11 +3011,11 @@ std::string nodePortsJson()
                         p.type == kPoly ? 1 : componentCount(p.type);
                     json += ",\"default\":";
                     if (arity == 1) {
-                        json += number(p.def[0]);
+                        json += numberJson(p.def[0]);
                     } else {
                         json += "[";
                         for (int c = 0; c < arity; ++c) {
-                            json += (c ? "," : "") + number(p.def[c]);
+                            json += (c ? "," : "") + numberJson(p.def[c]);
                         }
                         json += "]";
                     }
@@ -3020,7 +3029,8 @@ std::string nodePortsJson()
             bool firstPort = true;
             for (const auto& out : outputPortsFor(e.type)) {
                 json += std::string(firstPort ? "" : ",") + "{\"name\":\"" +
-                        out.name + "\",\"type\":\"" + out.category + "\"}";
+                        jsonEscape(out.name) + "\",\"type\":\"" +
+                        out.category + "\"}";
                 firstPort = false;
             }
             json += "]";

@@ -85,10 +85,14 @@ export const Module = {
         const reason = wasm.errors().split('\n')[0];
         setStatus('wasmStatus', `preview: ${reason}`, 'warn');
         console.log(`editor: wasm preview unavailable: ${reason}`);
+        // The port/prop tables arrived with the runtime even though the
+        // scene did not — rebuild anything a live connection drew earlier.
+        refreshPanel();
       } else if (Date.now() - started > 8000) {
         clearInterval(timer);
         setStatus('wasmStatus', 'preview: unavailable (WebGPU?)', 'bad');
         console.log('editor: wasm preview unavailable');
+        refreshPanel(); // see above: a live-connected graph may predate this
       }
     }, 200);
   },

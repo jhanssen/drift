@@ -18,6 +18,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+// The editor and driftpkg write the same starter project.
+import { templateScene,
+         TEMPLATE_WGSL } from '../src/platform/web/editor/templates.js';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const defaultRepo = path.join(here, '..', 'library');
 
@@ -28,43 +32,6 @@ function usage() {
   process.exit(2);
 }
 
-// The same starter the editor's New… writes (editor.html TEMPLATE_*):
-// a sequence-driven glow with one parameter, ready to run and edit.
-const TEMPLATE_SCENE = (name) => JSON.stringify({
-  version: 1,
-  name,
-  parameters: {
-    tint: { type: 'vec3', default: [0.4, 0.6, 1.0], hint: 'color',
-            label: 'Tint' },
-  },
-  nodes: [
-    { id: 'seq', type: 'sequence', duration: 8, loop: true,
-      tracks: [
-        { name: 'level', kind: 'value', type: 'scalar',
-          interpolate: 'smooth',
-          keys: [{ t: 0, value: 0.2 }, { t: 4, value: 1 },
-                 { t: 8, value: 0.2 }] },
-      ],
-      inputs: { time: '@time.seconds' } },
-    { id: 'main', type: 'shader', shader: 'shaders/main.wgsl',
-      inputs: { level: '@seq.level', tint: '$tint' } },
-    { id: 'out', type: 'output', inputs: { color: '@main' } },
-  ],
-}, null, 2) + '\n';
-
-const TEMPLATE_WGSL = `struct Params {
-    level: f32,
-    tint: vec3<f32>,
-}
-@group(0) @binding(0) var<uniform> params: Params;
-
-@fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
-    let d = distance(uv, vec2f(0.5, 0.5));
-    let glow = params.level * exp(-d * d * 8.0);
-    return vec4f(params.tint * glow, 1.0);
-}
-`;
-
 function cmdInit(target) {
   if (fs.existsSync(target) && fs.readdirSync(target).length > 0) {
     throw new Error(`${target} exists and is not empty`);
@@ -73,7 +40,7 @@ function cmdInit(target) {
                'Untitled';
   fs.mkdirSync(path.join(target, 'shaders'), { recursive: true });
   fs.mkdirSync(path.join(target, 'assets'), { recursive: true });
-  fs.writeFileSync(path.join(target, 'scene.json'), TEMPLATE_SCENE(name));
+  fs.writeFileSync(path.join(target, 'scene.json'), templateScene(name));
   fs.writeFileSync(path.join(target, 'shaders', 'main.wgsl'),
                    TEMPLATE_WGSL);
   console.log(`created ${target}`);

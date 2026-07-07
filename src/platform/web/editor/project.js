@@ -1,4 +1,5 @@
 import { query, sceneName } from './config.js';
+import { templateScene, TEMPLATE_WGSL } from './templates.js';
 import { wasm, wasmManifest, setWasmManifest, Module } from './preview.js';
 import { live, liveSend } from './live.js';
 import { setStatus, openQuickForm } from './ui.js';
@@ -65,41 +66,6 @@ export let project = null; // { name, root, handle, kind: 'dir'|'opfs', template
 let storeHandle = null;    // §20 package store overlay (persisted handle)
 let pendingProject = null; // open blocked on missing packages; retried by
                            // the Packages… button
-
-const TEMPLATE_SCENE = JSON.stringify({
-  version: 1,
-  name: 'Untitled',
-  parameters: {
-    tint: { type: 'vec3', default: [0.4, 0.6, 1.0], hint: 'color',
-            label: 'Tint' },
-  },
-  nodes: [
-    { id: 'seq', type: 'sequence', duration: 8, loop: true,
-      tracks: [
-        { name: 'level', kind: 'value', type: 'scalar',
-          interpolate: 'smooth',
-          keys: [{ t: 0, value: 0.2 }, { t: 4, value: 1 },
-                 { t: 8, value: 0.2 }] },
-      ],
-      inputs: { time: '@time.seconds' } },
-    { id: 'main', type: 'shader', shader: 'shaders/main.wgsl',
-      inputs: { level: '@seq.level', tint: '$tint' } },
-    { id: 'out', type: 'output', inputs: { color: '@main' } },
-  ],
-}, null, 2);
-
-const TEMPLATE_WGSL = `struct Params {
-    level: f32,
-    tint: vec3<f32>,
-}
-@group(0) @binding(0) var<uniform> params: Params;
-
-@fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
-    let d = distance(uv, vec2f(0.5, 0.5));
-    let glow = params.level * exp(-d * d * 8.0);
-    return vec4f(params.tint * glow, 1.0);
-}
-`;
 
 // -- tiny IndexedDB kv: persists directory handles (localStorage cannot) --
 function kvOpen() {
@@ -362,7 +328,7 @@ export async function createProject(name, kind) {
       handle = await parent.getDirectoryHandle(slugify(name),
                                                { create: true });
     }
-    await writeFileToHandle(handle, 'scene.json', TEMPLATE_SCENE + '\n');
+    await writeFileToHandle(handle, 'scene.json', templateScene('Untitled'));
     await writeFileToHandle(handle, 'shaders/main.wgsl', TEMPLATE_WGSL);
     return await openProject(handle, kind, name, { template: true });
   } catch (err) {

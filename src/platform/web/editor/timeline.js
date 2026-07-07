@@ -1,5 +1,5 @@
 import { wasm, wasmManifest, setWasmManifest } from './preview.js';
-import { openQuickForm } from './ui.js';
+import { openQuickForm, isIdentifier } from './ui.js';
 import { activeManifest, refreshPanel } from './params.js';
 import { sceneSource, setSceneSource, pushDocument,
          pushFromGraph } from './document.js';
@@ -39,7 +39,7 @@ function addTrack(seq, anchor) {
     { key: 'name', label: 'name', value: '' },
     { key: 'kind', label: 'kind', options: ['value', 'event'] },
   ], (v) => {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(v.name)) {
+    if (!isIdentifier(v.name)) {
       return 'name must be an identifier (§3)';
     }
     if (seq.tracks.some((t) => t.name === v.name)) {

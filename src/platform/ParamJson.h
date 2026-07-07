@@ -9,10 +9,17 @@
 #include <string>
 #include <vector>
 
+#include "core/Json.h"
 #include "core/Nodes.h"
 #include "core/Scene.h"
 
 namespace drift::platform {
+
+// The fragment formatters live in core/Json.h so core serializers
+// (nodePortsJson) emit the same forms; keep the unqualified names the
+// callers here use.
+using core::jsonEscape;
+using core::numberJson;
 
 // Copyable snapshot of a sequence node for describe (the native endpoint
 // hands describe data across a callback boundary by value).
@@ -35,37 +42,6 @@ inline std::vector<SequenceDesc> sequenceDescs(const core::Scene& scene)
         out.push_back(SequenceDesc::from(*node));
     }
     return out;
-}
-
-inline std::string jsonEscape(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        switch (c) {
-        case '"': out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n"; break;
-        case '\r': out += "\\r"; break;
-        case '\t': out += "\\t"; break;
-        default:
-            if ((unsigned char)c < 0x20) {
-                char buf[8];
-                snprintf(buf, sizeof(buf), "\\u%04x", c);
-                out += buf;
-            } else {
-                out.push_back(c);
-            }
-        }
-    }
-    return out;
-}
-
-inline std::string numberJson(double v)
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.17g", v);
-    return buf;
 }
 
 // Scene-literal form (§4): scalar as a number, vecN as an array.
