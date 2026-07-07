@@ -258,6 +258,7 @@ struct PortDef {
     std::array<double, 4> def{};
     bool array = false; // texture[]: expands to one Node::Input per element
     uint32_t stride = 0; // buffer ports (§18.1): required element stride
+    bool hidden = false; // loader-injected; never surfaced to editors
 };
 
 const PortDef kWaveInputs[] = {
@@ -384,7 +385,7 @@ const PortDef kParticlesInputs[] = {
     // Hidden §18.5.4 feedback edge: injected by the loader when 'spawn' is
     // connected (death detection needs the source's previous tick).
     { "spawnPrev", ValueType::Buffer, false, {}, false,
-      ParticlesNode::kStride },
+      ParticlesNode::kStride, true },
     { "time", ValueType::Scalar, true },
 };
 // Order must match SpritesNode::Port.
@@ -444,6 +445,10 @@ bool parseEmitterShape(const std::string& kind, ParticlesNode::Emitter& out)
 struct OutputPortDef {
     const char* name;
     int index;
+    // Wire category for editors (nodePortsJson); the loader itself only
+    // resolves names to indices. Precise value types can be polymorphic,
+    // but the category never is.
+    const char* category = "value";
 };
 
 // name -> output port index per node type; index 0 is the default output.
@@ -452,8 +457,17 @@ std::vector<OutputPortDef> outputPortsFor(const std::string& type)
     if (type == "time") return { { "seconds", 0 }, { "delta", 1 } };
     if (type == "mouse") return { { "position", 0 }, { "active", 1 } };
     if (type == "split") return { { "x", 0 }, { "y", 1 }, { "z", 2 }, { "w", 3 } };
-    if (type == "video") return { { "result", 0 }, { "finished", 1 } };
+    if (type == "video") {
+        return { { "result", 0, "texture" }, { "finished", 1, "event" } };
+    }
     if (type == "output") return {};
+    if (type == "particles") return { { "result", 0, "buffer" } };
+    if (type == "edge") return { { "result", 0, "event" } };
+    if (type == "image" || type == "shader" || type == "sprites" ||
+        type == "trails" || type == "transform" || type == "fit" ||
+        type == "compositor") {
+        return { { "result", 0, "texture" } };
+    }
     return { { "result", 0 } };
 }
 
@@ -2894,6 +2908,128 @@ std::unique_ptr<Scene> Loader::load(const std::string& sceneJson)
 }
 
 } // namespace
+
+// The per-type port surface for editors (drift_node_ports): the k*Inputs
+// tables and outputPortsFor serialized once, so editors never restate what
+// the loader already knows. Types whose ports are reflected or dynamic
+// keep them out of the table — shader/compute inputs and compute outputs
+// come from WGSL reflection, graph ports from the §19.2 interface, and
+// sequence outputs from its tracks — and editors resolve those from the
+// document instead.
+std::string nodePortsJson()
+{
+    struct Entry {
+        const char* type;
+        const PortDef* inputs; // nullptr with count 0: reflected, omitted
+        int count;
+        bool staticOutputs = true;
+        bool implicit = false;
+    };
+    const auto table = [](const auto& t) { return (int)std::size(t); };
+    const Entry kEntries[] = {
+        { "image", nullptr, 0 }, // declared empty: every pin is spec'd
+        { "video", kVideoInputs, table(kVideoInputs) },
+        { "shader", nullptr, -1 },
+        { "compute", nullptr, -1, false },
+        { "particles", kParticlesInputs, table(kParticlesInputs) },
+        { "sprites", kSpritesInputs, table(kSpritesInputs) },
+        { "trails", kTrailsInputs, table(kTrailsInputs) },
+        { "transform", kTransformInputs, table(kTransformInputs) },
+        { "fit", kFitInputs, table(kFitInputs) },
+        { "compositor", kCompositorInputs, table(kCompositorInputs) },
+        { "output", kOutputInputs, table(kOutputInputs) },
+        { "remap", kRemapInputs, table(kRemapInputs) },
+        { "wave", kWaveInputs, table(kWaveInputs) },
+        { "add", kAddInputs, table(kAddInputs) },
+        { "multiply", kMultiplyInputs, table(kMultiplyInputs) },
+        { "mix", kMixInputs, table(kMixInputs) },
+        { "clamp", kClampInputs, table(kClampInputs) },
+        { "noise", kNoiseInputs, table(kNoiseInputs) },
+        { "damp", kDampInputs, table(kDampInputs) },
+        { "edge", kEdgeInputs, table(kEdgeInputs) },
+        { "combine", kCombineInputs, table(kCombineInputs) },
+        { "split", kSplitInputs, table(kSplitInputs) },
+        { "sequence", kSequenceInputs, table(kSequenceInputs), false },
+        { "graph", nullptr, -1, false },
+        { "time", nullptr, -1, true, true },
+        { "mouse", nullptr, -1, true, true },
+    };
+    const auto category = [](ValueType t) {
+        if (t == ValueType::Texture) return "texture";
+        if (t == ValueType::Event) return "event";
+        if (t == ValueType::Buffer) return "buffer";
+        return "value"; // scalar, vectors, and the kPoly sentinel
+    };
+    const auto number = [](double v) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%g", v);
+        return std::string(buf);
+    };
+    std::string json = "{";
+    for (const auto& e : kEntries) {
+        if (json.size() > 1) {
+            json += ",";
+        }
+        json += std::string("\"") + e.type + "\":{";
+        bool first = true;
+        if (e.implicit) {
+            json += "\"implicit\":true";
+            first = false;
+        }
+        if (e.count >= 0) {
+            json += std::string(first ? "" : ",") + "\"inputs\":[";
+            first = false;
+            bool firstPort = true;
+            for (int i = 0; i < e.count; ++i) {
+                const PortDef& p = e.inputs[i];
+                if (p.hidden) {
+                    continue;
+                }
+                json += std::string(firstPort ? "" : ",") + "{\"name\":\"" +
+                        p.name + "\",\"type\":\"" + category(p.type) + "\"";
+                firstPort = false;
+                if (p.array) {
+                    json += ",\"array\":true";
+                }
+                if (p.required) {
+                    json += ",\"required\":true";
+                } else if (p.type != ValueType::Texture &&
+                           p.type != ValueType::Event &&
+                           p.type != ValueType::Buffer) {
+                    // The default an unbound port runs at; kPoly ports
+                    // resolve per-instance, their defaults read as scalar.
+                    const int arity =
+                        p.type == kPoly ? 1 : componentCount(p.type);
+                    json += ",\"default\":";
+                    if (arity == 1) {
+                        json += number(p.def[0]);
+                    } else {
+                        json += "[";
+                        for (int c = 0; c < arity; ++c) {
+                            json += (c ? "," : "") + number(p.def[c]);
+                        }
+                        json += "]";
+                    }
+                }
+                json += "}";
+            }
+            json += "]";
+        }
+        if (e.staticOutputs) {
+            json += std::string(first ? "" : ",") + "\"outputs\":[";
+            bool firstPort = true;
+            for (const auto& out : outputPortsFor(e.type)) {
+                json += std::string(firstPort ? "" : ",") + "{\"name\":\"" +
+                        out.name + "\",\"type\":\"" + out.category + "\"}";
+                firstPort = false;
+            }
+            json += "]";
+        }
+        json += "}";
+    }
+    json += "}";
+    return json;
+}
 
 std::unique_ptr<Scene> Scene::load(const std::string& sceneJson,
                                    const AssetReader& readAsset,

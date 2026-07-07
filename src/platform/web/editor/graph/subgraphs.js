@@ -6,7 +6,7 @@ import { openQuickForm } from '../ui.js';
 import { currentValues, refreshPanel } from '../params.js';
 import { sceneSource, pushFromGraph } from '../document.js';
 import { projectRoot, projectWriteThrough } from '../project.js';
-import { IMPLICIT_OUTPUTS } from '../nodedefs.js';
+import { implicitOutputs } from '../nodedefs.js';
 import { viewStack, selectedIds, setSelectedIds, setSelectedNodeId,
          setGraphNeedsFit, setGraphStatus, viewReadOnly, updateGraphChrome,
          graph, inSubgraph } from './state.js';
@@ -168,7 +168,7 @@ function makeSubgraphFromSelection(anchor) {
           Array.isArray(value) && value.some((el) => {
             const conn = parseConnection(el);
             return conn && !ids.has(conn.node) &&
-                   !IMPLICIT_OUTPUTS[conn.node];
+                   !implicitOutputs(conn.node);
           }));
   if (picked.some((n) => arrayCrossesIn(n.source))) {
     setGraphStatus('make subgraph: an outside wire into a selected array ' +
@@ -212,7 +212,7 @@ function makeSubgraphFromSelection(anchor) {
       const src = structuredClone(node.source);
       for (const [port, value] of Object.entries(src.inputs ?? {})) {
         const conn = parseConnection(value);
-        if (conn && !ids.has(conn.node) && !IMPLICIT_OUTPUTS[conn.node]) {
+        if (conn && !ids.has(conn.node) && !implicitOutputs(conn.node)) {
           const name = exportName(port);
           file.inputs[name] = { type: boundaryType(node, port, value),
                                 bind: `@${src.id}.${port}` };

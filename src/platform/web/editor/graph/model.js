@@ -2,7 +2,7 @@
 // §19 graph-file interface cache — shared by build, wiring, and subgraphs.
 
 import { wasm } from '../preview.js';
-import { NODE_OUTPUTS, NODE_INPUTS } from '../nodedefs.js';
+import { nodeInputs, nodeOutputs } from '../nodedefs.js';
 import { viewStack } from './state.js';
 
 // §20.1: paths inside a package's graph file resolve against the package
@@ -83,7 +83,7 @@ export function specInputsOf(source, base = activeDocRoot()) {
     return reflectPorts(source, false, base)?.map((p) =>
         [p.name, reflectCategory(p), false]) ?? null;
   }
-  return NODE_INPUTS[source.type] ?? null;
+  return nodeInputs(source.type);
 }
 
 export const reflectCategory = (p) =>
@@ -116,7 +116,7 @@ export function outputsOf(node, base = activeDocRoot()) {
     return reflectPorts(node, true, base)?.map((p) =>
         [p.name, reflectCategory(p)]) ?? [];
   }
-  return NODE_OUTPUTS[node.type] ?? [['result', 'value']];
+  return nodeOutputs(node.type) ?? [['result', 'value']];
 }
 
 // Reference grammar (§7): "@node", "@node.port", { node, port, previous }.

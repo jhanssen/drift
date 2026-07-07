@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // Declared node properties (§9, §13): the single source of truth for the
 // per-type property surface. The loader derives its unknown-property
 // warning from this table, and the web runtime serializes it
@@ -56,6 +58,14 @@ inline constexpr NodePropDef kNodeProps[] = {
     { "fit", "mode", "enum", false, "\"cover\"", "cover contain stretch" },
     { "graph", "graph", "asset", true, nullptr, nullptr },
 };
+
+// The per-type port surface (input/output names, wire categories,
+// defaults) as JSON for editors (drift_node_ports). Defined in
+// SceneLoader.cpp so the loader's own port tables stay the single source
+// of truth; reflected/dynamic ports (shader/compute WGSL, §19.2 graph
+// interfaces, sequence tracks) are omitted for editors to resolve from
+// the document.
+std::string nodePortsJson();
 
 // Every §9 node type, including the property-less ones — the loader
 // warns on unknown properties for all of them.

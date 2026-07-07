@@ -665,6 +665,18 @@ EMSCRIPTEN_KEEPALIVE const char* drift_node_props()
     return json.c_str();
 }
 
+// The per-type port surface (core/NodeProps.h → SceneLoader's own port
+// tables) — the editor draws pins, wire categories, and unbound-port
+// defaults from this instead of hardcoding node types.
+EMSCRIPTEN_KEEPALIVE const char* drift_node_ports()
+{
+    static std::string json;
+    if (json.empty()) {
+        json = drift::core::nodePortsJson();
+    }
+    return json.c_str();
+}
+
 // Reads a project-relative text file (e.g. a shader into the editor
 // pane). packages/ paths resolve through the store (§20.6) so the editor
 // can drill into package graphs.

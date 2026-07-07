@@ -1,6 +1,6 @@
 // ---- graph view: building the node/edge model and its layout ---------------
 
-import { G, IMPLICIT_OUTPUTS } from '../nodedefs.js';
+import { G, implicitOutputs } from '../nodedefs.js';
 import { sceneSource } from '../document.js';
 import { activeDoc, inSubgraph, viewStack, graph, setGraph,
          selectedIds, setSelectedIds, selectedNodeId, setSelectedNodeId,
@@ -60,7 +60,8 @@ function buildGraph() {
         pushBound(name, value, undefined, false);
       }
     }
-    const outputs = implicit ? IMPLICIT_OUTPUTS[source.id] : outputsOf(source);
+    const outputs =
+        implicit ? implicitOutputs(source.id) : outputsOf(source);
     // Instances label with their block's name (palette markers: ⬡ =
     // package, ▣ = project graph) instead of the generic "graph".
     let typeLabel = null;
@@ -124,7 +125,7 @@ function buildGraph() {
         continue;
       }
       let from = byId.get(input.conn.node);
-      if (!from && IMPLICIT_OUTPUTS[input.conn.node]) {
+      if (!from && implicitOutputs(input.conn.node)) {
         // Implicit singletons (§9.7–9.8) appear once something uses them.
         from = add({ id: input.conn.node }, true);
       }

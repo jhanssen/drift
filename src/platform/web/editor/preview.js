@@ -31,12 +31,14 @@ export const Module = {
     const open = Module.cwrap('drift_open', 'number', ['string']);
     const reflect = Module.cwrap('drift_reflect', 'string', ['string']);
     const nodeProps = Module.cwrap('drift_node_props', 'string', []);
+    const nodePorts = Module.cwrap('drift_node_ports', 'string', []);
     const scenes = Module.cwrap('drift_scenes', 'string', []);
     const graphs = Module.cwrap('drift_graphs', 'string', []);
     wasm = {
       describe,
       reflect,
       nodeProps,
+      nodePorts,
       scenes,
       graphs,
       time,

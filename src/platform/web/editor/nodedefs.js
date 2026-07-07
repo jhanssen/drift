@@ -1,132 +1,46 @@
-// Node-type metadata the graph view draws and creates from. Output/input
-// port tables mirror §9; declared properties come from the runtime
-// (drift_node_props) instead of editor hardcoding.
+// Node-type metadata the graph view draws and creates from. Ports and
+// declared properties both come from the runtime (drift_node_ports,
+// drift_node_props) instead of editor hardcoding.
 
 import { wasm } from './preview.js';
 
-// Output ports per built-in type as [name, category] in declaration order —
-// the first is the default output (§9). Categories color the wires: texture,
-// event, or plain value. sequence ports come from its tracks.
-export const NODE_OUTPUTS = {
-  image: [['result', 'texture']],
-  video: [['result', 'texture'], ['finished', 'event']],
-  shader: [['result', 'texture']],
-  particles: [['result', 'buffer']],
-  sprites: [['result', 'texture']],
-  trails: [['result', 'texture']],
-  transform: [['result', 'texture']],
-  fit: [['result', 'texture']],
-  compositor: [['result', 'texture']],
-  output: [],
-  remap: [['result', 'value']],
-  wave: [['result', 'value']],
-  add: [['result', 'value']],
-  multiply: [['result', 'value']],
-  mix: [['result', 'value']],
-  clamp: [['result', 'value']],
-  noise: [['result', 'value']],
-  damp: [['result', 'value']],
-  edge: [['result', 'event']],
-  combine: [['result', 'value']],
-  split: [['x', 'value'], ['y', 'value'], ['z', 'value'], ['w', 'value']],
-};
-export const IMPLICIT_OUTPUTS = {
-  time: [['seconds', 'value'], ['delta', 'value']],
-  mouse: [['position', 'value'], ['active', 'value']],
-};
-// Input ports per built-in type as [name, category, isArray, default] (§9),
-// so ports that are not bound in the document still get pins to drop wires
-// on, showing the default they run at. shader ports come from WGSL
-// reflection instead (specInputsOf).
-export const NODE_INPUTS = {
-  image: [],
-  video: [['playing', 'value', false, 1], ['restart', 'event']],
-  particles: [['rate', 'value', false, 10], ['burst', 'event'],
-              ['burstCount', 'value', false, 32],
-              ['origin', 'value', false, [0.5, 0.5]],
-              ['extent', 'value', false, [0, 0]],
-              ['emitScale', 'value', false, [1, 1]],
-              ['direction', 'value', false, [0, -1]],
-              ['spread', 'value', false, 180],
-              ['speed', 'value', false, [0.05, 0.15]],
-              ['lifetime', 'value', false, [1, 3]],
-              ['size', 'value', false, [0.01, 0.03]],
-              ['spin', 'value', false, [0, 0]],
-              ['colorStart', 'value', false, [1, 1, 1, 1]],
-              ['colorEnd', 'value', false, [1, 1, 1, 0]],
-              ['fadeIn', 'value', false, 0.1],
-              ['fadeOut', 'value', false, 0],
-              ['sizeEnd', 'value', false, 1],
-              ['sizeWindow', 'value', false, [0, 1]],
-              ['gravity', 'value', false, [0, 0]],
-              ['drag', 'value', false, 0],
-              ['turbulence', 'value', false, 0],
-              ['turbulenceScale', 'value', false, 4],
-              ['turbulenceMask', 'value', false, [1, 1]],
-              ['attractor', 'value', false, [0.5, 0.5]],
-              ['attract', 'value', false, 0],
-              ['vortex', 'value', false, 0],
-              ['delay', 'value', false, 0],
-              ['duration', 'value', false, 0],
-              ['ring', 'value', false, 0],
-              ['depth', 'value', false, [0, 0]],
-              ['collide', 'texture'],
-              ['bounce', 'value', false, 0.5],
-              ['tintVary', 'value', false, [1, 1, 1, 1]],
-              ['tintVaryMax', 'value', false, [1, 1, 1, 1]],
-              ['velocityMin', 'value', false, [0, 0]],
-              ['velocityMax', 'value', false, [0, 0]],
-              ['twinkle', 'value', false, [1, 1]],
-              ['twinkleRate', 'value', false, [1, 2]],
-              ['prewarm', 'value', false, 0],
-              ['spawn', 'buffer'],
-              ['inherit', 'value', false, 0],
-              ['spawnRate', 'value', false, 0],
-              ['time', 'value']],
-  sprites: [['particles', 'buffer'], ['texture', 'texture'],
-            ['frameRate', 'value', false, 0],
-            ['parallax', 'value', false, [0, 0]],
-            ['flutter', 'value', false, [0, 0]],
-            ['flutterRate', 'value', false, 1],
-            ['stretch', 'value', false, [1, 1]],
-            ['frameBlend', 'value', false, 0],
-            ['align', 'value', false, 0],
-            ['hardness', 'value', false, 1]],
-  trails: [['particles', 'buffer'],
-           ['width', 'value', false, 1],
-           ['taper', 'value', false, 0],
-           ['fade', 'value', false, 0],
-           ['parallax', 'value', false, [0, 0]],
-           ['feather', 'value', false, 0]],
-  transform: [['source', 'texture'],
-              ['position', 'value', false, [0.5, 0.5]],
-              ['rotation', 'value', false, 0],
-              ['scale', 'value', false, [1, 1]],
-              ['anchor', 'value', false, [0.5, 0.5]],
-              ['opacity', 'value', false, 1]],
-  fit: [['source', 'texture']],
-  compositor: [['layers', 'texture', true]],
-  output: [['color', 'texture']],
-  remap: [['value', 'value'], ['inMin', 'value', false, 0],
-          ['inMax', 'value', false, 1], ['outMin', 'value', false, 0],
-          ['outMax', 'value', false, 1]],
-  wave: [['input', 'value'], ['frequency', 'value', false, 1],
-         ['phase', 'value', false, 0]],
-  add: [['a', 'value'], ['b', 'value', false, 0]],
-  multiply: [['a', 'value'], ['b', 'value', false, 1]],
-  mix: [['a', 'value'], ['b', 'value'], ['t', 'value', false, 0.5]],
-  clamp: [['value', 'value'], ['lo', 'value', false, 0],
-          ['hi', 'value', false, 1]],
-  noise: [['input', 'value'], ['frequency', 'value', false, 1],
-          ['seed', 'value', false, 0]],
-  damp: [['value', 'value'], ['time', 'value'],
-         ['halflife', 'value', false, 0.2]],
-  edge: [['value', 'value'], ['threshold', 'value', false, 0.5]],
-  combine: [['x', 'value', false, 0], ['y', 'value', false, 0],
-            ['z', 'value', false, 0], ['w', 'value', false, 0]],
-  split: [['value', 'value']],
-  sequence: [['time', 'value']],
-};
+// Port tables come from the runtime too (drift_node_ports ← the loader's
+// own PortDef tables in SceneLoader.cpp), so a port added engine-side
+// appears here without an editor edit. Inputs convert to
+// [name, category, isArray, default] and outputs to [name, category] in
+// §9 declaration order (the first output is the default). Types whose
+// ports are reflected or dynamic (shader/compute WGSL, §19.2 graph
+// interfaces, sequence tracks) have no static entry — the editor resolves
+// those from the document. Without a preview runtime the accessors return
+// null and the graph degrades to bound-ports-only, like nodePropDefs.
+let nodePortsCache = null;
+function nodePorts() {
+  if (!nodePortsCache && wasm) {
+    try {
+      const decls = JSON.parse(wasm.nodePorts());
+      nodePortsCache = { inputs: {}, outputs: {}, implicit: {} };
+      for (const [type, decl] of Object.entries(decls)) {
+        if (decl.inputs) {
+          nodePortsCache.inputs[type] =
+              decl.inputs.map((p) => [p.name, p.type, !!p.array, p.default]);
+        }
+        if (decl.outputs) {
+          (decl.implicit ? nodePortsCache.implicit
+                         : nodePortsCache.outputs)[type] =
+              decl.outputs.map((p) => [p.name, p.type]);
+        }
+      }
+    } catch {
+      nodePortsCache = null;
+    }
+  }
+  return nodePortsCache;
+}
+export const nodeInputs = (type) => nodePorts()?.inputs[type] ?? null;
+export const nodeOutputs = (type) => nodePorts()?.outputs[type] ?? null;
+// Implicit singletons (§9.7–9.8): time and mouse.
+export const implicitOutputs = (id) => nodePorts()?.implicit[id] ?? null;
+
 // Declared properties per type (name/kind/required/default/options) come
 // from the runtime (drift_node_props ← core/NodeProps.h): creation forms
 // and the inspector's defaults follow the engine, not editor hardcoding.
