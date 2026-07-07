@@ -108,14 +108,20 @@ if(EMSCRIPTEN)
         ${DRIFT_WEB_PRELOADS}
     )
     # The editor page loads drift.js/.wasm/.data from its own directory.
-    # A real dependency (not POST_BUILD): editing editor.html alone must
+    # A real dependency (not POST_BUILD): editing the editor alone must
     # propagate without relinking drift_web.
+    file(GLOB_RECURSE DRIFT_EDITOR_SOURCES CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/platform/web/editor/*")
     add_custom_command(
         OUTPUT "${CMAKE_BINARY_DIR}/editor.html"
         COMMAND ${CMAKE_COMMAND} -E copy
             "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html"
             "${CMAKE_BINARY_DIR}/editor.html"
-        DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html")
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/src/platform/web/editor"
+            "${CMAKE_BINARY_DIR}/editor"
+        DEPENDS "${CMAKE_SOURCE_DIR}/src/platform/web/editor.html"
+                ${DRIFT_EDITOR_SOURCES})
     add_custom_target(drift_editor ALL
         DEPENDS "${CMAKE_BINARY_DIR}/editor.html")
     return()

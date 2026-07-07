@@ -1,0 +1,120 @@
+  :root {
+    --bg: #16181d; --panel: #1e2128; --edge: #2c3038;
+    --text: #d6d9de; --dim: #8a8f98; --accent: #6aa1ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg);
+               color: var(--text);
+               font: 13px/1.45 system-ui, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 340px; }
+  main { display: flex; flex-direction: column; min-width: 0; }
+  #viewTabs { display: flex; align-items: center; gap: 6px; padding: 4px 10px;
+              background: var(--panel); border-bottom: 1px solid var(--edge); }
+  #viewTabs button { font-size: 11px; padding: 2px 12px; }
+  #viewTabs button.active { border-color: var(--accent); color: var(--accent); }
+  #viewTabs .dim { color: var(--dim); margin-left: 8px; }
+  #graphStatus { font-size: 11px; margin-left: 8px; white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+  #nodeMenu { position: fixed; z-index: 10; display: flex;
+              flex-direction: column; gap: 2px; background: var(--panel);
+              border: 1px solid var(--edge); border-radius: 5px; padding: 4px;
+              box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #nodeMenu[hidden] { display: none; }
+  #nodeMenu button { border: none; text-align: left; padding: 3px 10px;
+                     background: none; font-size: 12px; }
+  #nodeMenu button:hover { background: var(--bg); color: var(--accent); }
+  #quickForm { position: fixed; z-index: 11; display: flex;
+               flex-direction: column; gap: 6px; background: var(--panel);
+               border: 1px solid var(--accent); border-radius: 5px;
+               padding: 8px 10px; font-size: 12px; min-width: 230px;
+               box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #quickForm[hidden] { display: none; }
+  #quickForm h4 { margin: 0 0 2px; font-size: 10px; color: var(--dim);
+                  font-weight: normal; text-transform: uppercase;
+                  letter-spacing: .06em; }
+  #quickForm .row { margin: 0; }
+  #quickForm .row label { flex: 0 0 48px; color: var(--dim); }
+  #quickForm input, #quickForm select { flex: 1; min-width: 0; }
+  #quickForm .err { color: #e0787d; font-size: 11px; max-width: 220px; }
+  #quickForm .note { color: var(--dim); font-size: 10px; max-width: 220px;
+                     line-height: 1.35; margin: 2px 0; }
+  #quickForm .buttons { display: flex; gap: 6px; justify-content: flex-end;
+                        margin-top: 2px; }
+  #viewStack { flex: 1; position: relative; min-height: 0; background: #000; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+            display: block; background: #000; }
+  /* The graph tab shrinks the preview to a live thumbnail rather than hiding
+     it: the wasm runtime skips frames while the canvas has zero size, which
+     would freeze the shared clock. */
+  body.graph-mode #canvas { inset: auto 10px 10px auto; width: 224px;
+                            height: 126px; border: 1px solid var(--edge);
+                            z-index: 2; }
+  /* While the document is an invalid draft the preview shows the LAST VALID
+     scene — dim it so nobody mistakes it for the edited document. */
+  body.draft #canvas { filter: grayscale(.8) brightness(.45); }
+  body.draft #canvas { border-color: #e3c56d; }
+  #graphCanvas { position: absolute; inset: 0; width: 100%; height: 100%;
+                 display: block; background: var(--bg); }
+  body:not(.graph-mode) #graphCanvas { display: none; }
+  #transport { display: flex; align-items: center; gap: 12px;
+               padding: 6px 12px; border-top: 1px solid var(--edge);
+               background: var(--panel); }
+  #transport button { width: 34px; }
+  #timeText { color: var(--dim); font-variant-numeric: tabular-nums;
+              min-width: 70px; }
+  #timeline { border-top: 1px solid var(--edge); background: var(--panel);
+              max-height: 280px; overflow-y: auto; padding: 8px 12px; }
+  #timeline canvas { cursor: crosshair; }
+  #keyEdit { position: fixed; z-index: 10; display: flex; gap: 6px;
+             background: var(--panel); border: 1px solid var(--accent);
+             border-radius: 5px; padding: 6px 8px; font-size: 12px;
+             box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  #keyEdit[hidden] { display: none; }
+  #keyEdit label { display: flex; align-items: center; gap: 4px;
+                   color: var(--dim); }
+  #keyEdit input { width: 72px; }
+  #timeline .dim { color: var(--dim); }
+  #seqTabs { display: flex; gap: 4px; margin: 2px 0 4px; }
+  #seqTabs button { font-size: 10px; padding: 1px 10px; }
+  #seqTabs button.active { border-color: var(--accent);
+                           color: var(--accent); }
+  #timeline h3 { font-size: 11px; margin: 6px 0 4px; color: var(--dim);
+                 font-weight: normal; letter-spacing: .04em; }
+  #timeline canvas { display: block; width: 100%; }
+  #statusbar { padding: 6px 12px; border-top: 1px solid var(--edge);
+               color: var(--dim); display: flex; gap: 18px;
+               white-space: nowrap; overflow: hidden; }
+  aside { border-left: 1px solid var(--edge); background: var(--panel);
+          overflow-y: auto; padding: 14px; }
+  h1 { font-size: 14px; margin: 0 0 14px; letter-spacing: .02em; }
+  h1 span { color: var(--dim); font-weight: normal; }
+  section { margin-bottom: 20px; }
+  section > h2 { font-size: 11px; text-transform: uppercase;
+                 letter-spacing: .08em; color: var(--dim); margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 0 0 110px; overflow: hidden; text-overflow: ellipsis;
+               white-space: nowrap; }
+  input, select, button {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 4px; padding: 3px 6px;
+  }
+  input[type=range] { flex: 1; padding: 0; }
+  input[type=number] { width: 64px; }
+  input[type=color] { padding: 0; width: 44px; height: 24px; }
+  textarea { width: 100%; font: 11px/1.4 ui-monospace, monospace;
+             color: var(--text); background: var(--bg);
+             border: 1px solid var(--edge); border-radius: 4px;
+             padding: 6px; resize: vertical; }
+  #wgslStatus { font-size: 11px; white-space: pre-wrap; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .ok { color: #7fd490; } .bad { color: #e0787d; } .warn { color: #e3c56d; }
+  #params .row { margin: 8px 0; }
+  .mismatch { color: #e3c56d; margin: 6px 0; }
+  #nodeInfo h3 { font-size: 10px; text-transform: uppercase; margin: 10px 0 4px;
+                 letter-spacing: .06em; color: var(--dim); font-weight: normal; }
+  #nodeInfo .row { margin: 3px 0; }
+  #nodeInfo .row label { flex: 0 0 92px; color: var(--dim); }
+  #nodeInfo .row span { font: 11px/1.4 ui-monospace, monospace; min-width: 0;
+                        overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; }
