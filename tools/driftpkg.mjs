@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 // The editor and driftpkg write the same starter project.
@@ -28,9 +29,149 @@ const defaultRepo = path.join(here, '..', 'library');
 function usage() {
   console.error('usage: driftpkg.mjs init PATH | ' +
                 'index [REPO-DIR] [--first-party] | ' +
-                'install NAME[@PIN]|--all [--repo DIR|URL] [--store DIR] | ' +
+                'install NAME[@PIN]|--all [--repo DIR|URL] [--store DIR] ' +
+                '[--yes] | ' +
+                'grant PROJECT-DIR [--yes] | ' +
                 'list [--store DIR]');
   process.exit(2);
+}
+
+// --- §4.4 permissions: derive from interface JSONs, prompt, record ------
+
+// Mirrors core/Module.cpp's origin grammar: https://host[:port], plain
+// http only for localhost/127.0.0.1/[::1]. No path, no wildcard.
+function validOrigin(origin) {
+  const m = origin.match(
+      /^(https?):\/\/(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?$/);
+  if (!m) return false;
+  if (m[1] === 'http' &&
+      !['localhost', '127.0.0.1', '[::1]'].includes(m[2])) {
+    return false;
+  }
+  return true;
+}
+
+// Reads one interface JSON's permission requests; throws on grammar
+// violations so a bad package fails indexing/install loudly.
+function interfacePermissions(text, context) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${context}: ${e.message}`);
+  }
+  const p = doc?.permissions;
+  if (!p) return null;
+  const out = {};
+  if (p.storage) {
+    const quota = p.storage.quota;
+    if (!Number.isInteger(quota) || quota <= 0 || quota > 256 << 20) {
+      throw new Error(`${context}: bad permissions.storage.quota`);
+    }
+    out.storage = { quota };
+  }
+  if (p.network) {
+    const origins = p.network.origins;
+    if (!Array.isArray(origins) || !origins.length ||
+        !origins.every((o) => typeof o === 'string' && validOrigin(o))) {
+      throw new Error(`${context}: bad permissions.network.origins`);
+    }
+    out.network = { origins: [...new Set(origins)].sort() };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// The package-level view: the union of its modules' requests (quota is a
+// per-module namespace, so max, not sum). Derived, never declared twice
+// (§4.4) — this is what indexes embed, prompts show, and records grant.
+function derivePermissions(pkgDir) {
+  const modulesDir = path.join(pkgDir, 'modules');
+  let quota = 0;
+  const origins = new Set();
+  if (fs.existsSync(modulesDir)) {
+    for (const entry of fs.readdirSync(modulesDir).sort()) {
+      if (!entry.endsWith('.json')) continue;
+      const p = interfacePermissions(
+          fs.readFileSync(path.join(modulesDir, entry), 'utf8'),
+          `modules/${entry}`);
+      if (!p) continue;
+      quota = Math.max(quota, p.storage?.quota ?? 0);
+      for (const o of p.network?.origins ?? []) origins.add(o);
+    }
+  }
+  const out = {};
+  if (quota) out.storage = { quota };
+  if (origins.size) out.network = { origins: [...origins].sort() };
+  return Object.keys(out).length ? out : null;
+}
+
+function permissionLines(perms) {
+  const lines = [];
+  for (const o of perms?.network?.origins ?? []) lines.push(`network: ${o}`);
+  if (perms?.storage) {
+    lines.push(`storage: ${perms.storage.quota} bytes`);
+  }
+  return lines;
+}
+
+// True when `want` is fully covered by `granted` (origins subset, quota
+// within) — the silent-inherit test for upgrades.
+function permissionsCovered(want, granted) {
+  if ((want?.storage?.quota ?? 0) > (granted?.storage?.quota ?? 0)) {
+    return false;
+  }
+  const have = new Set(granted?.network?.origins ?? []);
+  return (want?.network?.origins ?? []).every((o) => have.has(o));
+}
+
+// Order-insensitive equality via mutual coverage.
+const permissionsEqual = (a, b) =>
+    permissionsCovered(a, b) && permissionsCovered(b, a);
+
+// The newest installed version's granted set for a package, if any — an
+// upgrade whose requests it covers inherits without a prompt.
+function latestGrant(store, name) {
+  const dir = path.join(store, name);
+  if (!fs.existsSync(dir)) return null;
+  let best = null;
+  let bestSegs = null;
+  for (const v of fs.readdirSync(dir)) {
+    const segs = versionSegments(v);
+    if (!segs) continue;
+    let perms = null;
+    try {
+      perms = JSON.parse(fs.readFileSync(
+          path.join(dir, v, '.installed.json'), 'utf8')).permissions ?? null;
+    } catch {
+      continue;
+    }
+    if (!perms) continue;
+    if (!bestSegs || versionCompare(segs, bestSegs) > 0) {
+      best = perms;
+      bestSegs = segs;
+    }
+  }
+  return best;
+}
+
+function grantsFile() {
+  const state = process.env.XDG_STATE_HOME ||
+                path.join(process.env.HOME ?? '.', '.local', 'state');
+  return path.join(state, 'drift', 'grants.json');
+}
+
+async function confirm(question, yes) {
+  if (yes) return true;
+  if (!process.stdin.isTTY) {
+    console.error('driftpkg: refusing to grant permissions without a ' +
+                  'terminal; re-run with --yes to grant non-interactively');
+    return false;
+  }
+  const rl = readline.createInterface({ input: process.stdin,
+                                        output: process.stderr });
+  const answer = await new Promise((r) => rl.question(question, r));
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
 }
 
 function cmdInit(target) {
@@ -178,6 +319,12 @@ function cmdIndex(repoDir, firstParty) {
     if (typeof manifest.description === 'string') {
       pkg.description = manifest.description;
     }
+    // §4.4: capability requests ride the index so consent is visible
+    // before download; install re-derives and cross-checks.
+    const perms = derivePermissions(pkgDir);
+    if (perms) {
+      pkg.permissions = perms;
+    }
     packages.push(pkg);
   }
   packages.sort((a, b) => (a.name < b.name ? -1 : 1));
@@ -202,7 +349,7 @@ function cmdIndex(repoDir, firstParty) {
   console.log(`indexed ${packages.length} package(s) in ${repoDir}`);
 }
 
-async function cmdInstall(spec, repo, store) {
+async function cmdInstall(spec, repo, store, yes) {
   const get = repoFetcher(repo);
   const index = JSON.parse((await get('index.json')).toString('utf8'));
   if (index.version !== 1) {
@@ -214,7 +361,7 @@ async function cmdInstall(spec, repo, store) {
   if (spec === '--all') {
     const names = [...new Set((index.packages ?? []).map((p) => p.name))];
     for (const name of names.sort()) {
-      await installOne(name, null, null, index, get, repo, store);
+      await installOne(name, null, null, index, get, repo, store, yes);
     }
     return;
   }
@@ -227,10 +374,10 @@ async function cmdInstall(spec, repo, store) {
       (pinText !== null && !pin)) {
     usage();
   }
-  await installOne(name, pin, pinText, index, get, repo, store);
+  await installOne(name, pin, pinText, index, get, repo, store, yes);
 }
 
-async function installOne(name, pin, pinText, index, get, repo, store) {
+async function installOne(name, pin, pinText, index, get, repo, store, yes) {
   // §20.1: bare names are reserved for the first-party library.
   if (!name.includes('.') && !index.firstParty) {
     console.warn(`warning: installing bare-named '${name}' from a ` +
@@ -280,13 +427,92 @@ async function installOne(name, pin, pinText, index, get, repo, store) {
   if (manifest.name !== name || manifest.version !== best.version) {
     throw new Error('manifest does not match the index entry');
   }
+
+  // §4.4 consent. Requests are re-derived from the fetched bytes; an
+  // index that claims something else lies about its payload. An upgrade
+  // covered by an existing grant inherits silently; anything else
+  // prompts, and declining aborts the install.
+  const perms = derivePermissions(staging);
+  if (best.permissions !== undefined &&
+      !permissionsEqual(perms, best.permissions)) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw new Error(`index misstates '${name}' permission requests`);
+  }
+  if (perms) {
+    const prior = latestGrant(store, name);
+    if (permissionsCovered(perms, prior)) {
+      console.error(`'${name}': permissions already granted; carried over`);
+    } else {
+      console.error(`'${name}' requests:`);
+      for (const line of permissionLines(perms)) {
+        console.error(`  ${line}`);
+      }
+      if (prior) {
+        console.error('  (expands the previously granted set)');
+      }
+      if (!(await confirm('Allow? [y/N] ', yes))) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        throw new Error(`permissions not granted for '${name}'`);
+      }
+    }
+  }
+
+  const record = { repository: String(repo), hash: best.hash };
+  if (perms) {
+    record.permissions = perms; // the record is the policy (§4.4)
+  }
   fs.writeFileSync(path.join(staging, '.installed.json'),
-                   JSON.stringify({ repository: String(repo),
-                                    hash: best.hash }, null, 2) + '\n');
+                   JSON.stringify(record, null, 2) + '\n');
   fs.rmSync(dest, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.renameSync(staging, dest);
   console.log(`installed ${name} ${best.version} -> ${dest}`);
+}
+
+// §4.4 grants for a project run directly (drift <project>): union the
+// project's own modules/ with any vendored packages', prompt, and record
+// in the state-dir grants file keyed by the project's real path — where
+// the native runtime reads it (platform/ProjectGrants.h).
+async function cmdGrant(project, yes) {
+  const root = fs.realpathSync(project);
+  const sources = [root];
+  const pkgsDir = path.join(root, 'packages');
+  if (fs.existsSync(pkgsDir)) {
+    for (const entry of fs.readdirSync(pkgsDir)) {
+      sources.push(path.join(pkgsDir, entry));
+    }
+  }
+  let quota = 0;
+  const origins = new Set();
+  for (const source of sources) {
+    const p = derivePermissions(source);
+    if (!p) continue;
+    quota = Math.max(quota, p.storage?.quota ?? 0);
+    for (const o of p.network?.origins ?? []) origins.add(o);
+  }
+  const perms = {};
+  if (quota) perms.storage = { quota };
+  if (origins.size) perms.network = { origins: [...origins].sort() };
+  if (!Object.keys(perms).length) {
+    console.log(`no capability requests in ${root}`);
+    return;
+  }
+  console.error(`project '${root}' requests:`);
+  for (const line of permissionLines(perms)) {
+    console.error(`  ${line}`);
+  }
+  if (!(await confirm('Allow? [y/N] ', yes))) {
+    throw new Error('permissions not granted');
+  }
+  const file = grantsFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let all = {};
+  try {
+    all = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { /* first grant */ }
+  all[root] = { permissions: perms };
+  fs.writeFileSync(file, JSON.stringify(all, null, 2) + '\n');
+  console.log(`granted; recorded in ${file}`);
 }
 
 function cmdList(store) {
@@ -314,11 +540,13 @@ let repo = defaultRepo;
 let store = defaultStore();
 const positional = [];
 let firstParty = false;
+let yes = false;
 while (args.length) {
   const a = args.shift();
   if (a === '--repo') repo = args.shift() ?? usage();
   else if (a === '--store') store = args.shift() ?? usage();
   else if (a === '--first-party') firstParty = true;
+  else if (a === '--yes') yes = true;
   else positional.push(a);
 }
 
@@ -330,7 +558,10 @@ try {
     cmdIndex(positional[0] ?? defaultRepo, firstParty);
   } else if (command === 'install') {
     if (positional.length !== 1) usage();
-    await cmdInstall(positional[0], repo, store);
+    await cmdInstall(positional[0], repo, store, yes);
+  } else if (command === 'grant') {
+    if (positional.length !== 1) usage();
+    await cmdGrant(positional[0], yes);
   } else if (command === 'list') {
     cmdList(store);
   } else {

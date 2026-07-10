@@ -141,21 +141,52 @@ private-network blocking) comes from the platform; natively the runtime
 is the enforcer — the WASM engine only guarantees memory isolation, and
 all policy lives in the host functions.
 
-**Manifest permissions.** The module's package manifest grows a
-`permissions` block; absence of a key means no access. Time and scene
-parameters are always available; mouse and audio are declared inputs:
+**Declaring requests (implemented 2026-07-10; capabilities themselves
+pending).** Requests live in the module's *interface JSON* (§4.5) — not
+in a manifest copy. Derive-not-duplicate: tooling (driftpkg, editors,
+repository indexes) unions `modules/*.json` for the package-level
+display, so the displayed ask and the enforced policy share one source
+that travels inside the hashed package tree:
 
 ```json
 "permissions": {
-  "inputs": ["mouse"],
   "storage": { "quota": 1048576 },
   "network": { "origins": ["https://api.open-meteo.com"] }
 }
 ```
 
-Network grants are origin allowlists (the shape of CSP `connect-src`),
-never blanket access. The installer/editor surfaces the grant, and
-surfaces declared inputs and network origins *together* (§11).
+Network requests are exact-origin allowlists (the shape of CSP
+`connect-src`) — `https://host[:port]`, plain http for localhost only,
+no wildcards — never blanket access. (The earlier `inputs: ["mouse"]`
+labeling idea is deferred: mouse arrives through visible graph wiring,
+and enforcing the label honestly means taint analysis through value
+nodes; storage and network are the real capability surface.)
+
+**Grants and consent (implemented 2026-07-10).** Consent happens at
+tool surfaces, never in the runtime — a wallpaper daemon must not
+render permission dialogs. driftpkg prompts at install (repository
+indexes embed the derived requests so consent is visible *before*
+download; install re-derives from the fetched bytes and hard-errors on
+an index that misstates them; `--yes` for automation, non-TTY refuses
+rather than granting); `driftpkg grant <project>` covers projects run
+directly; editors prompt in their own flows; importers of future
+formats (`.wallpkg`) are installers too. **The grant record is the
+policy**: store packages carry it in `.installed.json` (so grants
+travel with a shared store — grant once natively, the browser editor
+overlay sees it), projects in the state-dir grants file keyed by real
+path. Upgrades whose requests are covered by the existing grant inherit
+silently; expansions re-prompt with the delta.
+
+**Soft-deny.** The runtime only reads records. An ungranted request is
+a load *warning* (naming the missing capability and the driftpkg fix),
+never a load error — the scene renders, and the ungranted capability
+serves the same defined denial code as offline and golden-mode denial:
+one error path modules must handle anyway, so a missing grant degrades
+exactly like a missing network. Enforcement reads only the record's
+concrete values — per-call origin checks against the recorded list,
+byte accounting against the recorded quota — so the text shown at
+consent time *is* the policy enforced, and there is no API surface to
+police beyond the imports the host chose to provide.
 
 **Storage: key-value, not a filesystem.** `get`/`put`/`delete`/`list`
 over a namespace scoped per (scene, module), quota-enforced. Native

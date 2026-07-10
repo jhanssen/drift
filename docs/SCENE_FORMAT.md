@@ -1731,15 +1731,20 @@ package version:
 | `description` | string | optional, from the manifest                      |
 | `files`       | array  | `{ "path", "sha256", "size" }` per file, sorted by path |
 | `hash`        | string | sha256 of the canonical file list (see below)    |
+| `permissions` | object | optional; the §4.4 requests derived from the package's `modules/*.json`, so consent is visible before download |
 
 The package `hash` is `sha256` over the text `"<sha256>  <path>\n"` for
 every file, sorted by path — computable from `files` alone, so a client
 can verify a package fetched file-by-file over HTTP without a tarball.
-Install verifies every file hash and the tree hash, then records
-`{ "repository", "hash" }` beside the package in the store
-(`.installed.json`, ignored by resolution). First-party packages live in
-this repository's top-level `library/`, which is itself a valid package
-repository.
+Install verifies every file hash and the tree hash, re-derives the
+permission requests from the fetched bytes (an index that claims
+otherwise misstates its payload — hard error), obtains consent when they
+are not already covered by an existing grant (DESIGN.md §4.4), then
+records `{ "repository", "hash"[, "permissions"] }` beside the package
+in the store (`.installed.json`, ignored by resolution). The recorded
+`permissions` are the granted policy the runtime enforces; grants travel
+with a shared store. First-party packages live in this repository's
+top-level `library/`, which is itself a valid package repository.
 
 ### 20.5 Validation Additions (§13)
 

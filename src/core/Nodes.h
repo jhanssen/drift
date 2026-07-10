@@ -530,15 +530,20 @@ private:
 // of freezing the wall.
 class ModuleNode : public Node {
 public:
+    // granted: the §4.4 policy from the grant record — what the
+    // capability host calls (storage/network, later slices) enforce
+    // per call. Requests beyond it serve the defined offline denial.
     ModuleNode(std::unique_ptr<ModuleInstance> instance,
-               ModuleInterface iface);
+               ModuleInterface iface, ModulePermissions granted = {});
     void evaluate(FrameContext& ctx) override;
 
     const ModuleInterface& interface() const { return mIface; }
+    const ModulePermissions& granted() const { return mGranted; }
 
 private:
     std::unique_ptr<ModuleInstance> mInstance;
     const ModuleInterface mIface;
+    const ModulePermissions mGranted;
     std::vector<uint8_t> mScratch;      // io exchange staging (host heap)
     std::vector<wgpu::Buffer> mBuffers; // one per buffer output, iface order
     double mLastSeconds = 0.0;

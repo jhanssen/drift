@@ -17,6 +17,7 @@
 #include "core/Scene.h"
 #include "platform/ModuleWasmtime.h"
 #include "platform/PackageStore.h"
+#include "platform/ProjectGrants.h"
 #include "platform/linux/ControlServer.h"
 #include "platform/linux/Gpu.h"
 #include "platform/linux/VideoDecoderFFmpeg.h"
@@ -154,10 +155,25 @@ std::unique_ptr<drift::core::Scene> loadScene(
         return nullptr;
     }
 
+    // §4.4 project grants: `driftpkg grant <project>` records the granted
+    // policy in the state-dir grants file, keyed by the project's real
+    // path; package grants ride the store's .installed.json via readAsset.
+    auto projectGrants =
+        [root](drift::core::ModulePermissions& out) -> bool {
+        std::error_code ec;
+        const fs::path real = fs::canonical(root, ec);
+        if (ec) {
+            return false;
+        }
+        return drift::platform::readProjectGrant(real.string(), out);
+    };
+
     std::vector<std::string> errors, warnings;
-    auto scene = drift::core::Scene::load(
-        sceneJson, readAsset, videoFactory,
-        drift::platform::wasmtimeModuleLoader(), device, errors, warnings);
+    drift::core::ModulePlatform modules{
+        drift::platform::wasmtimeModuleLoader(), projectGrants
+    };
+    auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
+                                          modules, device, errors, warnings);
     for (const auto& w : warnings) {
         fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
     }

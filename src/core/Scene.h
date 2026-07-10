@@ -110,12 +110,13 @@ public:
     // human-readable messages appended to errors; non-fatal findings (§13:
     // unknown fields/properties/hints, unreachable nodes) go to warnings.
     // videoFactory may be null: scenes with video nodes then fail to load.
-    // moduleLoader likewise (§4.5): null means this runtime cannot run
+    // modules.load likewise (§4.5): null means this runtime cannot run
     // WASM modules, and scenes containing a module node fail to load.
+    // Ungranted §4.4 capabilities are warnings, never errors (soft-deny).
     static std::unique_ptr<Scene> load(const std::string& sceneJson,
                                        const AssetReader& readAsset,
                                        const VideoDecoderFactory& videoFactory,
-                                       const ModuleLoader& moduleLoader,
+                                       const ModulePlatform& modules,
                                        const wgpu::Device& device,
                                        std::vector<std::string>& errors,
                                        std::vector<std::string>& warnings);

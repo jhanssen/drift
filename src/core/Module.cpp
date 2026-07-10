@@ -56,7 +56,161 @@ bool parseLiteral(const glz::generic& j, Value& out)
     return false;
 }
 
+// Shared by the interface's request block and grant records' granted
+// block — one grammar, so the consent display and the enforced policy
+// cannot diverge structurally.
+bool parsePermissions(const glz::generic& spec, ModulePermissions& out,
+                      std::string& error)
+{
+    if (!spec.is_object()) {
+        error = "'permissions' must be an object";
+        return false;
+    }
+    const auto& obj = spec.get_object();
+    if (auto it = obj.find("storage"); it != obj.end()) {
+        if (!it->second.is_object()) {
+            error = "'permissions.storage' must be an object";
+            return false;
+        }
+        const auto& storage = it->second.get_object();
+        auto quotaIt = storage.find("quota");
+        if (quotaIt == storage.end() || !quotaIt->second.is_number() ||
+            quotaIt->second.get_number() <= 0 ||
+            quotaIt->second.get_number() !=
+                (double)(uint64_t)quotaIt->second.get_number() ||
+            (uint64_t)quotaIt->second.get_number() > kModuleMaxStorageQuota) {
+            error = "'permissions.storage.quota' must be a positive integer "
+                    "of at most " +
+                    std::to_string(kModuleMaxStorageQuota >> 20) + " MiB";
+            return false;
+        }
+        out.storageQuota = (uint64_t)quotaIt->second.get_number();
+    }
+    if (auto it = obj.find("network"); it != obj.end()) {
+        if (!it->second.is_object()) {
+            error = "'permissions.network' must be an object";
+            return false;
+        }
+        const auto& network = it->second.get_object();
+        auto originsIt = network.find("origins");
+        if (originsIt == network.end() || !originsIt->second.is_array() ||
+            originsIt->second.get_array().empty()) {
+            error = "'permissions.network.origins' must be a non-empty array";
+            return false;
+        }
+        const auto& arr = originsIt->second.get_array();
+        if (arr.size() > kModuleMaxOrigins) {
+            error = "more than " + std::to_string(kModuleMaxOrigins) +
+                    " network origins";
+            return false;
+        }
+        for (const auto& entry : arr) {
+            if (!entry.is_string() ||
+                !ModulePermissions::validOrigin(entry.get_string())) {
+                error = "network origin must be https://host[:port] "
+                        "(plain http only for localhost)";
+                return false;
+            }
+            out.networkOrigins.push_back(entry.get_string());
+        }
+        std::sort(out.networkOrigins.begin(), out.networkOrigins.end());
+        out.networkOrigins.erase(std::unique(out.networkOrigins.begin(),
+                                             out.networkOrigins.end()),
+                                 out.networkOrigins.end());
+    }
+    return true;
+}
+
 } // namespace
+
+bool ModulePermissions::validOrigin(const std::string& origin)
+{
+    std::string rest;
+    bool localOnly = false;
+    if (origin.starts_with("https://")) {
+        rest = origin.substr(8);
+    } else if (origin.starts_with("http://")) {
+        rest = origin.substr(7);
+        localOnly = true;
+    } else {
+        return false;
+    }
+    std::string host;
+    if (!rest.empty() && rest[0] == '[') { // bracketed IPv6 literal
+        const size_t bracket = rest.find(']');
+        if (bracket == std::string::npos) {
+            return false;
+        }
+        host = rest.substr(0, bracket + 1);
+        const std::string inner = rest.substr(1, bracket - 1);
+        if (inner.empty() ||
+            inner.find_first_not_of("0123456789abcdef:.") !=
+                std::string::npos) {
+            return false;
+        }
+        rest = rest.substr(bracket + 1);
+    } else {
+        const size_t colon = rest.find(':');
+        host = colon == std::string::npos ? rest : rest.substr(0, colon);
+        rest = colon == std::string::npos ? std::string()
+                                          : rest.substr(colon);
+        if (host.empty() ||
+            host.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-") !=
+                std::string::npos) {
+            return false;
+        }
+    }
+    if (!rest.empty()) { // :port
+        if (rest[0] != ':' || rest.size() < 2 || rest.size() > 6 ||
+            rest.find_first_not_of("0123456789", 1) != std::string::npos) {
+            return false;
+        }
+    }
+    if (localOnly) {
+        return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+    }
+    return true;
+}
+
+bool ModulePermissions::coveredBy(const ModulePermissions& granted,
+                                  std::vector<std::string>& missing) const
+{
+    const size_t before = missing.size();
+    if (storageQuota > granted.storageQuota) {
+        missing.push_back(
+            "storage (" + std::to_string(storageQuota) + " bytes)");
+    }
+    for (const std::string& origin : networkOrigins) {
+        if (!std::binary_search(granted.networkOrigins.begin(),
+                                granted.networkOrigins.end(), origin)) {
+            missing.push_back("network origin " + origin);
+        }
+    }
+    return missing.size() == before;
+}
+
+bool parseGrantRecord(const std::string& json, ModulePermissions& out)
+{
+    glz::generic doc{};
+    if (auto ec = glz::read_json(doc, json); ec) {
+        return false;
+    }
+    if (!doc.is_object()) {
+        return false;
+    }
+    const auto& top = doc.get_object();
+    auto it = top.find("permissions");
+    if (it == top.end()) {
+        return false;
+    }
+    std::string error;
+    ModulePermissions granted;
+    if (!parsePermissions(it->second, granted, error) || granted.empty()) {
+        return false;
+    }
+    out = granted;
+    return true;
+}
 
 bool ModuleInterface::parse(const std::string& json, ModuleInterface& out,
                             std::string& error)
@@ -80,6 +234,15 @@ bool ModuleInterface::parse(const std::string& json, ModuleInterface& out,
         return false;
     }
     out.abi = kModuleAbiVersion;
+
+    // §4.4 capability requests. Declared here — the interface travels
+    // with the module and is what the host reads; tooling derives any
+    // package-level display from these.
+    if (auto it = top.find("permissions"); it != top.end()) {
+        if (!parsePermissions(it->second, out.permissions, error)) {
+            return false;
+        }
+    }
 
     // Ports are declared as JSON objects (DESIGN.md §4.5). The canonical
     // port order — block layout, event bit assignment, node port order —

@@ -364,7 +364,7 @@ struct LoadResult {
 
 LoadResult load(const std::string& json,
                 const drift::core::VideoDecoderFactory& videoFactory = nullptr,
-                const drift::core::ModuleLoader& moduleLoader = nullptr)
+                const drift::core::ModulePlatform& modules = {})
 {
     const std::map<std::string, std::string> assets = {
         { "shaders/minimal.wgsl", kMinimalWgsl },
@@ -421,7 +421,7 @@ LoadResult load(const std::string& json,
             out = it->second;
             return true;
         },
-        videoFactory, moduleLoader, wgpu::Device(), r.errors, r.warnings);
+        videoFactory, modules, wgpu::Device(), r.errors, r.warnings);
     return r;
 }
 

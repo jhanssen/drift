@@ -41,6 +41,33 @@ inline constexpr uint32_t kModuleHeaderSize = 32;
 inline constexpr uint32_t kModuleMaxEvents = 32; // per direction
 // Guard against absurd staging demands (per buffer output).
 inline constexpr uint64_t kModuleMaxBufferBytes = 64u << 20;
+// §4.4 capability guards.
+inline constexpr uint64_t kModuleMaxStorageQuota = 256u << 20;
+inline constexpr size_t kModuleMaxOrigins = 16;
+
+// §4.4 declared capabilities. The module's interface JSON is where a
+// module *requests* them (derive-not-duplicate: tooling unions these for
+// package-level display; there is no manifest copy to drift out of sync).
+// The same structure holds the *granted* policy read back from a grant
+// record — and the record is what the runtime enforces: requests beyond
+// it are denied with the defined offline-equivalent error, never a load
+// failure (§4.4 soft-deny).
+struct ModulePermissions {
+    uint64_t storageQuota = 0;              // 0 = no storage capability
+    std::vector<std::string> networkOrigins; // exact origins, sorted
+
+    bool empty() const { return storageQuota == 0 && networkOrigins.empty(); }
+
+    // True when this request is fully covered by `granted`; otherwise
+    // appends one human-readable line per missing capability (the load
+    // warning bodies).
+    bool coveredBy(const ModulePermissions& granted,
+                   std::vector<std::string>& missing) const;
+
+    // Validates one origin: https://host[:port], or plain http for
+    // localhost/127.0.0.1/[::1] (dev only). No path, no wildcard.
+    static bool validOrigin(const std::string& origin);
+};
 
 // Header field offsets (all little-endian, the WASM memory order).
 enum ModuleHeaderField : uint32_t {
@@ -73,6 +100,7 @@ struct ModuleInterface {
     };
 
     uint32_t abi = 0;
+    ModulePermissions permissions; // §4.4 requests; empty = none
     std::vector<Input> inputs;
     std::vector<Output> outputs;
     // Set by computeLayout():
@@ -110,5 +138,23 @@ public:
 // modules; scenes containing one fail to load with a clear message.
 using ModuleLoader = std::function<std::unique_ptr<ModuleInstance>(
     const std::string& wasmBytes, uint32_t ioSize, std::string& error)>;
+
+// Parses a grant record's "permissions" into the granted policy (§4.4).
+// Grant records are written by consent surfaces — driftpkg at install
+// (the store's .installed.json), `driftpkg grant` for projects, editors
+// later — and only ever *read* by the runtime. Returns false when the
+// record is absent, unparseable, or grants nothing.
+bool parseGrantRecord(const std::string& json, ModulePermissions& out);
+
+// Everything the platform contributes to module nodes. Package modules'
+// grants resolve through the ordinary asset reader (the package's
+// .installed.json travels with the store); projectGrants covers modules
+// living in the project itself. Null members degrade legibly: no loader
+// fails module scenes with a clear message, no grants means ungranted
+// (soft-deny warnings, §4.4).
+struct ModulePlatform {
+    ModuleLoader load;
+    std::function<bool(ModulePermissions&)> projectGrants;
+};
 
 } // namespace drift::core

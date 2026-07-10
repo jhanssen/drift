@@ -332,9 +332,12 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
 
     gModulesPending = false;
     std::vector<std::string> errors, warnings;
+    // Package grants ride the store's .installed.json through readAsset;
+    // no project-grant surface in the browser yet (the editor prompt is a
+    // later slice) — ungranted capabilities warn and read as offline.
+    drift::core::ModulePlatform modules{ makeModuleInstance, nullptr };
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
-                                          makeModuleInstance, device, errors,
-                                          warnings);
+                                          modules, device, errors, warnings);
     if (!scene && gModulesPending) {
         // Retried verbatim by drift_modules_ready() once compiles land.
         gRetryJson = (jsonInOut && !jsonInOut->empty()) ? *jsonInOut

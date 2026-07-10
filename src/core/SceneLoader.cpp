@@ -496,11 +496,11 @@ class Loader {
 public:
     Loader(const AssetReader& readAsset,
            const VideoDecoderFactory& videoFactory,
-           const ModuleLoader& moduleLoader,
+           const ModulePlatform& modules,
            const wgpu::Device& device, std::vector<std::string>& errors,
            std::vector<std::string>& warnings)
         : mReadAsset(readAsset), mVideoFactory(videoFactory),
-          mModuleLoader(moduleLoader), mDevice(device), mErrors(errors),
+          mModules(modules), mDevice(device), mErrors(errors),
           mWarnings(warnings)
     {
     }
@@ -555,7 +555,7 @@ private:
 
     const AssetReader& mReadAsset;
     const VideoDecoderFactory& mVideoFactory;
-    const ModuleLoader& mModuleLoader;
+    const ModulePlatform& mModules;
     const wgpu::Device& mDevice;
     std::vector<std::string>& mErrors;
     std::vector<std::string>& mWarnings;
@@ -2189,12 +2189,42 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
         }
         iface.computeLayout();
 
-        if (!mModuleLoader) {
+        // §4.4 grants: the record is the policy. Package modules carry
+        // theirs in the store's .installed.json (read through the
+        // ordinary asset reader, so a shared store shares its grants);
+        // project-local modules use the platform's project record.
+        // Ungranted capability requests are warnings — the module loads
+        // and the excess serves the defined offline-equivalent denial.
+        ModulePermissions granted;
+        if (!iface.permissions.empty()) {
+            bool haveRecord = false;
+            if (!raw.assetRoot.empty()) {
+                std::string recordJson;
+                haveRecord =
+                    mReadAsset(raw.assetRoot + ".installed.json",
+                               recordJson) &&
+                    parseGrantRecord(recordJson, granted);
+            } else if (mModules.projectGrants) {
+                haveRecord = mModules.projectGrants(granted);
+            }
+            (void)haveRecord;
+            std::vector<std::string> missing;
+            if (!iface.permissions.coveredBy(granted, missing)) {
+                for (const std::string& m : missing) {
+                    warn("node '" + raw.id + "': module requests " + m +
+                         " — not granted; the capability reads as offline "
+                         "(§4.4). Grant with driftpkg (install prompt, or "
+                         "'driftpkg grant' for project modules).");
+                }
+            }
+        }
+
+        if (!mModules.load) {
             fail("node '" + raw.id +
                  "': this runtime cannot run WASM modules");
             return nullptr;
         }
-        auto instance = mModuleLoader(wasmBytes, iface.ioSize, err);
+        auto instance = mModules.load(wasmBytes, iface.ioSize, err);
         if (!instance) {
             fail("node '" + raw.id + "': " + wasmPath + ": " + err);
             return nullptr;
@@ -2210,7 +2240,8 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             def.def = in.def.v;
             portsOut.push_back(std::move(def));
         }
-        return new ModuleNode(std::move(instance), std::move(iface));
+        return new ModuleNode(std::move(instance), std::move(iface),
+                              std::move(granted));
     }
 
     if (raw.type == "image") {
@@ -3162,12 +3193,12 @@ std::string nodePortsJson()
 std::unique_ptr<Scene> Scene::load(const std::string& sceneJson,
                                    const AssetReader& readAsset,
                                    const VideoDecoderFactory& videoFactory,
-                                   const ModuleLoader& moduleLoader,
+                                   const ModulePlatform& modules,
                                    const wgpu::Device& device,
                                    std::vector<std::string>& errors,
                                    std::vector<std::string>& warnings)
 {
-    Loader loader(readAsset, videoFactory, moduleLoader, device, errors,
+    Loader loader(readAsset, videoFactory, modules, device, errors,
                   warnings);
     auto scene = loader.load(sceneJson);
     if (!scene && errors.empty()) {

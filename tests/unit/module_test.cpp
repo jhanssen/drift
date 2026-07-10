@@ -225,6 +225,59 @@ TEST_CASE("module interface: buffer layout and validation (§4.5)")
     CHECK(parseError(many).find("event inputs") != std::string::npos);
 }
 
+TEST_CASE("module permissions: request grammar (§4.4)")
+{
+    ModuleInterface iface = parseIface(R"({
+        "abi": 1,
+        "permissions": {
+            "storage": { "quota": 65536 },
+            "network": { "origins": ["https://api.example.com",
+                                     "http://localhost:8080"] }
+        },
+        "outputs": { "x": { "type": "scalar" } } })");
+    CHECK(iface.permissions.storageQuota == 65536);
+    REQUIRE(iface.permissions.networkOrigins.size() == 2);
+    CHECK(iface.permissions.networkOrigins[0] == "http://localhost:8080");
+
+    // Plain http only for localhost; no paths; positive bounded quota.
+    CHECK(parseError(R"({ "abi": 1, "permissions": {
+            "network": { "origins": ["http://evil.example.com"] } },
+        "outputs": { "x": { "type": "scalar" } } })")
+              .find("origin") != std::string::npos);
+    CHECK(parseError(R"({ "abi": 1, "permissions": {
+            "network": { "origins": ["https://api.example.com/v1"] } },
+        "outputs": { "x": { "type": "scalar" } } })")
+              .find("origin") != std::string::npos);
+    CHECK(parseError(R"({ "abi": 1, "permissions": {
+            "storage": { "quota": 0 } },
+        "outputs": { "x": { "type": "scalar" } } })")
+              .find("quota") != std::string::npos);
+
+    CHECK(ModulePermissions::validOrigin("https://[2001:db8::1]:8443"));
+    CHECK(!ModulePermissions::validOrigin("https://"));
+    CHECK(!ModulePermissions::validOrigin("wss://api.example.com"));
+    CHECK(!ModulePermissions::validOrigin("https://api.example.com:"));
+
+    // Coverage: the record is the policy; excess requests are the
+    // missing list (the load-warning bodies).
+    ModulePermissions granted;
+    granted.storageQuota = 1024;
+    granted.networkOrigins = { "https://api.example.com" };
+    ModulePermissions want;
+    want.storageQuota = 2048;
+    want.networkOrigins = { "https://api.example.com",
+                            "https://other.example.com" };
+    std::vector<std::string> missing;
+    CHECK(!want.coveredBy(granted, missing));
+    REQUIRE(missing.size() == 2);
+    CHECK(missing[0].find("storage") != std::string::npos);
+    CHECK(missing[1].find("other.example.com") != std::string::npos);
+    want.storageQuota = 1024;
+    want.networkOrigins = { "https://api.example.com" };
+    missing.clear();
+    CHECK(want.coveredBy(granted, missing));
+}
+
 TEST_CASE("module node: pure CPU transform — values in, values out (§4.5)")
 {
     ModuleInterface iface = parseIface(kBrainIface);
@@ -389,9 +442,12 @@ struct LoadResult {
     }
 };
 
-LoadResult loadScene(const std::string& nodesJson, bool withLoader = true)
+LoadResult loadScene(const std::string& nodesJson, bool withLoader = true,
+                     const std::map<std::string, std::string>& extraAssets = {},
+                     const std::function<bool(ModulePermissions&)>&
+                         projectGrants = nullptr)
 {
-    const std::map<std::string, std::string> assets = {
+    std::map<std::string, std::string> assets = {
         { "modules/brain.json", kBrainIface },
         { "modules/brain.wasm", std::string("\0asm-fake", 9) },
         { "modules/pts12.json", kPts12Iface },
@@ -399,11 +455,15 @@ LoadResult loadScene(const std::string& nodesJson, bool withLoader = true)
         { "shaders/minimal.wgsl", kMinimalWgsl },
         { "shaders/vec4consumer.wgsl", kVec4ConsumerWgsl },
     };
+    for (const auto& [path, contents] : extraAssets) {
+        assets[path] = contents;
+    }
     LoadResult r;
-    ModuleLoader loader;
+    ModulePlatform platform;
+    platform.projectGrants = projectGrants;
     if (withLoader) {
-        loader = [&r](const std::string&, uint32_t ioSize,
-                      std::string&) -> std::unique_ptr<ModuleInstance> {
+        platform.load = [&r](const std::string&, uint32_t ioSize,
+                             std::string&) -> std::unique_ptr<ModuleInstance> {
             auto fake = std::make_unique<FakeModule>(ioSize);
             r.modules.push_back(fake.get());
             r.ioSizes.push_back(ioSize);
@@ -422,7 +482,7 @@ LoadResult loadScene(const std::string& nodesJson, bool withLoader = true)
             out = it->second;
             return true;
         },
-        nullptr, loader, wgpu::Device(), r.errors, r.warnings);
+        nullptr, platform, wgpu::Device(), r.errors, r.warnings);
     return r;
 }
 
@@ -514,4 +574,78 @@ TEST_CASE("module loader: buffer outputs stride-check like compute (§18.1)")
         { "id": "out", "type": "output", "inputs": { "color": "@brain.pts" } })");
     CHECK(r.scene == nullptr);
     CHECK(r.hasError("'capacity' must be a positive integer"));
+}
+
+TEST_CASE("module grants: soft-deny — ungranted warns, still loads (§4.4)")
+{
+    const char* kCapIface = R"({
+        "abi": 1,
+        "permissions": {
+            "network": { "origins": ["https://api.example.com"] } },
+        "outputs": { "level": { "type": "scalar" } } })";
+    const std::map<std::string, std::string> capAssets = {
+        { "modules/cap.json", kCapIface },
+    };
+    const std::string nodes = R"(
+        { "id": "brain", "type": "module", "module": "modules/brain.wasm",
+          "interface": "modules/cap.json" },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@brain.level" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx.result" } })";
+
+    // No grant record anywhere: loads with the §4.4 warning.
+    auto r = loadScene(nodes, true, capAssets);
+    REQUIRE(r.scene != nullptr);
+    REQUIRE(r.warnings.size() == 1);
+    CHECK(r.warnings[0].find("api.example.com") != std::string::npos);
+    CHECK(r.warnings[0].find("not granted") != std::string::npos);
+
+    // A covering project grant: no warning.
+    r = loadScene(nodes, true, capAssets, [](ModulePermissions& out) {
+        out.networkOrigins = { "https://api.example.com" };
+        return true;
+    });
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty());
+}
+
+TEST_CASE("module grants: package grants ride .installed.json (§4.4)")
+{
+    const std::map<std::string, std::string> pkg = {
+        { "packages/cap/manifest.json",
+          R"({ "name": "cap", "version": "1.0.0" })" },
+        { "packages/cap/graphs/cap.json", R"({
+            "version": 1, "name": "Cap",
+            "outputs": { "result": "@m.level" },
+            "nodes": [ { "id": "m", "type": "module",
+                         "module": "modules/cap.wasm",
+                         "interface": "modules/cap.json" } ] })" },
+        { "packages/cap/modules/cap.wasm", "fake" },
+        { "packages/cap/modules/cap.json", R"({
+            "abi": 1,
+            "permissions": {
+                "network": { "origins": ["https://api.example.com"] } },
+            "outputs": { "level": { "type": "scalar" } } })" },
+    };
+    const std::string nodes = R"(
+        { "id": "g", "type": "graph", "graph": "packages/cap/graphs/cap.json" },
+        { "id": "fx", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": "@g" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@fx.result" } })";
+
+    // Installed but never granted: warning.
+    auto r = loadScene(nodes, true, pkg);
+    REQUIRE(r.scene != nullptr);
+    REQUIRE(r.warnings.size() == 1);
+    CHECK(r.warnings[0].find("not granted") != std::string::npos);
+
+    // The record driftpkg writes at consent: covered, silent.
+    auto granted = pkg;
+    granted["packages/cap/.installed.json"] = R"({
+        "repository": "https://repo.example.com",
+        "permissions": {
+            "network": { "origins": ["https://api.example.com"] } } })";
+    r = loadScene(nodes, true, granted);
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.warnings.empty());
 }

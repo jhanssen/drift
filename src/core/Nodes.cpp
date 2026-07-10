@@ -3712,8 +3712,9 @@ void TrailsNode::evaluate(FrameContext& ctx)
 // ---- ModuleNode (DESIGN.md §4.5) ----
 
 ModuleNode::ModuleNode(std::unique_ptr<ModuleInstance> instance,
-                       ModuleInterface iface)
-    : mInstance(std::move(instance)), mIface(std::move(iface))
+                       ModuleInterface iface, ModulePermissions granted)
+    : mInstance(std::move(instance)), mIface(std::move(iface)),
+      mGranted(std::move(granted))
 {
     // Outputs are named and typed at construction (like compute), so load
     // time can resolve references and validate buffer strides before the
