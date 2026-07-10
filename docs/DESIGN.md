@@ -99,8 +99,8 @@ Responsibilities:
 Modules operate on:
 
 - **Input buffer** (provided by host)
-  - mouse position
-  - audio analysis
+  - mouse position (declared input — §4.4)
+  - audio analysis (declared input — §4.4)
   - time
   - scene parameters
 - **Output buffer**
@@ -116,9 +116,229 @@ Host writes inputs → WASM update() → outputs written → host applies change
 ### 4.3 Host API
 
 - Minimal, data-oriented ABI
-- No direct rendering access
-- No filesystem or network access
+- No direct rendering access — no GPU object ever crosses the module
+  boundary; GPU-using effects are composed declaratively (§4.5)
+- Default-deny I/O: a module gets no storage or network unless it
+  declares the capability and the user grants it (§4.4)
 - Stable versioned interface
+
+### 4.4 Declared Capabilities: Storage & Network
+
+Design revised 2026-07-10 (modules themselves remain post-v1, §13.3).
+The original blanket "no filesystem or network access" is relaxed to
+**default-deny plus declared capabilities**. The load-bearing invariant
+was never "no I/O" — it is §4.1's *no ambient authority*: the host API
+is the only capability surface. Storage and HTTP extend that surface as
+capabilities a module must declare in its manifest and the user must
+grant at install time; an undeclared capability does not exist, so
+today's behavior remains the default.
+
+Because the same module runs unmodified in both runtimes (§4.1), the
+portability rule is: **the browser is the stricter envelope — design
+the ABI to the browser's envelope and re-implement that envelope
+natively.** In the browser, enforcement (CORS, storage quotas,
+private-network blocking) comes from the platform; natively the runtime
+is the enforcer — the WASM engine only guarantees memory isolation, and
+all policy lives in the host functions.
+
+**Manifest permissions.** The module's package manifest grows a
+`permissions` block; absence of a key means no access. Time and scene
+parameters are always available; mouse and audio are declared inputs:
+
+```json
+"permissions": {
+  "inputs": ["mouse"],
+  "storage": { "quota": 1048576 },
+  "network": { "origins": ["https://api.open-meteo.com"] }
+}
+```
+
+Network grants are origin allowlists (the shape of CSP `connect-src`),
+never blanket access. The installer/editor surfaces the grant, and
+surfaces declared inputs and network origins *together* (§11).
+
+**Storage: key-value, not a filesystem.** `get`/`put`/`delete`/`list`
+over a namespace scoped per (scene, module), quota-enforced. Native
+backs it with a per-namespace file under `$XDG_STATE_HOME/drift/`; the
+browser backs it with OPFS partitioned the same way. The module never
+sees a path, so traversal is structurally impossible and the semantics
+are identical on both targets. If the browser module host runs in a
+worker, OPFS sync-access handles permit a *synchronous* storage ABI
+matching native — decide before freezing the ABI (§13.1). Storage
+shared across scenes by package identity is deliberately absent (it is
+a tracking channel); opt-in sharing is reserved if a real need appears.
+
+**HTTP: fetch-shaped, asynchronous, handle-based.** `update()` is a
+synchronous buffer exchange and browser fetch cannot block, so a module
+issues a request descriptor, receives a handle, and observes completion
+in a later `update()`. Native enforcement to match the browser
+envelope: origins from the manifest allowlist only; HTTPS-only (plain
+`http://localhost` permitted only in `--windowed`/dev modes);
+private/link-local address ranges blocked, with the check applied
+*post-DNS-resolution* (DNS-rebinding defense); redirects confined to
+the allowlist; response-size and request-rate caps. CORS applies in the
+browser build and cannot be waived, so the browser is the compatibility
+floor: modules must target CORS-permissive endpoints, or they will work
+natively and silently fail in the web editor.
+
+**Determinism.** Deterministic modules underpin golden tests and scrub
+preview (SCENE_FORMAT.md §16.1). Capabilities are injected effects: in
+headless/golden/scrub modes the host denies them with a defined error
+code (indistinguishable from being offline, which modules must handle
+anyway) or replays recorded responses. The failure/offline semantics
+are part of the ABI from day one, not an afterthought.
+
+**Power.** Network completions and retry timers ride §3.2's
+non-frame-based updates; the host coalesces and rate-limits requests so
+a polling module (weather, transit) does not defeat the idle story.
+
+### 4.5 Modules and the GPU: Ports, Not Pipelines
+
+Design adopted 2026-07-10 (implementation post-v1 with modules, §13.3).
+**Everything that crosses the module boundary is data** — values,
+events, buffer contents — never a GPU handle. Modules do not create
+pipelines, encode passes, or submit work; a "GPU-using WASM effect" is
+a *package* (SCENE_FORMAT.md §20) whose subgraph composes ordinary
+reflected `shader`/`compute`/`sprites` nodes with one **`module` node**
+— the WASM brain — wired to them with ordinary edges. The reduction
+that makes this sufficient: a declared pipeline is exactly a
+`shader`/`compute` node (WGSL reflected into ports, §9.10/§18.2); a set
+of pipelines with intermediate textures/buffers is exactly a subgraph
+(§19); the distributable bundle is exactly a package. N pipelines need
+no new machinery — they are edges, and the engine owns allocation,
+topological ordering, synchronization, and dirty propagation.
+
+**The `module` node.** Properties: `module` (wasm path), `interface`
+(JSON path — there is no WGSL to reflect, so ports are declared):
+
+```json
+{
+  "abi": 1,
+  "inputs": {
+    "attractor": { "type": "vec2",   "default": [0.5, 0.5] },
+    "tick":      { "type": "scalar", "default": 0.0 },
+    "excite":    { "type": "event" }
+  },
+  "outputs": {
+    "goals": { "type": "buffer", "stride": 16, "capacity": 4096 },
+    "heat":  { "type": "scalar" },
+    "burst": { "type": "event" }
+  }
+}
+```
+
+Types are the SCENE_FORMAT.md §4 system; `buffer` is permitted on
+**outputs only** (below). Buffer outputs follow §18.1 — fixed stride
+and capacity at load; a graph node property may override `capacity`
+(the `compute` pattern). Module ports are ordinary ports: wireable,
+referenced as `brain.goals`, rendered by the editor like any node.
+
+**ABI.** Module exports `drift_abi()` (version, must match the
+interface's `abi`), `drift_init(io)`, `drift_update()`. The host
+computes one I/O block layout *from the interface JSON* (declaration
+order; 4/8/16-byte alignment by type), places it in the module's linear
+memory, and exchanges data around each `drift_update()` — no per-value
+host calls. Browser glue reads/writes the WASM memory directly, so the
+ABI is identical on both targets by construction. The block begins with
+an implicit header:
+
+```c
+struct DriftHeader {
+  float    time;           // scene time, seconds (non-decreasing)
+  float    dt;             // since this node's last update; 0 on first
+  uint32_t frame;          // scene frame counter
+  uint32_t flags;          // bit 0: first update after (re)load
+  uint32_t events_in;      // bitmask over declared input events
+  uint32_t events_out;     // module sets; host reads and clears
+  uint32_t wake_after_ms;  // 0 = none; else "run me again in ≤ N ms"
+  uint32_t _reserved;
+};
+```
+
+then input values, then value outputs, then per buffer output a
+`{count, written}` control pair followed by `capacity × stride` bytes
+of staging. On `written = 1` the host performs one `queue.writeBuffer`
+from the staging region and clears the flag. The engine creates and
+owns every GPU resource; the module only ever writes its own linear
+memory. GPU-to-GPU intermediates between pipelines never round-trip
+through the module.
+
+**Execution hosts (decided 2026-07-10).** Native embeds **Wasmtime**
+via its C API, as a prebuilt per-platform tarball (the Dawn precedent —
+pin versions and hashes, use signed releases). Configuration: WASI
+disabled entirely (the §4.3/§4.4 host imports are the only capability
+surface); epoch interruption armed around each `drift_update()` as the
+runaway-module watchdog (trap → disable the node, never freeze the
+wall); NaN canonicalization on, so goldens and §16.1 recorded passes
+hold across machines and backends; the Pulley interpreter as the
+hardened default (no executable-memory allocation —
+`MemoryDenyWriteExecute`-compatible) with Cranelift JIT as opt-in; one
+store/instance per node, so two nodes sharing a module file get private
+memories. Decisive criteria over the contingency: the engine is the
+security boundary for untrusted community content in a persistent
+desktop process, so a memory-safe implementation, first-class
+interruption, and determinism knobs outweigh footprint. **WAMR**
+(interpreter-only, FetchContent from source) is the recorded fallback
+if the tarball or binary size ever becomes untenable. In the
+**browser** there is no embedded engine: each module is an ordinary
+`WebAssembly.Instance` beside the Emscripten-compiled runtime — one
+compiled `WebAssembly.Module` per file, one instance per node — driven
+by the same shared-C++ graph evaluator through a thin JS
+memcpy-and-call bridge (scheduling, block layout, change detection, and
+capability *policy* all stay in shared core code; the bridge is
+deliberately too dumb to diverge). Buffer staging may upload straight
+from the module instance's memory via `queue.writeBuffer`, skipping the
+runtime heap entirely.
+
+**Scheduling & dirtiness.** The node executes when an input port is
+dirty, an input event fires, `wake_after_ms` elapses (§3.2's timer
+wake — what a §4.4 polling module uses), or its tick input is wired to
+`@time.delta` (the §18.1 simulation idiom; gate the wire to pause).
+Value outputs are change-detected like value nodes; events are dirty
+when fired; buffer outputs are dirty **only when `written` is set** — a
+refinement of §18.1's dirty-on-execute that the staging flag enables. A
+brain that wakes and writes nothing propagates no GPU work: the idle
+story holds end to end.
+
+**Shaders stay separate text files.** The wasm contains no WGSL and
+knows nothing of pipelines. Sibling `.wgsl` files keep reflection as
+the interface mechanism, stay auditable/signable/load-validated and
+repository-hashable, hot-reload through the editor's existing path, and
+remain reusable by other scenes (§20.2 bare-shader references). The
+brain↔shader contract cannot version-skew (the package is the atomic
+unit, resolved per version) and is checked mechanically at load
+(§18.1 stride matching).
+
+**Deliberately absent.** Runtime-generated WGSL (unauditable,
+unsignable, unvalidatable at load — permanently excluded). Buffer and
+texture *inputs* to modules — GPU→CPU readback stalls the frame;
+restructure so the GPU consumes CPU data, or use indirect dispatch
+(reserved) when the GPU must drive its own workload size. An explicitly
+asynchronous, frames-late readback port is a possible later addition,
+as a separate decision.
+
+**Rejected alternatives** (recorded so they are not re-litigated):
+
+- *Raw WebGPU access from modules.* Survivable on security grounds
+  (Dawn/browser validation is designed for hostile input) but not on
+  architectural ones: an opaque command stream defeats dirty-driven
+  idling, editor introspection, determinism/goldens, and texture-pool
+  lifetime analysis; it re-exports a huge, still-evolving API through a
+  boundary that promises a stable versioned interface (§4.3); and
+  resource appetite (VRAM exhaustion, pathological dispatches, GPU
+  hangs) lands on the device shared with the whole desktop session.
+- *A mediated handle-table GPU ABI* (declared ports for I/O, but the
+  module records passes against host-owned encoders via opaque handles;
+  `dawn_wire` prior art). Fixes the security and graph-integration
+  problems, but is a permanent ABI-maintenance tax that the declarative
+  form makes unnecessary.
+
+**Reserved growth** (mirrored in SCENE_FORMAT.md §15): a declared
+`draw`/mesh node (vertex+fragment WGSL reflected like everything else,
+geometry via `buffer` ports — the §13.3 3D plan, which this makes
+implementable as a package); `compute.dispatch` promoted from property
+to wireable port; indirect dispatch; subgraph iteration for dynamic
+pass counts; async readback ports.
 
 ## 5. Editor System
 
@@ -347,8 +567,40 @@ index.json
 - No dynamic libraries
 - WASM sandbox isolation
 - Explicit host API surface
-- No filesystem/network access for modules
+- Default-deny I/O for modules: storage and network exist only as
+  manifest-declared, user-granted capabilities (§4.4)
 - Optional signed packages for trust verification
+
+**Exfiltration threat model (2026-07-10).** Granting a module both a
+sensitive input and network access creates a channel the sandbox cannot
+close: an author who controls both the module and an allowlisted origin
+can stream inputs out, and no server-consent mechanism (CORS) applies
+when the receiving server is a cooperating party — the same is true of
+any web page. What makes the web's version tolerable is scoping: a page
+sees the mouse only over its own viewport, only while its tab is open,
+on a site the user chose to visit. A wallpaper breaks both assumptions —
+it is persistent and its inputs are global (desktop-wide mouse, later
+audio). Defenses, honestly ranked:
+
+1. **Legible consent** — the installer shows declared inputs and
+   network origins together: "reads mouse, talks to
+   api.wallpaperguy.example" reads very differently from "talks to
+   api.open-meteo.com, reads nothing". The combination is the signal;
+   either alone looks innocent.
+2. **Capability minimization** — mouse/audio enter the input buffer
+   only if declared (§4.4), so the dangerous combination is rare and
+   conspicuous rather than default. Most network-using modules need no
+   pointer data at all.
+3. **Channel degradation** — quantized or rate-limited pointer data for
+   network-capable modules raises effort but prevents nothing;
+   exfiltration needs trivial bandwidth.
+4. **Distribution trust** — signing, review, and reputation at the
+   repository layer (§9), where a malicious author is actually fought.
+
+A user who grants mouse + network-to-author-origin to a malicious
+package has authorized the exfiltration. The design goal is to make
+that grant explicit, rare, and legible — not to pretend the sandbox can
+prevent a data flow the user approved.
 
 ## 12. Ecosystem Goals
 
@@ -369,7 +621,7 @@ To be nailed down on paper before runtime implementation begins:
 
 - `scene.json` schema: nodes, connections, parameter bindings, asset references, user-tweakable parameters
 - Graph type system and evaluation semantics: edge types (texture, buffer, scalar, vector, event), load-time validation, invalid-graph behavior, precise dirty/damage semantics for dependency-driven updates
-- WASM host ABI: buffer memory layout, parameter identification, `update()` signature, version negotiation; choice of embedded WASM engine
+- WASM host ABI: buffer memory layout, parameter identification, `update()` signature, version negotiation; capability ABI (§4.4) — storage calls (sync vs. worker-backed), HTTP request handles, and the defined denial/offline error codes; the §4.5 module-node interface JSON and I/O block layout. The embedded engine is decided: Wasmtime natively, browser-native instances in the web build (§4.5)
 - Two or three hand-written example scenes against the draft schema, to validate the format before any code exists
 
 ### 13.2 V1 Scope

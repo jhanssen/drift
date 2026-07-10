@@ -719,8 +719,18 @@ accounts for but v1 does not implement:
 - Damage-rectangle dirty granularity for textures (§11)
 - Arithmetic value nodes: discharged (§9.9); further growth reserved
 - Additional implicit input nodes (e.g. `audio`) (§9.7)
-- `modules/` (WASM logic) project directory (§1); `graphs/` is discharged
-  by §19
+- `modules/` (WASM logic) project directory (§1), and with it the
+  package-manifest `permissions` block (declared inputs, storage quota,
+  network origin allowlist) for module capabilities (DESIGN.md §4.4);
+  `graphs/` is discharged by §19
+- The `module` node type (DESIGN.md §4.5): WASM logic as a graph node
+  with JSON-declared typed ports — `buffer` outputs staged in module
+  memory, uploaded and marked dirty only on a written flag (refining
+  §18.1's dirty-on-execute). Companions reserved with it: a declared
+  `draw`/mesh node (vertex+fragment WGSL, geometry via `buffer` ports),
+  `dispatch` promoted from property to wireable port on `compute`,
+  indirect dispatch, subgraph iteration for dynamic pass counts, and
+  async GPU→CPU readback ports
 
 ## 16. Events & Sequencing (adopted)
 
