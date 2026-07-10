@@ -3712,9 +3712,10 @@ void TrailsNode::evaluate(FrameContext& ctx)
 // ---- ModuleNode (DESIGN.md §4.5) ----
 
 ModuleNode::ModuleNode(std::unique_ptr<ModuleInstance> instance,
-                       ModuleInterface iface, ModulePermissions granted)
-    : mInstance(std::move(instance)), mIface(std::move(iface)),
-      mGranted(std::move(granted))
+                       ModuleInterface iface, ModulePermissions granted,
+                       std::unique_ptr<ModuleStorage> storage)
+    : mStorage(std::move(storage)), mInstance(std::move(instance)),
+      mIface(std::move(iface)), mGranted(std::move(granted))
 {
     // Outputs are named and typed at construction (like compute), so load
     // time can resolve references and validate buffer strides before the
@@ -3805,6 +3806,9 @@ void ModuleNode::evaluate(FrameContext& ctx)
     if (!mInstance->update(err)) {
         die("trapped: " + err);
         return;
+    }
+    if (mStorage) {
+        mStorage->maybeFlush(ctx.seconds); // §4.4 debounced write-behind
     }
 
     // Value outputs: change-detected like any value node. Event outputs:

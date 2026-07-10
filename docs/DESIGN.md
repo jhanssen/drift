@@ -141,8 +141,9 @@ private-network blocking) comes from the platform; natively the runtime
 is the enforcer — the WASM engine only guarantees memory isolation, and
 all policy lives in the host functions.
 
-**Declaring requests (implemented 2026-07-10; capabilities themselves
-pending).** Requests live in the module's *interface JSON* (§4.5) — not
+**Declaring requests (implemented 2026-07-10; network capability still
+pending, storage implemented — see below).** Requests live in the
+module's *interface JSON* (§4.5) — not
 in a manifest copy. Derive-not-duplicate: tooling (driftpkg, editors,
 repository indexes) unions `modules/*.json` for the package-level
 display, so the displayed ask and the enforced policy share one source
@@ -176,6 +177,23 @@ travel with a shared store — grant once natively, the browser editor
 overlay sees it), projects in the state-dir grants file keyed by real
 path. Upgrades whose requests are covered by the existing grant inherit
 silently; expansions re-prompt with the delta.
+
+**Storage (implemented 2026-07-10, both targets).** A synchronous
+key-value store per (scene, module): `drift_storage_get/put/delete/keys`
+imports over a host-memory working copy (read-your-writes, identical
+semantics on both targets — the sync-vs-worker question §4.5 left open
+is resolved as *no worker*: the working copy is host memory, and
+persistence is asynchronous write-behind, debounced to 1s of scene time
+plus a flush at teardown). Quota is the granted policy, counted as
+Σ(key+value bytes); the ABI, error codes, and blob format live in
+core/Module.h. Native persists one blob per (project-hash, node id)
+under `$XDG_STATE_HOME/drift/module-storage/`, written atomically;
+the browser preloads an IndexedDB cache before the first scene load
+(start gates on it) and saves through it fire-and-forget. Headless and
+golden runs get no backend: in-memory stores with a deterministic empty
+start every run — the storage face of the defined-denial family below.
+Durability is deliberately eventual (a killed tab may lose the last
+second); module state is a cache, never content.
 
 **Soft-deny.** The runtime only reads records. An ungranted request is
 a load *warning* (naming the missing capability and the driftpkg fix),
@@ -237,9 +255,10 @@ artifacts do not — and the engine still probes `pulley64` with an empty
 module at startup, falling back to the Cranelift JIT with one stderr
 line if a Pulley-less build is ever substituted. Pulley and JIT produce
 bit-identical module output (NaN canonicalization + IEEE f32), so
-goldens hold across backends. Not yet implemented: `wake_after_ms`
-(accepted, not honored) and the §4.4 storage/network capability
-imports.
+goldens hold across backends. The §4.4 storage capability is
+implemented on both targets (2026-07-10). Not yet implemented:
+`wake_after_ms` (accepted, not honored) and the §4.4 network
+capability.
 **Everything that crosses the module boundary is data** — values,
 events, buffer contents — never a GPU handle. Modules do not create
 pipelines, encode passes, or submit work; a "GPU-using WASM effect" is

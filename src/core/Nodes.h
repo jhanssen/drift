@@ -531,16 +531,20 @@ private:
 class ModuleNode : public Node {
 public:
     // granted: the §4.4 policy from the grant record — what the
-    // capability host calls (storage/network, later slices) enforce
-    // per call. Requests beyond it serve the defined offline denial.
+    // capability host calls enforce per call. storage is the node's
+    // key-value store (quota already reflects the granted policy); the
+    // instance's imports point into it, so it is declared first and
+    // destroyed last.
     ModuleNode(std::unique_ptr<ModuleInstance> instance,
-               ModuleInterface iface, ModulePermissions granted = {});
+               ModuleInterface iface, ModulePermissions granted = {},
+               std::unique_ptr<ModuleStorage> storage = nullptr);
     void evaluate(FrameContext& ctx) override;
 
     const ModuleInterface& interface() const { return mIface; }
     const ModulePermissions& granted() const { return mGranted; }
 
 private:
+    std::unique_ptr<ModuleStorage> mStorage; // before mInstance: see ctor
     std::unique_ptr<ModuleInstance> mInstance;
     const ModuleInterface mIface;
     const ModulePermissions mGranted;

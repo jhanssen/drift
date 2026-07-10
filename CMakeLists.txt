@@ -110,6 +110,8 @@ if(EMSCRIPTEN)
         # UTF8ToString/stringToUTF8 are used by the module bridge's EM_JS
         # bodies; exporting guarantees they are linked into the glue.
         "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,UTF8ToString,stringToUTF8"
+        # malloc/free back the storage-import trampolines' heap staging.
+        "-sEXPORTED_FUNCTIONS=_main,_malloc,_free"
         "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/src/platform/web/shell.html"
         ${DRIFT_WEB_PRELOADS}
     )

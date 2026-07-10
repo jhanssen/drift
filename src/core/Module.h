@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -136,8 +137,90 @@ public:
 // pattern): wasm bytes + required io block size -> running instance, or
 // nullptr with error set. A null factory means this runtime cannot run
 // modules; scenes containing one fail to load with a clear message.
+// storage (may be null: module declared none) is the node's §4.4 store;
+// the engine wires the drift_storage_* imports to it and must not
+// outlive it (the node owns both, storage destroyed last).
+class ModuleStorage;
 using ModuleLoader = std::function<std::unique_ptr<ModuleInstance>(
-    const std::string& wasmBytes, uint32_t ioSize, std::string& error)>;
+    const std::string& wasmBytes, uint32_t ioSize, ModuleStorage* storage,
+    std::string& error)>;
+
+// ---- §4.4 storage capability ----
+// A synchronous key-value store per (scene, module): the working copy is
+// a host-memory map (read-your-writes, identical on both targets — no
+// worker migration, no async ABI), persisted through a platform blob
+// backend with debounced write-behind. No backend means in-memory only —
+// which IS the headless/golden behavior: deterministic empty start.
+//
+// Host imports (all synchronous; key ≤ 256 bytes):
+//   drift_storage_get(kptr, klen, dptr, dcap) -> i32
+//       full value size (copies min(size, dcap) bytes; dcap 0 probes),
+//       or kModuleStorageMissing / kModuleStorageDenied
+//   drift_storage_put(kptr, klen, vptr, vlen) -> i32   0 or error
+//   drift_storage_delete(kptr, klen) -> i32            0 or error
+//   drift_storage_keys(dptr, dcap) -> i32
+//       total bytes of all keys each terminated by '\0' (copies what
+//       fits), or kModuleStorageDenied
+//
+// Quota is the *granted* policy (the §4.4 record), counted as
+// Σ(klen + vlen). Ungranted = quota 0: writes are denied, reads miss.
+inline constexpr int32_t kModuleStorageMissing = -1;
+inline constexpr int32_t kModuleStorageDenied = -2;
+inline constexpr int32_t kModuleStorageQuota = -3;
+inline constexpr int32_t kModuleStorageInvalid = -4;
+inline constexpr uint32_t kModuleStorageMaxKey = 256;
+inline constexpr double kModuleStorageFlushSeconds = 1.0;
+
+// Platform blob persistence: one opaque blob per namespace (the node's
+// document-unique id; the backend instance is already per-project).
+// save() may complete asynchronously and must tolerate being called
+// during teardown.
+class ModuleStoragePersistence {
+public:
+    virtual ~ModuleStoragePersistence() = default;
+    virtual bool load(const std::string& ns, std::string& blob) = 0;
+    virtual void save(const std::string& ns, const std::string& blob) = 0;
+};
+
+class ModuleStorage {
+public:
+    explicit ModuleStorage(uint64_t quota)
+        : mQuota(quota)
+    {
+    }
+    ~ModuleStorage(); // flushes if dirty
+
+    // Loads the namespace's blob from the backend (tolerates a missing
+    // or corrupt blob: starts empty). Without attach the store is
+    // in-memory only.
+    void attach(std::shared_ptr<ModuleStoragePersistence> backend,
+                std::string ns);
+
+    int32_t get(const uint8_t* key, uint32_t klen, uint8_t* dst,
+                uint32_t dcap) const;
+    int32_t put(const uint8_t* key, uint32_t klen, const uint8_t* val,
+                uint32_t vlen);
+    int32_t erase(const uint8_t* key, uint32_t klen);
+    int32_t keys(uint8_t* dst, uint32_t dcap) const;
+
+    // Debounced write-behind: called after each module update with scene
+    // time; persists at most every kModuleStorageFlushSeconds.
+    void maybeFlush(double now);
+
+    uint64_t used() const { return mUsed; }
+
+private:
+    std::string serialize() const;
+    void deserialize(const std::string& blob);
+
+    const uint64_t mQuota;
+    std::map<std::string, std::string> mEntries;
+    uint64_t mUsed = 0;
+    std::shared_ptr<ModuleStoragePersistence> mBackend;
+    std::string mNs;
+    bool mDirty = false;
+    double mLastFlush = -1e300;
+};
 
 // Parses a grant record's "permissions" into the granted policy (§4.4).
 // Grant records are written by consent surfaces — driftpkg at install
@@ -155,6 +238,10 @@ bool parseGrantRecord(const std::string& json, ModulePermissions& out);
 struct ModulePlatform {
     ModuleLoader load;
     std::function<bool(ModulePermissions&)> projectGrants;
+    // §4.4 storage blob persistence, already scoped to the project. Null
+    // means in-memory-only stores — the headless/golden configuration
+    // (deterministic empty start every run).
+    std::shared_ptr<ModuleStoragePersistence> storage;
 };
 
 } // namespace drift::core

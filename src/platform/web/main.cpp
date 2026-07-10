@@ -86,8 +86,12 @@ EM_JS(void, js_module_error, (const char* key, char* out, int cap), {
 
 // Instantiates the cached module and runs the §4.5 init handshake
 // (drift_abi / drift_init(ioSize) / memory bounds). Returns a handle > 0,
-// or 0 with the message in errOut.
-EM_JS(int, js_module_instantiate, (const char* key, int ioSize, char* errOut,
+// or 0 with the message in errOut. storagePtr is the node's C++
+// ModuleStorage (0 = none): the §4.4 storage imports bridge bytes
+// between the module's memory and the runtime heap, then call the
+// drift_storage_c_* shims.
+EM_JS(int, js_module_instantiate, (const char* key, int ioSize,
+                                   int storagePtr, char* errOut,
                                    int errCap), {
     const ent = (Module.driftModules || new Map()).get(UTF8ToString(key));
     const fail = (msg) => { stringToUTF8(String(msg), errOut, errCap); return 0; };
@@ -95,13 +99,78 @@ EM_JS(int, js_module_instantiate, (const char* key, int ioSize, char* errOut,
         return fail(ent && ent.error ? ent.error : 'module not compiled');
     }
     let inst;
+    const guest = () => new Uint8Array(inst.exports.memory.buffer);
+    const toHeap = (view) => {
+        const p = _malloc(view.length || 1);
+        HEAPU8.set(view, p);
+        return p;
+    };
     try {
         inst = new WebAssembly.Instance(ent.module, { env: {
-            // The one host import (§4.5): debug logging.
+            // Debug logging (§4.5).
             drift_log: (ptr, len) => {
                 const mem = inst.exports.memory;
                 console.log('drift module:', new TextDecoder().decode(
                     new Uint8Array(mem.buffer, ptr >>> 0, len >>> 0)));
+            },
+            // §4.4 storage (core/Module.h ABI; -4 = invalid span).
+            drift_storage_get: (kptr, klen, dptr, dcap) => {
+                kptr >>>= 0; klen >>>= 0; dptr >>>= 0; dcap >>>= 0;
+                const m = guest();
+                if (kptr + klen > m.length || dptr + dcap > m.length) {
+                    return -4;
+                }
+                const kh = toHeap(m.subarray(kptr, kptr + klen));
+                const dh = dcap ? _malloc(dcap) : 0;
+                const r = _drift_storage_c_get(storagePtr, kh, klen, dh,
+                                               dcap);
+                if (r > 0 && dcap) {
+                    const n = Math.min(r, dcap);
+                    guest().set(HEAPU8.subarray(dh, dh + n), dptr);
+                }
+                if (dh) _free(dh);
+                _free(kh);
+                return r;
+            },
+            drift_storage_put: (kptr, klen, vptr, vlen) => {
+                kptr >>>= 0; klen >>>= 0; vptr >>>= 0; vlen >>>= 0;
+                const m = guest();
+                if (kptr + klen > m.length || vptr + vlen > m.length) {
+                    return -4;
+                }
+                const kh = toHeap(m.subarray(kptr, kptr + klen));
+                const vh = toHeap(m.subarray(vptr, vptr + vlen));
+                const r = _drift_storage_c_put(storagePtr, kh, klen, vh,
+                                               vlen);
+                _free(vh);
+                _free(kh);
+                return r;
+            },
+            drift_storage_delete: (kptr, klen) => {
+                kptr >>>= 0; klen >>>= 0;
+                const m = guest();
+                if (kptr + klen > m.length) {
+                    return -4;
+                }
+                const kh = toHeap(m.subarray(kptr, kptr + klen));
+                const r = _drift_storage_c_delete(storagePtr, kh, klen);
+                _free(kh);
+                return r;
+            },
+            drift_storage_keys: (dptr, dcap) => {
+                dptr >>>= 0; dcap >>>= 0;
+                const m = guest();
+                if (dptr + dcap > m.length) {
+                    return -4;
+                }
+                const dh = dcap ? _malloc(dcap) : 0;
+                const r = _drift_storage_c_keys(storagePtr, dh, dcap);
+                if (r > 0 && dcap) {
+                    const n = Math.min(r, dcap);
+                    guest().set(HEAPU8.subarray(dh, dh + n), dptr);
+                }
+                if (dh) _free(dh);
+                return r;
             },
         } });
     } catch (e) {
@@ -173,9 +242,149 @@ EM_JS(void, js_module_set_ready, (), {
     Module.driftModuleReady = () => _drift_modules_ready();
 });
 
+// ---- §4.4 module storage: IndexedDB-backed blob cache ----
+// The storage ABI is synchronous (core/Module.h), so the persistent
+// blobs are preloaded into a JS Map before the first scene load (scene
+// start gates on it) and every save writes the cache through to
+// IndexedDB fire-and-forget. Keys are "<project root>|<namespace>".
+
+EM_JS(void, js_storage_init, (), {
+    Module.driftStorageCache = new Map();
+    const done = () => {
+        Module.driftStorageReady = true;
+        _drift_storage_ready();
+    };
+    let req;
+    try {
+        req = indexedDB.open('drift-module-storage', 1);
+    } catch (e) {
+        done(); // no IndexedDB (privacy mode): in-memory session storage
+        return;
+    }
+    req.onupgradeneeded = () => req.result.createObjectStore('blobs');
+    req.onerror = done;
+    req.onsuccess = () => {
+        const db = req.result;
+        Module.driftStorageDb = db;
+        const tx = db.transaction('blobs', 'readonly');
+        const store = tx.objectStore('blobs');
+        const keys = store.getAllKeys();
+        const vals = store.getAll();
+        tx.oncomplete = () => {
+            for (let i = 0; i < keys.result.length; ++i) {
+                Module.driftStorageCache.set(keys.result[i],
+                                             new Uint8Array(vals.result[i]));
+            }
+            done();
+        };
+        tx.onerror = done;
+    };
+});
+
+EM_JS(int, js_storage_blob_size, (const char* key), {
+    const blob = Module.driftStorageCache.get(UTF8ToString(key));
+    return blob ? blob.length : -1;
+});
+
+EM_JS(void, js_storage_blob_copy, (const char* key, uint8_t* dst), {
+    const blob = Module.driftStorageCache.get(UTF8ToString(key));
+    if (blob) HEAPU8.set(blob, dst);
+});
+
+EM_JS(void, js_storage_blob_save, (const char* key, const uint8_t* data,
+                                   int len), {
+    const k = UTF8ToString(key);
+    const blob = HEAPU8.slice(data, data + len);
+    Module.driftStorageCache.set(k, blob);
+    const db = Module.driftStorageDb;
+    if (!db) return;
+    try {
+        db.transaction('blobs', 'readwrite').objectStore('blobs')
+            .put(blob, k);
+    } catch (e) { /* session-only from here */ }
+});
+
+// §4.4 storage shims: the JS import trampolines call these with
+// heap-copied spans; storage is the node's ModuleStorage (0 = denied).
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE int drift_storage_c_get(void* storage,
+                                             const uint8_t* k, int klen,
+                                             uint8_t* d, int dcap)
+{
+    if (!storage) {
+        return drift::core::kModuleStorageDenied;
+    }
+    return ((drift::core::ModuleStorage*)storage)
+        ->get(k, (uint32_t)klen, d, (uint32_t)dcap);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_storage_c_put(void* storage,
+                                             const uint8_t* k, int klen,
+                                             const uint8_t* v, int vlen)
+{
+    if (!storage) {
+        return drift::core::kModuleStorageDenied;
+    }
+    return ((drift::core::ModuleStorage*)storage)
+        ->put(k, (uint32_t)klen, v, (uint32_t)vlen);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_storage_c_delete(void* storage,
+                                                const uint8_t* k, int klen)
+{
+    if (!storage) {
+        return drift::core::kModuleStorageDenied;
+    }
+    return ((drift::core::ModuleStorage*)storage)->erase(k, (uint32_t)klen);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_storage_c_keys(void* storage, uint8_t* d,
+                                              int dcap)
+{
+    if (!storage) {
+        return drift::core::kModuleStorageDenied;
+    }
+    return ((drift::core::ModuleStorage*)storage)
+        ->keys(d, (uint32_t)dcap);
+}
+
+} // extern "C"
+
 namespace {
 
 constexpr const char* kCanvas = "#canvas";
+
+// §4.4 storage persistence: the preloaded IndexedDB cache, keyed
+// "<project root>|<namespace>".
+class IdbStoragePersistence : public drift::core::ModuleStoragePersistence {
+public:
+    explicit IdbStoragePersistence(std::string root)
+        : mRoot(std::move(root))
+    {
+    }
+    bool load(const std::string& ns, std::string& blob) override
+    {
+        const std::string key = mRoot + "|" + ns;
+        const int size = js_storage_blob_size(key.c_str());
+        if (size < 0) {
+            return false;
+        }
+        blob.resize((size_t)size);
+        if (size) {
+            js_storage_blob_copy(key.c_str(), (uint8_t*)blob.data());
+        }
+        return true;
+    }
+    void save(const std::string& ns, const std::string& blob) override
+    {
+        js_storage_blob_save((mRoot + "|" + ns).c_str(),
+                             (const uint8_t*)blob.data(), (int)blob.size());
+    }
+
+private:
+    std::string mRoot;
+};
 
 class WebModuleInstance : public drift::core::ModuleInstance {
 public:
@@ -216,7 +425,7 @@ std::string gRetryJson; // the failed attempt's document; "" = read bundle
 
 std::unique_ptr<drift::core::ModuleInstance>
 makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
-                   std::string& error)
+                   drift::core::ModuleStorage* storage, std::string& error)
 {
     // Content-hash key (FNV-1a 64): editor rewrites of a module file get a
     // fresh compile, unchanged files share the cached one.
@@ -241,7 +450,8 @@ makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
         return nullptr;
     }
     char err[512] = {};
-    const int handle = js_module_instantiate(key, (int)ioSize, err,
+    const int handle = js_module_instantiate(key, (int)ioSize,
+                                             (int)(uintptr_t)storage, err,
                                              sizeof(err));
     if (!handle) {
         error = err;
@@ -335,7 +545,11 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
     // Package grants ride the store's .installed.json through readAsset;
     // no project-grant surface in the browser yet (the editor prompt is a
     // later slice) — ungranted capabilities warn and read as offline.
-    drift::core::ModulePlatform modules{ makeModuleInstance, nullptr };
+    // Storage persists through the preloaded IndexedDB cache.
+    drift::core::ModulePlatform modules{
+        makeModuleInstance, nullptr,
+        std::make_shared<IdbStoragePersistence>(root)
+    };
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
                                           modules, device, errors, warnings);
     if (!scene && gModulesPending) {
@@ -478,6 +692,29 @@ bool onMouseEnterLeave(int eventType, const EmscriptenMouseEvent*, void*)
     return true;
 }
 
+// Scene start gates on the GPU device AND the storage cache preload
+// (§4.4: the synchronous storage ABI needs the blobs in memory before
+// the first module instantiates); whichever finishes last starts.
+bool gDeviceReady = false;
+bool gStorageReady = false;
+
+void tryStart()
+{
+    static bool started = false;
+    if (started || !gDeviceReady || !gStorageReady) {
+        return;
+    }
+    started = true;
+    gApp.scene = loadScene(gApp.scenePath, gApp.device, &gApp.sceneJson);
+    // Callbacks and the frame loop start even without a scene: the initial
+    // load may be waiting on module compiles (drift_modules_ready fills
+    // gApp.scene in), and onFrame no-ops until it exists.
+    emscripten_set_mousemove_callback(kCanvas, nullptr, false, onMouseMove);
+    emscripten_set_mouseenter_callback(kCanvas, nullptr, false, onMouseEnterLeave);
+    emscripten_set_mouseleave_callback(kCanvas, nullptr, false, onMouseEnterLeave);
+    emscripten_request_animation_frame_loop(onFrame, nullptr);
+}
+
 void onDeviceReady()
 {
     wgpu::SurfaceCapabilities caps{};
@@ -489,15 +726,8 @@ void onDeviceReady()
     gApp.format = caps.formats[0];
     gApp.alphaMode = caps.alphaModeCount ? caps.alphaModes[0]
                                          : wgpu::CompositeAlphaMode::Auto;
-
-    gApp.scene = loadScene(gApp.scenePath, gApp.device, &gApp.sceneJson);
-    // Callbacks and the frame loop start even without a scene: the initial
-    // load may be waiting on module compiles (drift_modules_ready fills
-    // gApp.scene in), and onFrame no-ops until it exists.
-    emscripten_set_mousemove_callback(kCanvas, nullptr, false, onMouseMove);
-    emscripten_set_mouseenter_callback(kCanvas, nullptr, false, onMouseEnterLeave);
-    emscripten_set_mouseleave_callback(kCanvas, nullptr, false, onMouseEnterLeave);
-    emscripten_request_animation_frame_loop(onFrame, nullptr);
+    gDeviceReady = true;
+    tryStart();
 }
 
 void requestDevice()
@@ -550,6 +780,14 @@ void requestDevice()
 // endpoint — platform/ParamJson.h): call via ccall/cwrap after the scene
 // loads (describe returns {"scene":null} until then).
 extern "C" {
+
+// Fired by the JS bridge when the IndexedDB storage cache preload
+// completes (or is unavailable — then storage is session-only).
+EMSCRIPTEN_KEEPALIVE void drift_storage_ready()
+{
+    gStorageReady = true;
+    tryStart();
+}
 
 // Fired by the JS bridge when an asynchronous module compile lands:
 // re-runs the load attempt that failed on "still compiling". Keeps the
@@ -1000,6 +1238,7 @@ int main(int argc, char** argv)
     // (§20.2); a host page can still override the path.
     setenv("DRIFT_PACKAGE_PATH", "/packages", /*overwrite=*/0);
     js_module_set_ready(); // async module compiles retry the scene load
+    js_storage_init();     // §4.4 storage cache; scene start gates on it
 
     std::string name = argc > 1 ? argv[1] : "plasma";
     if (name.find('/') != std::string::npos ||

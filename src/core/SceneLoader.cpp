@@ -2224,7 +2224,23 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
                  "': this runtime cannot run WASM modules");
             return nullptr;
         }
-        auto instance = mModules.load(wasmBytes, iface.ioSize, err);
+
+        // §4.4 storage: quota is the granted policy, capped by the
+        // module's own request; the node id is the namespace (document-
+        // unique, stable across reloads). No platform backend means an
+        // in-memory store — the headless/golden configuration.
+        std::unique_ptr<ModuleStorage> storage;
+        if (iface.permissions.storageQuota) {
+            storage = std::make_unique<ModuleStorage>(
+                std::min(iface.permissions.storageQuota,
+                         granted.storageQuota));
+            if (granted.storageQuota && mModules.storage) {
+                storage->attach(mModules.storage, raw.id);
+            }
+        }
+
+        auto instance =
+            mModules.load(wasmBytes, iface.ioSize, storage.get(), err);
         if (!instance) {
             fail("node '" + raw.id + "': " + wasmPath + ": " + err);
             return nullptr;
@@ -2241,7 +2257,7 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             portsOut.push_back(std::move(def));
         }
         return new ModuleNode(std::move(instance), std::move(iface),
-                              std::move(granted));
+                              std::move(granted), std::move(storage));
     }
 
     if (raw.type == "image") {

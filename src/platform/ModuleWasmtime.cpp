@@ -46,7 +46,21 @@ std::string messageOf(wasm_trap_t* trap)
     return out;
 }
 
-// env.drift_log(ptr, len): the one host import (§4.5).
+// Fetches the caller's exported linear memory; base/size for span checks.
+uint8_t* callerMemory(wasmtime_caller_t* caller, size_t& size)
+{
+    wasmtime_extern_t item;
+    if (!wasmtime_caller_export_get(caller, "memory", 6, &item) ||
+        item.kind != WASMTIME_EXTERN_MEMORY) {
+        size = 0;
+        return nullptr;
+    }
+    wasmtime_context_t* ctx = wasmtime_caller_context(caller);
+    size = wasmtime_memory_data_size(ctx, &item.of.memory);
+    return wasmtime_memory_data(ctx, &item.of.memory);
+}
+
+// env.drift_log(ptr, len): debug logging (§4.5).
 wasm_trap_t* driftLog(void*, wasmtime_caller_t* caller,
                       const wasmtime_val_t* args, size_t nargs,
                       wasmtime_val_t*, size_t)
@@ -54,21 +68,124 @@ wasm_trap_t* driftLog(void*, wasmtime_caller_t* caller,
     if (nargs != 2) {
         return nullptr;
     }
-    wasmtime_extern_t item;
-    if (!wasmtime_caller_export_get(caller, "memory", 6, &item) ||
-        item.kind != WASMTIME_EXTERN_MEMORY) {
-        return nullptr;
-    }
-    wasmtime_context_t* ctx = wasmtime_caller_context(caller);
-    const uint8_t* data = wasmtime_memory_data(ctx, &item.of.memory);
-    const size_t size = wasmtime_memory_data_size(ctx, &item.of.memory);
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
     const uint64_t ptr = (uint32_t)args[0].of.i32;
     const uint64_t len = (uint32_t)args[1].of.i32;
-    if (ptr + len <= size) {
+    if (data && ptr + len <= size) {
         fprintf(stderr, "drift module: %.*s\n", (int)len,
                 (const char*)data + ptr);
     }
     return nullptr;
+}
+
+// §4.4 storage imports. env = the node's ModuleStorage (null when the
+// module declared none: everything reads as denied). All spans are
+// validated against the caller's memory; violations return the invalid
+// code rather than trapping.
+using drift::core::kModuleStorageDenied;
+using drift::core::kModuleStorageInvalid;
+
+wasm_trap_t* storageGet(void* env, wasmtime_caller_t* caller,
+                        const wasmtime_val_t* args, size_t,
+                        wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* storage = (drift::core::ModuleStorage*)env;
+    size_t size = 0;
+    uint8_t* data = callerMemory(caller, size);
+    const uint64_t kptr = (uint32_t)args[0].of.i32;
+    const uint64_t klen = (uint32_t)args[1].of.i32;
+    const uint64_t dptr = (uint32_t)args[2].of.i32;
+    const uint64_t dcap = (uint32_t)args[3].of.i32;
+    if (!data || kptr + klen > size || dptr + dcap > size) {
+        results[0].of.i32 = kModuleStorageInvalid;
+    } else if (!storage) {
+        results[0].of.i32 = kModuleStorageDenied;
+    } else {
+        results[0].of.i32 =
+            storage->get(data + kptr, (uint32_t)klen,
+                         dcap ? data + dptr : nullptr, (uint32_t)dcap);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* storagePut(void* env, wasmtime_caller_t* caller,
+                        const wasmtime_val_t* args, size_t,
+                        wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* storage = (drift::core::ModuleStorage*)env;
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
+    const uint64_t kptr = (uint32_t)args[0].of.i32;
+    const uint64_t klen = (uint32_t)args[1].of.i32;
+    const uint64_t vptr = (uint32_t)args[2].of.i32;
+    const uint64_t vlen = (uint32_t)args[3].of.i32;
+    if (!data || kptr + klen > size || vptr + vlen > size) {
+        results[0].of.i32 = kModuleStorageInvalid;
+    } else if (!storage) {
+        results[0].of.i32 = kModuleStorageDenied;
+    } else {
+        results[0].of.i32 = storage->put(data + kptr, (uint32_t)klen,
+                                         data + vptr, (uint32_t)vlen);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* storageDelete(void* env, wasmtime_caller_t* caller,
+                           const wasmtime_val_t* args, size_t,
+                           wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* storage = (drift::core::ModuleStorage*)env;
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
+    const uint64_t kptr = (uint32_t)args[0].of.i32;
+    const uint64_t klen = (uint32_t)args[1].of.i32;
+    if (!data || kptr + klen > size) {
+        results[0].of.i32 = kModuleStorageInvalid;
+    } else if (!storage) {
+        results[0].of.i32 = kModuleStorageDenied;
+    } else {
+        results[0].of.i32 = storage->erase(data + kptr, (uint32_t)klen);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* storageKeys(void* env, wasmtime_caller_t* caller,
+                         const wasmtime_val_t* args, size_t,
+                         wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* storage = (drift::core::ModuleStorage*)env;
+    size_t size = 0;
+    uint8_t* data = callerMemory(caller, size);
+    const uint64_t dptr = (uint32_t)args[0].of.i32;
+    const uint64_t dcap = (uint32_t)args[1].of.i32;
+    if (!data || dptr + dcap > size) {
+        results[0].of.i32 = kModuleStorageInvalid;
+    } else if (!storage) {
+        results[0].of.i32 = kModuleStorageDenied;
+    } else {
+        results[0].of.i32 =
+            storage->keys(dcap ? data + dptr : nullptr, (uint32_t)dcap);
+    }
+    return nullptr;
+}
+
+// i32^n -> i32 function type (the wasm.h helpers stop at 3 params).
+wasm_functype_t* i32FuncType(size_t nparams)
+{
+    wasm_valtype_t* ps[4];
+    for (size_t i = 0; i < nparams; ++i) {
+        ps[i] = wasm_valtype_new_i32();
+    }
+    wasm_valtype_vec_t params, results;
+    wasm_valtype_vec_new(&params, nparams, ps);
+    wasm_valtype_t* rs[1] = { wasm_valtype_new_i32() };
+    wasm_valtype_vec_new(&results, 1, rs);
+    return wasm_functype_new(&params, &results);
 }
 
 // Process-wide engine + compiled-module cache + epoch ticker. Started by
@@ -181,9 +298,9 @@ Runtime& runtime()
 class WasmtimeModuleInstance : public ModuleInstance {
 public:
     // Takes ownership of store on success only; use create().
-    static std::unique_ptr<ModuleInstance> create(wasmtime_module_t* module,
-                                                  uint32_t ioSize,
-                                                  std::string& error)
+    static std::unique_ptr<ModuleInstance>
+    create(wasmtime_module_t* module, uint32_t ioSize,
+           drift::core::ModuleStorage* storage, std::string& error)
     {
         auto self = std::unique_ptr<WasmtimeModuleInstance>(
             new WasmtimeModuleInstance());
@@ -192,12 +309,31 @@ public:
         wasmtime_store_limiter(self->mStore, kMemoryLimit, -1, 1, 1, 1);
 
         wasmtime_linker_t* linker = wasmtime_linker_new(runtime().engine);
-        wasm_functype_t* logType = wasm_functype_new_2_0(
-            wasm_valtype_new_i32(), wasm_valtype_new_i32());
-        wasmtime_error_t* err = wasmtime_linker_define_func(
-            linker, "env", 3, "drift_log", 9, logType, driftLog, nullptr,
-            nullptr);
-        wasm_functype_delete(logType);
+        wasmtime_error_t* err = nullptr;
+        const auto defineFunc = [&](const char* name, size_t nameLen,
+                                    size_t nparams,
+                                    wasmtime_func_callback_t cb) {
+            if (err) {
+                return;
+            }
+            wasm_functype_t* type = i32FuncType(nparams);
+            err = wasmtime_linker_define_func(linker, "env", 3, name,
+                                              nameLen, type, cb, storage,
+                                              nullptr);
+            wasm_functype_delete(type);
+        };
+        {
+            wasm_functype_t* logType = wasm_functype_new_2_0(
+                wasm_valtype_new_i32(), wasm_valtype_new_i32());
+            err = wasmtime_linker_define_func(linker, "env", 3, "drift_log",
+                                              9, logType, driftLog, nullptr,
+                                              nullptr);
+            wasm_functype_delete(logType);
+        }
+        defineFunc("drift_storage_get", 17, 4, storageGet);
+        defineFunc("drift_storage_put", 17, 4, storagePut);
+        defineFunc("drift_storage_delete", 20, 2, storageDelete);
+        defineFunc("drift_storage_keys", 18, 2, storageKeys);
         if (err) {
             error = messageOf(err);
             wasmtime_linker_delete(linker);
@@ -347,12 +483,14 @@ private:
 drift::core::ModuleLoader wasmtimeModuleLoader()
 {
     return [](const std::string& wasmBytes, uint32_t ioSize,
+              drift::core::ModuleStorage* storage,
               std::string& error) -> std::unique_ptr<ModuleInstance> {
         wasmtime_module_t* module = runtime().moduleFor(wasmBytes, error);
         if (!module) {
             return nullptr;
         }
-        return WasmtimeModuleInstance::create(module, ioSize, error);
+        return WasmtimeModuleInstance::create(module, ioSize, storage,
+                                              error);
     };
 }
 

@@ -278,6 +278,80 @@ TEST_CASE("module permissions: request grammar (§4.4)")
     CHECK(want.coveredBy(granted, missing));
 }
 
+TEST_CASE("module storage: quota, roundtrip, write-behind (§4.4)")
+{
+    struct FakeBackend : ModuleStoragePersistence {
+        std::map<std::string, std::string> blobs;
+        int saves = 0;
+        bool load(const std::string& ns, std::string& blob) override
+        {
+            auto it = blobs.find(ns);
+            if (it == blobs.end()) {
+                return false;
+            }
+            blob = it->second;
+            return true;
+        }
+        void save(const std::string& ns, const std::string& blob) override
+        {
+            blobs[ns] = blob;
+            ++saves;
+        }
+    };
+    auto backend = std::make_shared<FakeBackend>();
+
+    const auto K = [](const char* s) { return (const uint8_t*)s; };
+    {
+        ModuleStorage st(64);
+        st.attach(backend, "brain");
+        uint8_t buf[32];
+        CHECK(st.get(K("pos"), 3, buf, sizeof(buf)) == kModuleStorageMissing);
+        CHECK(st.put(K("pos"), 3, K("12345678"), 8) == 0);
+        CHECK(st.used() == 11);
+        REQUIRE(st.get(K("pos"), 3, buf, sizeof(buf)) == 8);
+        CHECK(std::memcmp(buf, "12345678", 8) == 0);
+        // Probe (dcap 0) returns the size without copying.
+        CHECK(st.get(K("pos"), 3, nullptr, 0) == 8);
+        // Replacement re-accounts; over-quota is refused atomically.
+        CHECK(st.put(K("pos"), 3, K("xy"), 2) == 0);
+        CHECK(st.used() == 5);
+        std::vector<uint8_t> big(60, 7);
+        CHECK(st.put(K("big"), 3, big.data(), 60) == kModuleStorageQuota);
+        CHECK(st.used() == 5);
+        CHECK(st.put(K("b"), 1, big.data(), 40) == 0);
+        // keys: '\0'-terminated names, probe-then-copy.
+        const int32_t need = st.keys(nullptr, 0);
+        CHECK(need == 6); // "b\0pos\0"
+        std::vector<uint8_t> names(need);
+        st.keys(names.data(), (uint32_t)names.size());
+        CHECK(std::memcmp(names.data(), "b\0pos\0", 6) == 0);
+        CHECK(st.erase(K("b"), 1) == 0);
+        CHECK(st.erase(K("b"), 1) == 0); // idempotent
+        // Debounced write-behind: first flush at t, not again until t+1.
+        st.maybeFlush(10.0);
+        CHECK(backend->saves == 1);
+        CHECK(st.put(K("pos"), 3, K("zz"), 2) == 0);
+        st.maybeFlush(10.5);
+        CHECK(backend->saves == 1);
+        st.maybeFlush(11.5);
+        CHECK(backend->saves == 2);
+    } // dtor: not dirty, no extra save
+    CHECK(backend->saves == 2);
+
+    // A fresh store loads the persisted state.
+    ModuleStorage st2(64);
+    st2.attach(backend, "brain");
+    uint8_t buf[8];
+    REQUIRE(st2.get(K("pos"), 3, buf, sizeof(buf)) == 2);
+    CHECK(std::memcmp(buf, "zz", 2) == 0);
+
+    // Ungranted (quota 0): writes denied, reads miss (§4.4 soft-deny).
+    ModuleStorage denied(0);
+    CHECK(denied.put(K("k"), 1, K("v"), 1) == kModuleStorageDenied);
+    CHECK(denied.get(K("k"), 1, buf, sizeof(buf)) == kModuleStorageMissing);
+    CHECK(denied.keys(nullptr, 0) == kModuleStorageDenied);
+}
+
 TEST_CASE("module node: pure CPU transform — values in, values out (§4.5)")
 {
     ModuleInterface iface = parseIface(kBrainIface);
@@ -463,6 +537,7 @@ LoadResult loadScene(const std::string& nodesJson, bool withLoader = true,
     platform.projectGrants = projectGrants;
     if (withLoader) {
         platform.load = [&r](const std::string&, uint32_t ioSize,
+                             ModuleStorage*,
                              std::string&) -> std::unique_ptr<ModuleInstance> {
             auto fake = std::make_unique<FakeModule>(ioSize);
             r.modules.push_back(fake.get());

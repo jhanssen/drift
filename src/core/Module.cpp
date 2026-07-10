@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 #include <glaze/glaze.hpp>
 
@@ -187,6 +188,184 @@ bool ModulePermissions::coveredBy(const ModulePermissions& granted,
         }
     }
     return missing.size() == before;
+}
+
+// ---- ModuleStorage (§4.4) ----
+
+namespace {
+
+// Blob format: "DMS1", u32 count, then per entry u32 klen, u32 vlen,
+// key bytes, value bytes. Tolerant loading: anything malformed reads as
+// an empty store (never a load failure — state is a cache, not content).
+constexpr char kStorageMagic[4] = { 'D', 'M', 'S', '1' };
+
+void putU32(std::string& out, uint32_t v)
+{
+    out.append((const char*)&v, 4);
+}
+
+bool getU32(const std::string& in, size_t& off, uint32_t& v)
+{
+    if (off + 4 > in.size()) {
+        return false;
+    }
+    std::memcpy(&v, in.data() + off, 4);
+    off += 4;
+    return true;
+}
+
+} // namespace
+
+ModuleStorage::~ModuleStorage()
+{
+    if (mDirty && mBackend) {
+        mBackend->save(mNs, serialize());
+    }
+}
+
+void ModuleStorage::attach(std::shared_ptr<ModuleStoragePersistence> backend,
+                           std::string ns)
+{
+    mBackend = std::move(backend);
+    mNs = std::move(ns);
+    std::string blob;
+    if (mBackend && mBackend->load(mNs, blob)) {
+        deserialize(blob);
+    }
+}
+
+int32_t ModuleStorage::get(const uint8_t* key, uint32_t klen, uint8_t* dst,
+                           uint32_t dcap) const
+{
+    if (klen == 0 || klen > kModuleStorageMaxKey) {
+        return kModuleStorageInvalid;
+    }
+    auto it = mEntries.find(std::string((const char*)key, klen));
+    if (it == mEntries.end()) {
+        return kModuleStorageMissing;
+    }
+    const std::string& value = it->second;
+    if (dst && dcap) {
+        std::memcpy(dst, value.data(),
+                    std::min<size_t>(value.size(), dcap));
+    }
+    return (int32_t)value.size();
+}
+
+int32_t ModuleStorage::put(const uint8_t* key, uint32_t klen,
+                           const uint8_t* val, uint32_t vlen)
+{
+    if (mQuota == 0) {
+        return kModuleStorageDenied; // ungranted (§4.4 soft-deny)
+    }
+    if (klen == 0 || klen > kModuleStorageMaxKey) {
+        return kModuleStorageInvalid;
+    }
+    std::string k((const char*)key, klen);
+    auto it = mEntries.find(k);
+    const uint64_t oldBytes =
+        it == mEntries.end() ? 0 : klen + it->second.size();
+    const uint64_t newUsed = mUsed - oldBytes + klen + vlen;
+    if (newUsed > mQuota) {
+        return kModuleStorageQuota;
+    }
+    mEntries[std::move(k)] = std::string((const char*)val, vlen);
+    mUsed = newUsed;
+    mDirty = true;
+    return 0;
+}
+
+int32_t ModuleStorage::erase(const uint8_t* key, uint32_t klen)
+{
+    if (mQuota == 0) {
+        return kModuleStorageDenied;
+    }
+    if (klen == 0 || klen > kModuleStorageMaxKey) {
+        return kModuleStorageInvalid;
+    }
+    auto it = mEntries.find(std::string((const char*)key, klen));
+    if (it != mEntries.end()) {
+        mUsed -= klen + it->second.size();
+        mEntries.erase(it);
+        mDirty = true;
+    }
+    return 0; // idempotent
+}
+
+int32_t ModuleStorage::keys(uint8_t* dst, uint32_t dcap) const
+{
+    if (mQuota == 0) {
+        return kModuleStorageDenied;
+    }
+    uint64_t total = 0;
+    for (const auto& [k, v] : mEntries) {
+        total += k.size() + 1;
+    }
+    if (dst && dcap) {
+        uint32_t off = 0;
+        for (const auto& [k, v] : mEntries) {
+            for (size_t i = 0; i < k.size() + 1 && off < dcap; ++i) {
+                dst[off++] = i < k.size() ? (uint8_t)k[i] : 0;
+            }
+        }
+    }
+    return (int32_t)total;
+}
+
+void ModuleStorage::maybeFlush(double now)
+{
+    if (!mDirty || !mBackend ||
+        now - mLastFlush < kModuleStorageFlushSeconds) {
+        return;
+    }
+    mBackend->save(mNs, serialize());
+    mDirty = false;
+    mLastFlush = now;
+}
+
+std::string ModuleStorage::serialize() const
+{
+    std::string out(kStorageMagic, 4);
+    putU32(out, (uint32_t)mEntries.size());
+    for (const auto& [k, v] : mEntries) {
+        putU32(out, (uint32_t)k.size());
+        putU32(out, (uint32_t)v.size());
+        out += k;
+        out += v;
+    }
+    return out;
+}
+
+void ModuleStorage::deserialize(const std::string& blob)
+{
+    mEntries.clear();
+    mUsed = 0;
+    if (blob.size() < 8 || std::memcmp(blob.data(), kStorageMagic, 4) != 0) {
+        return;
+    }
+    size_t off = 4;
+    uint32_t count = 0;
+    getU32(blob, off, count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t klen = 0, vlen = 0;
+        if (!getU32(blob, off, klen) || !getU32(blob, off, vlen) ||
+            off + (uint64_t)klen + vlen > blob.size() || klen == 0 ||
+            klen > kModuleStorageMaxKey) {
+            mEntries.clear();
+            mUsed = 0;
+            return; // corrupt: empty store, never a failure
+        }
+        std::string k = blob.substr(off, klen);
+        off += klen;
+        std::string v = blob.substr(off, vlen);
+        off += vlen;
+        const uint64_t bytes = klen + vlen;
+        if (mUsed + bytes > mQuota) {
+            break; // quota shrank since this blob was written: keep what fits
+        }
+        mUsed += bytes;
+        mEntries[std::move(k)] = std::move(v);
+    }
 }
 
 bool parseGrantRecord(const std::string& json, ModulePermissions& out)

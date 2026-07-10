@@ -15,6 +15,7 @@
 
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/ModuleStorageFiles.h"
 #include "platform/ModuleWasmtime.h"
 #include "platform/PackageStore.h"
 #include "platform/ProjectGrants.h"
@@ -91,6 +92,10 @@ bool parseParamOverride(const char* arg, ParamOverride& out)
     }
     return true;
 }
+
+// Headless/golden runs keep module storage in-memory (§4.4: deterministic
+// empty start); set at the top of runHeadless.
+static bool gHeadless = false;
 
 // Loads a .sceneproject directory (or a scene.json path) with project-root
 // confinement for asset reads.
@@ -170,8 +175,17 @@ std::unique_ptr<drift::core::Scene> loadScene(
 
     std::vector<std::string> errors, warnings;
     drift::core::ModulePlatform modules{
-        drift::platform::wasmtimeModuleLoader(), projectGrants
+        drift::platform::wasmtimeModuleLoader(), projectGrants, nullptr
     };
+    // §4.4 storage persistence — except headless/golden runs, whose
+    // stores stay in-memory for a deterministic empty start every run.
+    if (!gHeadless) {
+        std::error_code ec;
+        const fs::path real = fs::canonical(root, ec);
+        modules.storage =
+            std::make_shared<drift::platform::FileStoragePersistence>(
+                (ec ? root : real).string());
+    }
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
                                           modules, device, errors, warnings);
     for (const auto& w : warnings) {
@@ -212,6 +226,7 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
                 const std::set<int>& writeFrames, const MouseArg& mouse,
                 const std::vector<ParamOverride>& overrides)
 {
+    gHeadless = true;
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/false)) {
         return 1;
