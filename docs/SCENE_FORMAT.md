@@ -1643,11 +1643,23 @@ editable `.sceneproject` deliberately stays a thin reference.
 
 | Field         | Type     | Notes                                          |
 |---------------|----------|------------------------------------------------|
-| `name`        | string   | required; `[a-z0-9-]+`, must equal the directory name |
+| `name`        | string   | required; one or two dot-separated `[a-z0-9-]+` segments (`glow`, `alice.glow`), must equal the directory name |
 | `version`     | string   | required; dotted decimal integers, e.g. `"1.0.0"` |
 | `description` | string   | optional; editor/repository label              |
 | `license`     | string   | optional; SPDX identifier                      |
 | `preview`     | string   | optional; package-relative image path          |
+
+**Naming (adopted 2026-07-10).** Package identity is namespaced by
+publisher: `<publisher>.<name>`, one dot, both segments `[a-z0-9-]+`.
+Bare (dotless) names are **reserved for the first-party library** that
+ships with drift; community repositories must publish dotted names, and
+install tooling warns when any other repository offers a bare name.
+Two things are deliberately *not* part of identity: the version (a
+separate coordinate — store layout, §20.3 pins) and the repository (a
+repo is transport; the same package may be mirrored by several §20.4
+hosts, and identity must survive relocation). Rationale and the trust
+path that eventually makes the publisher segment verifiable live in
+DESIGN.md §9.4.
 
 A package is **self-contained**: paths inside its graph files resolve
 against the *package* root (amending §19.1's project-root rule, which

@@ -190,5 +190,6 @@
       "hash": "0348a71afcff1383b5d871507d52bfaabf079caba039c24688d65745381bf027",
       "description": "Living still: source pixels ride an animated wave field where the grayscale flex map is white and stay pinned where it is black."
     }
-  ]
+  ],
+  "firstParty": true
 }

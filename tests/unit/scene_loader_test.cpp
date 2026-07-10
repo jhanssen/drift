@@ -191,6 +191,8 @@ const char* kBadBindGraph = R"({
 // The pin test's fixture exists ONLY under the pinned key, so a loader
 // that drops pins fails to resolve it.
 const char* kFxManifest = R"({ "name": "fx", "version": "1.2.0" })";
+const char* kDottedManifest =
+    R"({ "name": "alice.fx", "version": "1.0.0" })";
 const char* kPinnedManifest = R"({ "name": "pinned", "version": "2.0" })";
 const char* kMismatchManifest = R"({ "name": "other", "version": "1" })";
 const char* kXdepManifest = R"({ "name": "xdep", "version": "1" })";
@@ -384,6 +386,9 @@ LoadResult load(const std::string& json,
         { "graphs/badbind.json", kBadBindGraph },
         { "packages/fx/manifest.json", kFxManifest },
         { "packages/fx/graphs/dim.json", kDimGraph },
+        { "packages/alice.fx/manifest.json", kDottedManifest },
+        { "packages/alice.fx/graphs/dim.json", kDimGraph },
+        { "packages/alice.fx/shaders/dim.wgsl", kDimWgsl },
         { "packages/fx/graphs/pic.json", kPicGraph },
         { "packages/fx/shaders/dim.wgsl", kDimWgsl },
         { "packages/fx/assets/tiny.png",
@@ -1676,6 +1681,26 @@ TEST_CASE("packages: references, pins, self-containment (§20)")
     CAPTURE(r.joined());
     REQUIRE(r.scene != nullptr);
     CHECK(r.errors.empty());
+
+    // §20.1 publisher-dotted names resolve like any package; a second
+    // dot is not a valid name.
+    r = scene("", R"(
+        { "id": "bg", "type": "shader", "shader": "shaders/minimal.wgsl",
+          "inputs": { "phase": 0.5 } },
+        { "id": "g", "type": "graph",
+          "graph": "packages/alice.fx/graphs/dim.json",
+          "inputs": { "source": "@bg" } },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CAPTURE(r.joined());
+    REQUIRE(r.scene != nullptr);
+    CHECK(r.errors.empty());
+
+    r = scene("", R"(
+        { "id": "g", "type": "graph",
+          "graph": "packages/a.b.c/graphs/dim.json" },
+        { "id": "out", "type": "output", "inputs": { "color": "@g" } })");
+    CHECK(r.scene == nullptr);
+    CHECK(r.hasError("invalid package name"));
 
     // A pin canonicalizes into every read: this fixture only exists
     // under the pinned key (§20.3).

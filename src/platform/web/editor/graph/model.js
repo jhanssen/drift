@@ -10,7 +10,7 @@ import { viewStack } from './state.js';
 // flattening package content.
 export const pkgRootOf = (path) =>
     (typeof path === 'string' &&
-     path.match(/^packages\/[a-z0-9-]+\//)?.[0]) || '';
+     path.match(/^packages\/[a-z0-9-]+(?:\.[a-z0-9-]+)?\//)?.[0]) || '';
 export const activeDocRoot = () =>
     viewStack.length ? pkgRootOf(viewStack[viewStack.length - 1].path) : '';
 export const resolveDocPath = (p, base) =>

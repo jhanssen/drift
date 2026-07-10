@@ -26,7 +26,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const defaultRepo = path.join(here, '..', 'library');
 
 function usage() {
-  console.error('usage: driftpkg.mjs init PATH | index [REPO-DIR] | ' +
+  console.error('usage: driftpkg.mjs init PATH | ' +
+                'index [REPO-DIR] [--first-party] | ' +
                 'install NAME[@PIN] [--repo DIR|URL] [--store DIR] | ' +
                 'list [--store DIR]');
   process.exit(2);
@@ -112,9 +113,13 @@ function readManifest(text, context) {
   } catch (e) {
     throw new Error(`${context}: manifest.json: ${e.message}`);
   }
+  // §20.1: one or two dot-separated segments; bare names are reserved
+  // for the first-party library.
   if (typeof manifest.name !== 'string' ||
-      !/^[a-z0-9-]+$/.test(manifest.name)) {
-    throw new Error(`${context}: manifest 'name' must be [a-z0-9-]+`);
+      !/^[a-z0-9-]+(\.[a-z0-9-]+)?$/.test(manifest.name)) {
+    throw new Error(
+        `${context}: manifest 'name' must be [a-z0-9-]+ or ` +
+        `publisher.name (§20.1)`);
   }
   if (typeof manifest.version !== 'string' ||
       !versionSegments(manifest.version)) {
@@ -139,7 +144,7 @@ function repoFetcher(repo) {
 
 // --- commands -----------------------------------------------------------
 
-function cmdIndex(repoDir) {
+function cmdIndex(repoDir, firstParty) {
   const packages = [];
   for (const entry of fs.readdirSync(repoDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
@@ -167,7 +172,22 @@ function cmdIndex(repoDir) {
     packages.push(pkg);
   }
   packages.sort((a, b) => (a.name < b.name ? -1 : 1));
+  // §20.1: bare names are reserved for the first-party library. The flag
+  // is a self-declaration — it guards against accidental squatting, not
+  // attackers (that is what package signing is reserved for).
+  if (!firstParty) {
+    for (const pkg of packages) {
+      if (!pkg.name.includes('.')) {
+        console.warn(`warning: '${pkg.name}' is a bare name, reserved for ` +
+                     `the first-party library; community packages should ` +
+                     `be publisher.name (§20.1)`);
+      }
+    }
+  }
   const index = { version: 1, packages };
+  if (firstParty) {
+    index.firstParty = true;
+  }
   fs.writeFileSync(path.join(repoDir, 'index.json'),
                    JSON.stringify(index, null, 2) + '\n');
   console.log(`indexed ${packages.length} package(s) in ${repoDir}`);
@@ -178,12 +198,21 @@ async function cmdInstall(spec, repo, store) {
   const name = at === -1 ? spec : spec.slice(0, at);
   const pinText = at === -1 ? null : spec.slice(at + 1);
   const pin = pinText === null ? null : versionSegments(pinText);
-  if (!/^[a-z0-9-]+$/.test(name) || (pinText !== null && !pin)) usage();
+  if (!/^[a-z0-9-]+(\.[a-z0-9-]+)?$/.test(name) ||
+      (pinText !== null && !pin)) {
+    usage();
+  }
 
   const get = repoFetcher(repo);
   const index = JSON.parse((await get('index.json')).toString('utf8'));
   if (index.version !== 1) {
     throw new Error(`unsupported repository index version ${index.version}`);
+  }
+  // §20.1: bare names are reserved for the first-party library.
+  if (!name.includes('.') && !index.firstParty) {
+    console.warn(`warning: installing bare-named '${name}' from a ` +
+                 `repository that does not declare itself first-party ` +
+                 `(§20.1)`);
   }
   let best = null;
   for (const pkg of index.packages ?? []) {
@@ -261,10 +290,12 @@ const command = args.shift();
 let repo = defaultRepo;
 let store = defaultStore();
 const positional = [];
+let firstParty = false;
 while (args.length) {
   const a = args.shift();
   if (a === '--repo') repo = args.shift() ?? usage();
   else if (a === '--store') store = args.shift() ?? usage();
+  else if (a === '--first-party') firstParty = true;
   else positional.push(a);
 }
 
@@ -273,7 +304,7 @@ try {
     if (positional.length !== 1) usage();
     cmdInit(positional[0]);
   } else if (command === 'index') {
-    cmdIndex(positional[0] ?? defaultRepo);
+    cmdIndex(positional[0] ?? defaultRepo, firstParty);
   } else if (command === 'install') {
     if (positional.length !== 1) usage();
     await cmdInstall(positional[0], repo, store);

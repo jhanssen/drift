@@ -556,6 +556,41 @@ index.json
 - Cached content fetching
 - Integrity via hashing (recommended)
 
+### 9.4 Package Identity & Naming
+
+Adopted 2026-07-10 (format rules in SCENE_FORMAT.md §20.1). Names are
+two-level, publisher-namespaced: `alice.glow`. The reasoning, since the
+alternatives keep coming up:
+
+- **Flat names don't survive decentralization.** A flat namespace only
+  works when a central registry arbitrates who owns "glow"; drift has
+  no central anything (§9.1). With independent repositories, flat names
+  collide — and worse, invite dependency-confusion attacks (a second
+  repo publishing `glow` to shadow the one a scene meant).
+- **Reverse-DNS (`com.alice.glow`) rejected**: it presumes creators own
+  domains (hostile to the §12 hobbyist audience) and is unverifiable
+  theater without central enforcement — nothing stops anyone publishing
+  `com.google.fancy`. Ceremony without trust.
+- **Version is not identity** — it is a coordinate (store layout, §20.3
+  pins); folding it into the name would break "pin `alice.glow` to
+  1.x".
+- **Repository is not identity** — a repo is transport, and healthy
+  distribution means mirrors serving the same package. URL-as-identity
+  (the Go modules road) breaks scene documents the day a creator moves
+  hosts.
+- **Bare names are the standard library**: dotless names are reserved
+  for the first-party `library/` packages; community names are always
+  dotted. Zero migration, and the distinction is visible at a glance.
+
+**Trust path.** The publisher segment is a convention today and becomes
+cryptographic when §11's reserved package signing lands: a publisher
+namespace binds to a signing key on first install (trust-on-first-use —
+the store records the key for `alice.*`; later installs must match).
+Until then, the cheap mitigation: the store records the source
+repository per publisher and warns when a publisher's packages start
+arriving from somewhere new. Repositories stay dumb static mirrors
+throughout; authenticity attaches to the namespace, not the host.
+
 ## 10. Performance Goals
 
 - GPU/CPU cost proportional to visible change: a fully static scene costs near nothing; continuous sources (e.g. video) pay their decode/render cost and no more

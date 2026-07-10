@@ -98,11 +98,22 @@ bool validVersion(const std::string& s)
     return false;
 }
 
+// §20.1: one or two dot-separated [a-z0-9-]+ segments. Bare names are
+// the first-party library; community packages are publisher-dotted
+// ("alice.glow").
 bool validPackageName(const std::string& s)
 {
-    return !s.empty() &&
-           s.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") ==
-               std::string::npos;
+    const size_t dot = s.find('.');
+    const auto validSegment = [](const std::string& seg) {
+        return !seg.empty() &&
+               seg.find_first_not_of(
+                   "abcdefghijklmnopqrstuvwxyz0123456789-") ==
+                   std::string::npos;
+    };
+    if (dot == std::string::npos) {
+        return validSegment(s);
+    }
+    return validSegment(s.substr(0, dot)) && validSegment(s.substr(dot + 1));
 }
 
 bool validId(const std::string& s)

@@ -379,7 +379,8 @@ function rebuildNodeMenu() {
     for (const path of JSON.parse(wasm?.graphs() ?? '[]')) {
       // §20.6: package graphs list beside the project's own; the label
       // collapses "packages/sway/graphs/sway.json" to "⬡ sway".
-      const pkg = path.match(/^packages\/([a-z0-9-]+)\/graphs\/(.+)\.json$/);
+      const pkg = path.match(
+          /^packages\/([a-z0-9.-]+)\/graphs\/(.+)\.json$/);
       items.push({
         label: pkg ? '⬡ ' + (pkg[2] === pkg[1] ? pkg[1]
                                                : `${pkg[1]}/${pkg[2]}`)
