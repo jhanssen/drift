@@ -361,7 +361,8 @@ struct LoadResult {
 };
 
 LoadResult load(const std::string& json,
-                const drift::core::VideoDecoderFactory& videoFactory = nullptr)
+                const drift::core::VideoDecoderFactory& videoFactory = nullptr,
+                const drift::core::ModuleLoader& moduleLoader = nullptr)
 {
     const std::map<std::string, std::string> assets = {
         { "shaders/minimal.wgsl", kMinimalWgsl },
@@ -415,7 +416,7 @@ LoadResult load(const std::string& json,
             out = it->second;
             return true;
         },
-        videoFactory, wgpu::Device(), r.errors, r.warnings);
+        videoFactory, moduleLoader, wgpu::Device(), r.errors, r.warnings);
     return r;
 }
 
@@ -1735,7 +1736,7 @@ TEST_CASE("packages: references, pins, self-containment (§20)")
           "src": "packages/fx/manifest.json" },
         { "id": "out", "type": "output", "inputs": { "color": "@img" } })");
     CHECK(r.scene == nullptr);
-    CHECK(r.hasError("must name graphs/, shaders/ or assets/"));
+    CHECK(r.hasError("must name graphs/, shaders/, assets/ or modules/"));
 }
 
 TEST_CASE("editor block (§2.1) is accepted silently; non-object warns")

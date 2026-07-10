@@ -20,6 +20,11 @@ with zero-copy dmabuf import of VAAPI surfaces (per-plane, falling back to a
 single frame transfer, then to software decode). Wayland (wlr-layer-shell
 compositors) only.
 
+WASM logic modules (DESIGN.md §4.5) run in the browser runtime and editor:
+`module` nodes with JSON-declared typed ports, driven CPU-side through a
+data-only I/O block (`examples/spring.sceneproject`). The native Wasmtime
+embedding is pending, so module scenes are web-only for now.
+
 ## Build
 
 Requires: CMake ≥ 3.24, a C++23 compiler, and dev packages for

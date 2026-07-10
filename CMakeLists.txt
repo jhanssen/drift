@@ -49,6 +49,7 @@ add_library(drift_core STATIC
     src/core/Scene.cpp
     src/core/SceneLoader.cpp
     src/core/Nodes.cpp
+    src/core/Module.cpp
     src/core/WgslInterface.cpp
     src/core/Mp4Demux.cpp
 )
@@ -74,7 +75,7 @@ if(EMSCRIPTEN)
     )
     target_link_libraries(drift_web PRIVATE drift_core)
     set(DRIFT_WEB_SCENES plasma buoy follow trail pulse handoff swarm sparks
-                         comets fireworks bokeh sway fit effects)
+                         comets fireworks bokeh sway fit effects spring)
     set(DRIFT_WEB_PRELOADS)
     foreach(scene IN LISTS DRIFT_WEB_SCENES)
         list(APPEND DRIFT_WEB_PRELOADS
@@ -103,7 +104,9 @@ if(EMSCRIPTEN)
         "-sALLOW_MEMORY_GROWTH=1"
         "-sSTACK_SIZE=1048576"
         "-sENVIRONMENT=web"
-        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS"
+        # UTF8ToString/stringToUTF8 are used by the module bridge's EM_JS
+        # bodies; exporting guarantees they are linked into the glue.
+        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,UTF8ToString,stringToUTF8"
         "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/src/platform/web/shell.html"
         ${DRIFT_WEB_PRELOADS}
     )
@@ -188,6 +191,7 @@ if(BUILD_TESTING)
         tests/unit/mp4_demux_test.cpp
         tests/unit/package_store_test.cpp
         tests/unit/value_nodes_test.cpp
+        tests/unit/module_test.cpp
         src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest

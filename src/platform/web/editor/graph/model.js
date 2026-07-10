@@ -83,7 +83,39 @@ export function specInputsOf(source, base = activeDocRoot()) {
     return reflectPorts(source, false, base)?.map((p) =>
         [p.name, reflectCategory(p), false]) ?? null;
   }
+  if (source.type === 'module') {
+    return moduleInterface(source, base)?.inputs ?? null;
+  }
   return nodeInputs(source.type);
+}
+
+// §4.5: a module node's pins are its interface JSON, in the same
+// lexicographic order the runtime lays the I/O block out in. Value inputs
+// without a declared default are required, like the loader enforces.
+function moduleInterface(source, base = activeDocRoot()) {
+  if (!wasm || typeof source.interface !== 'string') {
+    return null;
+  }
+  try {
+    const text = wasm.readAsset(resolveDocPath(source.interface, base));
+    const doc = text ? JSON.parse(text) : null;
+    if (!doc) {
+      return null;
+    }
+    const sorted = (obj) => Object.entries(obj ?? {})
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return {
+      inputs: sorted(doc.inputs).map(([name, d]) => [
+        name, typeCategory(d?.type), false, d?.default,
+        d?.type !== 'event' && d?.default === undefined,
+      ]),
+      outputs: sorted(doc.outputs).map(([name, d]) =>
+          [name, typeCategory(d?.type)]),
+    };
+  } catch (err) {
+    console.log(`editor: module interface ${source.interface}: ${err}`);
+    return null;
+  }
 }
 
 const reflectCategory = (p) =>
@@ -115,6 +147,9 @@ export function outputsOf(node, base = activeDocRoot()) {
     // §18.2: outputs are the read_write storage bindings, reflected.
     return reflectPorts(node, true, base)?.map((p) =>
         [p.name, reflectCategory(p)]) ?? [];
+  }
+  if (node.type === 'module') {
+    return moduleInterface(node, base)?.outputs ?? [];
   }
   return nodeOutputs(node.type) ?? [['result', 'value']];
 }

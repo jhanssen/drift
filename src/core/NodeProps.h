@@ -57,6 +57,9 @@ inline constexpr NodePropDef kNodeProps[] = {
     { "edge", "mode", "enum", false, "\"rise\"", "rise fall both" },
     { "fit", "mode", "enum", false, "\"cover\"", "cover contain stretch" },
     { "graph", "graph", "asset", true, nullptr, nullptr },
+    { "module", "module", "asset", true, nullptr, nullptr },
+    { "module", "interface", "asset", true, nullptr, nullptr },
+    { "module", "capacity", "json", false, nullptr, nullptr },
 };
 
 // The per-type port surface (input/output names, wire categories,
@@ -73,7 +76,7 @@ inline constexpr const char* kNodeTypes[] = {
     "image", "video",  "shader",    "compute", "wave",   "remap",
     "add", "multiply", "mix", "clamp", "noise", "damp", "edge",
     "combine", "split", "sequence", "particles", "sprites", "trails",
-    "transform", "fit", "compositor", "output", "graph",
+    "transform", "fit", "compositor", "output", "graph", "module",
 };
 
 } // namespace drift::core

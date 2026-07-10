@@ -194,7 +194,15 @@ a polling module (weather, transit) does not defeat the idle story.
 
 ### 4.5 Modules and the GPU: Ports, Not Pipelines
 
-Design adopted 2026-07-10 (implementation post-v1 with modules, §13.3).
+Design adopted 2026-07-10; **first implementation the same day** — the
+`module` node runs in the browser runtime and editor (per-node
+`WebAssembly.Instance`s, the interface JSON, the I/O block ABI, value/
+event/buffer outputs, `examples/spring.sceneproject` as the pure
+CPU-transform demo; unit tests drive the whole contract through a fake
+instance). Not yet implemented: the native Wasmtime embedding (module
+scenes fail native load with a clear message — goldens for module
+scenes wait on it), `wake_after_ms` (accepted, not yet honored), and
+the §4.4 storage/network capability imports.
 **Everything that crosses the module boundary is data** — values,
 events, buffer contents — never a GPU handle. Modules do not create
 pipelines, encode passes, or submit work; a "GPU-using WASM effect" is
@@ -234,11 +242,13 @@ and capacity at load; a graph node property may override `capacity`
 referenced as `brain.goals`, rendered by the editor like any node.
 
 **ABI.** Module exports `drift_abi()` (version, must match the
-interface's `abi`), `drift_init(io)`, `drift_update()`. The host
-computes one I/O block layout *from the interface JSON* (declaration
-order; 4/8/16-byte alignment by type), places it in the module's linear
-memory, and exchanges data around each `drift_update()` — no per-value
-host calls. Browser glue reads/writes the WASM memory directly, so the
+interface's `abi`), `drift_init(ioSize)` (returns the block's address in
+module memory), `drift_update()`. The host computes one I/O block layout
+*from the interface JSON* — canonical port order is **lexicographic by
+name within each direction**, so no tool that rewrites the JSON with
+reordered keys can change the ABI; values pack as consecutive f32
+components, 4-byte aligned — and exchanges data around each
+`drift_update()` — no per-value host calls. Browser glue reads/writes the WASM memory directly, so the
 ABI is identical on both targets by construction. The block begins with
 an implicit header:
 
@@ -643,7 +653,8 @@ Deferred from implementation, but the scene format must account for them:
 
 - Compute nodes and GPU simulation
 - 3D meshes and mesh animation — added later as self-contained render-to-texture node types (geometry, camera, and animation internal to the node; output is an ordinary `texture` edge), requiring no scene-format changes
-- WASM logic modules
+- WASM logic modules — since implemented in the browser runtime and
+  editor (2026-07-10, §4.5); the native Wasmtime embedding remains open
 - Browser runtime (WASM build) and browser-based editor
 - Editor↔runtime live-sync protocol
 - Node packages, `.wallpkg` packaging, and the distribution/repository system

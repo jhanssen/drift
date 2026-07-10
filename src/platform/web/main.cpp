@@ -35,9 +35,220 @@ static std::string gLastLoadErrors;
 #include "platform/ParamJson.h"
 #include "platform/web/VideoDecoderWebCodecs.h"
 
+// ---- WASM logic modules (DESIGN.md §4.5) ----
+// Each module node is an ordinary WebAssembly.Instance beside this
+// runtime — one compiled WebAssembly.Module per file (cached by content
+// hash), one instance per node. The shared C++ evaluator drives it; this
+// bridge only moves bytes between the two linear memories and calls the
+// exports. Compilation is asynchronous (Chrome caps synchronous
+// WebAssembly.Module on the main thread at 4 KB), so a scene referencing
+// a not-yet-compiled module fails its load with "still compiling" and the
+// driftModuleReady callback re-runs the last load request.
+
+// Returns 0 = compiled and cached, 1 = compiling (retry on ready),
+// 2 = failed (message via js_module_error).
+EM_JS(int, js_module_prepare, (const char* key, const uint8_t* bytes, int len), {
+    const k = UTF8ToString(key);
+    const reg = Module.driftModules || (Module.driftModules = new Map());
+    const ent = reg.get(k);
+    if (ent) {
+        return ent.error ? 2 : (ent.module ? 0 : 1);
+    }
+    const buf = HEAPU8.slice(bytes, bytes + len);
+    if (len <= 4096) {
+        // Small enough for the synchronous path everywhere: no retry trip.
+        try {
+            reg.set(k, { module: new WebAssembly.Module(buf) });
+            return 0;
+        } catch (e) {
+            reg.set(k, { error: String(e) });
+            return 2;
+        }
+    }
+    reg.set(k, {});
+    WebAssembly.compile(buf).then(
+        (m) => {
+            reg.get(k).module = m;
+            if (Module.driftModuleReady) Module.driftModuleReady();
+        },
+        (e) => {
+            reg.get(k).error = String(e);
+            if (Module.driftModuleReady) Module.driftModuleReady();
+        });
+    return 1;
+});
+
+EM_JS(void, js_module_error, (const char* key, char* out, int cap), {
+    const ent = (Module.driftModules || new Map()).get(UTF8ToString(key));
+    stringToUTF8(ent && ent.error ? ent.error : 'unknown module error',
+                 out, cap);
+});
+
+// Instantiates the cached module and runs the §4.5 init handshake
+// (drift_abi / drift_init(ioSize) / memory bounds). Returns a handle > 0,
+// or 0 with the message in errOut.
+EM_JS(int, js_module_instantiate, (const char* key, int ioSize, char* errOut,
+                                   int errCap), {
+    const ent = (Module.driftModules || new Map()).get(UTF8ToString(key));
+    const fail = (msg) => { stringToUTF8(String(msg), errOut, errCap); return 0; };
+    if (!ent || !ent.module) {
+        return fail(ent && ent.error ? ent.error : 'module not compiled');
+    }
+    let inst;
+    try {
+        inst = new WebAssembly.Instance(ent.module, { env: {
+            // The one host import (§4.5): debug logging.
+            drift_log: (ptr, len) => {
+                const mem = inst.exports.memory;
+                console.log('drift module:', new TextDecoder().decode(
+                    new Uint8Array(mem.buffer, ptr >>> 0, len >>> 0)));
+            },
+        } });
+    } catch (e) {
+        return fail(e);
+    }
+    const ex = inst.exports;
+    if (typeof ex.drift_abi !== 'function' ||
+        typeof ex.drift_init !== 'function' ||
+        typeof ex.drift_update !== 'function' ||
+        !(ex.memory instanceof WebAssembly.Memory)) {
+        return fail('missing drift_abi/drift_init/drift_update/memory exports');
+    }
+    try {
+        const abi = ex.drift_abi() | 0;
+        if (abi !== 1) {
+            return fail('unsupported module ABI ' + abi);
+        }
+        const io = ex.drift_init(ioSize) >>> 0;
+        if (!io || io + ioSize > ex.memory.buffer.byteLength) {
+            return fail('drift_init returned a bad io block');
+        }
+        const insts = Module.driftInstances ||
+                      (Module.driftInstances = { next: 1, map: new Map() });
+        const h = insts.next++;
+        insts.map.set(h, { inst: inst, io: io });
+        return h;
+    } catch (e) {
+        return fail('module init trapped: ' + e);
+    }
+});
+
+// Byte moves take fresh views every call: either memory may have grown
+// (growth detaches the old ArrayBuffer).
+EM_JS(int, js_module_write, (int h, int off, const uint8_t* src, int len), {
+    const e = Module.driftInstances && Module.driftInstances.map.get(h);
+    if (!e) return 0;
+    const buf = e.inst.exports.memory.buffer;
+    if (e.io + off + len > buf.byteLength) return 0;
+    new Uint8Array(buf).set(HEAPU8.subarray(src, src + len), e.io + off);
+    return 1;
+});
+
+EM_JS(int, js_module_read, (int h, int off, uint8_t* dst, int len), {
+    const e = Module.driftInstances && Module.driftInstances.map.get(h);
+    if (!e) return 0;
+    const buf = e.inst.exports.memory.buffer;
+    if (e.io + off + len > buf.byteLength) return 0;
+    HEAPU8.set(new Uint8Array(buf, e.io + off, len), dst);
+    return 1;
+});
+
+EM_JS(int, js_module_update, (int h, char* errOut, int errCap), {
+    const e = Module.driftInstances && Module.driftInstances.map.get(h);
+    if (!e) return 0;
+    try {
+        e.inst.exports.drift_update();
+        return 1;
+    } catch (err) {
+        stringToUTF8(String(err), errOut, errCap);
+        return 0;
+    }
+});
+
+EM_JS(void, js_module_release, (int h), {
+    if (Module.driftInstances) Module.driftInstances.map.delete(h);
+});
+
+EM_JS(void, js_module_set_ready, (), {
+    Module.driftModuleReady = () => _drift_modules_ready();
+});
+
 namespace {
 
 constexpr const char* kCanvas = "#canvas";
+
+class WebModuleInstance : public drift::core::ModuleInstance {
+public:
+    explicit WebModuleInstance(int handle)
+        : mHandle(handle)
+    {
+    }
+    ~WebModuleInstance() override { js_module_release(mHandle); }
+
+    bool writeIo(uint32_t offset, const void* src, uint32_t len) override
+    {
+        return js_module_write(mHandle, (int)offset, (const uint8_t*)src,
+                               (int)len) != 0;
+    }
+    bool readIo(uint32_t offset, void* dst, uint32_t len) override
+    {
+        return js_module_read(mHandle, (int)offset, (uint8_t*)dst,
+                              (int)len) != 0;
+    }
+    bool update(std::string& error) override
+    {
+        char err[512] = {};
+        if (js_module_update(mHandle, err, sizeof(err))) {
+            return true;
+        }
+        error = err;
+        return false;
+    }
+
+private:
+    int mHandle;
+};
+
+// Set when a scene load failed only because a module was still compiling;
+// drift_modules_ready() then re-runs that load.
+bool gModulesPending = false;
+std::string gRetryJson; // the failed attempt's document; "" = read bundle
+
+std::unique_ptr<drift::core::ModuleInstance>
+makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
+                   std::string& error)
+{
+    // Content-hash key (FNV-1a 64): editor rewrites of a module file get a
+    // fresh compile, unchanged files share the cached one.
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char c : wasmBytes) {
+        hash = (hash ^ c) * 1099511628211ull;
+    }
+    char key[32];
+    snprintf(key, sizeof(key), "m%016llx", (unsigned long long)hash);
+
+    const int state = js_module_prepare(key, (const uint8_t*)wasmBytes.data(),
+                                        (int)wasmBytes.size());
+    if (state == 1) {
+        gModulesPending = true;
+        error = "module is still compiling; the preview retries when ready";
+        return nullptr;
+    }
+    if (state == 2) {
+        char err[512] = {};
+        js_module_error(key, err, sizeof(err));
+        error = err;
+        return nullptr;
+    }
+    char err[512] = {};
+    const int handle = js_module_instantiate(key, (int)ioSize, err,
+                                             sizeof(err));
+    if (!handle) {
+        error = err;
+        return nullptr;
+    }
+    return std::make_unique<WebModuleInstance>(handle);
+}
 
 struct App {
     wgpu::Instance instance;
@@ -119,9 +330,16 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
         return nullptr;
     }
 
+    gModulesPending = false;
     std::vector<std::string> errors, warnings;
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
-                                          device, errors, warnings);
+                                          makeModuleInstance, device, errors,
+                                          warnings);
+    if (!scene && gModulesPending) {
+        // Retried verbatim by drift_modules_ready() once compiles land.
+        gRetryJson = (jsonInOut && !jsonInOut->empty()) ? *jsonInOut
+                                                        : std::string();
+    }
     for (const auto& w : warnings) {
         fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
     }
@@ -181,6 +399,9 @@ bool syncSurfaceSize()
 
 bool onFrame(double nowMs, void*)
 {
+    if (!gApp.scene) {
+        return true; // no scene yet (e.g. modules still compiling)
+    }
     if (!syncSurfaceSize()) {
         return true; // canvas not laid out yet; try again next frame
     }
@@ -267,10 +488,9 @@ void onDeviceReady()
                                          : wgpu::CompositeAlphaMode::Auto;
 
     gApp.scene = loadScene(gApp.scenePath, gApp.device, &gApp.sceneJson);
-    if (!gApp.scene) {
-        return;
-    }
-
+    // Callbacks and the frame loop start even without a scene: the initial
+    // load may be waiting on module compiles (drift_modules_ready fills
+    // gApp.scene in), and onFrame no-ops until it exists.
     emscripten_set_mousemove_callback(kCanvas, nullptr, false, onMouseMove);
     emscripten_set_mouseenter_callback(kCanvas, nullptr, false, onMouseEnterLeave);
     emscripten_set_mouseleave_callback(kCanvas, nullptr, false, onMouseEnterLeave);
@@ -327,6 +547,25 @@ void requestDevice()
 // endpoint — platform/ParamJson.h): call via ccall/cwrap after the scene
 // loads (describe returns {"scene":null} until then).
 extern "C" {
+
+// Fired by the JS bridge when an asynchronous module compile lands:
+// re-runs the load attempt that failed on "still compiling". Keeps the
+// clock (a scene appearing late starts at the current time, like
+// drift_open).
+EMSCRIPTEN_KEEPALIVE void drift_modules_ready()
+{
+    if (!gModulesPending) {
+        return;
+    }
+    gModulesPending = false;
+    std::string json = gRetryJson;
+    auto fresh = loadScene(gApp.scenePath, gApp.device, &json);
+    if (!fresh) {
+        return; // still pending on another module, or a real load error
+    }
+    gApp.sceneJson = std::move(json);
+    gApp.scene = std::move(fresh);
+}
 
 EMSCRIPTEN_KEEPALIVE const char* drift_describe()
 {
@@ -757,6 +996,7 @@ int main(int argc, char** argv)
     // The bundle ships first-party packages as a store at /packages
     // (§20.2); a host page can still override the path.
     setenv("DRIFT_PACKAGE_PATH", "/packages", /*overwrite=*/0);
+    js_module_set_ready(); // async module compiles retry the scene load
 
     std::string name = argc > 1 ? argv[1] : "plasma";
     if (name.find('/') != std::string::npos ||

@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 
+#include "Module.h"
 #include "Scene.h"
 #include "Video.h"
 #include "WgslInterface.h"
@@ -515,6 +516,33 @@ private:
     wgpu::Texture mColor;
     uint32_t mWidth = 0, mHeight = 0;
     uint32_t mTick = 0; // ring head = mTick % mLength
+};
+
+// DESIGN.md §4.5 module: WASM logic as a node. Ports come from the
+// interface JSON (core/Module.h; lexicographic order): value/event inputs,
+// then value/event/buffer outputs. Everything crossing the boundary is
+// data through one I/O block — the host writes header + inputs, calls the
+// module's update, reads outputs back. Value outputs are change-detected
+// like any value node (a pure CPU transform module composes exactly like
+// wave/remap); buffer outputs stage in module memory and upload+dirty only
+// on the written flag (the §18.1 refinement); event outputs fire off the
+// header bitmask. A trapped module goes dead with one stderr line instead
+// of freezing the wall.
+class ModuleNode : public Node {
+public:
+    ModuleNode(std::unique_ptr<ModuleInstance> instance,
+               ModuleInterface iface);
+    void evaluate(FrameContext& ctx) override;
+
+    const ModuleInterface& interface() const { return mIface; }
+
+private:
+    std::unique_ptr<ModuleInstance> mInstance;
+    const ModuleInterface mIface;
+    std::vector<uint8_t> mScratch;      // io exchange staging (host heap)
+    std::vector<wgpu::Buffer> mBuffers; // one per buffer output, iface order
+    double mLastSeconds = 0.0;
+    bool mDead = false; // trapped or io failure; stops updating, logged once
 };
 
 // §9.6 output: blits the final linear texture to the platform target with

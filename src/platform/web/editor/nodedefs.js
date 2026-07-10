@@ -63,7 +63,8 @@ export const GRAPH_COLORS = { texture: '#6aa1ff', value: '#7fd490', event: '#e3c
 export const G = { W: 170, HEAD: 24, ROW: 15, PAD: 7, COL: 250, GAP: 26, MARGIN: 40 };
 
 // Node types the palette offers ('output' is exactly-one per scene, §9.6).
-export const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'particles',
+export const NODE_PALETTE = ['image', 'video', 'shader', 'compute', 'module',
+                      'particles',
                       'sprites', 'trails', 'transform', 'fit', 'compositor',
                       'sequence', 'wave', 'noise', 'damp', 'remap', 'add',
                       'multiply', 'mix', 'clamp', 'edge', 'combine', 'split',

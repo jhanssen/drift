@@ -1,0 +1,12 @@
+{
+    "abi": 1,
+    "inputs": {
+        "damping": { "type": "scalar", "default": 6.0 },
+        "stiffness": { "type": "scalar", "default": 90.0 },
+        "target": { "type": "vec2" },
+        "tick": { "type": "scalar", "default": 0.0 }
+    },
+    "outputs": {
+        "position": { "type": "vec2" }
+    }
+}

@@ -483,11 +483,14 @@ bool isImplicitNode(const std::string& id)
 
 class Loader {
 public:
-    Loader(const AssetReader& readAsset, const VideoDecoderFactory& videoFactory,
+    Loader(const AssetReader& readAsset,
+           const VideoDecoderFactory& videoFactory,
+           const ModuleLoader& moduleLoader,
            const wgpu::Device& device, std::vector<std::string>& errors,
            std::vector<std::string>& warnings)
-        : mReadAsset(readAsset), mVideoFactory(videoFactory), mDevice(device),
-          mErrors(errors), mWarnings(warnings)
+        : mReadAsset(readAsset), mVideoFactory(videoFactory),
+          mModuleLoader(moduleLoader), mDevice(device), mErrors(errors),
+          mWarnings(warnings)
     {
     }
 
@@ -541,6 +544,7 @@ private:
 
     const AssetReader& mReadAsset;
     const VideoDecoderFactory& mVideoFactory;
+    const ModuleLoader& mModuleLoader;
     const wgpu::Device& mDevice;
     std::vector<std::string>& mErrors;
     std::vector<std::string>& mWarnings;
@@ -613,9 +617,10 @@ std::vector<OutputPortDef> Loader::producerPorts(const std::string& nodeId)
         }
         return ports;
     }
-    if (raw.type == "compute") {
-        // Reflected outputs (§18.2), named at construction like sequence
-        // tracks; the instance exists for every caller (topo/deferred).
+    if (raw.type == "compute" || raw.type == "module") {
+        // Reflected/declared outputs (§18.2 WGSL, §4.5 interface JSON),
+        // named at construction like sequence tracks; the instance exists
+        // for every caller (topo/deferred).
         Node* node = mInstances[nodeId];
         std::vector<OutputPortDef> ports;
         for (int i = 0; i < (int)node->outputs.size(); ++i) {
@@ -974,9 +979,10 @@ bool Loader::assetPath(const RawNode& raw, std::string& path,
         return false;
     }
     if (!rest.starts_with("graphs/") && !rest.starts_with("shaders/") &&
-        !rest.starts_with("assets/")) {
+        !rest.starts_with("assets/") && !rest.starts_with("modules/")) {
         fail("node '" + raw.id + "': package path '" + path +
-             "' must name graphs/, shaders/ or assets/ content (§20.5)");
+             "' must name graphs/, shaders/, assets/ or modules/ content "
+             "(§20.5)");
         return false;
     }
     std::string ref = name;
@@ -2096,6 +2102,106 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
                                std::move(capacities), dispatch);
     }
 
+    if (raw.type == "module") {
+        // DESIGN.md §4.5: WASM logic as a node. Ports come from the
+        // interface JSON; the wasm itself is instantiated through the
+        // platform's ModuleLoader (null = this runtime can't run modules).
+        const auto& obj = raw.json->get_object();
+        auto readPath = [&](const char* key, std::string& path,
+                            std::string& contents) -> bool {
+            auto it = obj.find(key);
+            if (it == obj.end() || !it->second.is_string()) {
+                fail("node '" + raw.id + "': module node needs a string '" +
+                     std::string(key) + "' path");
+                return false;
+            }
+            path = it->second.get_string();
+            if (path.find("..") != std::string::npos ||
+                path.starts_with("/")) {
+                fail("node '" + raw.id + "': " + key +
+                     " path escapes the project");
+                return false;
+            }
+            if (!assetPath(raw, path, key)) {
+                return false;
+            }
+            if (!mReadAsset(path, contents)) {
+                fail("node '" + raw.id + "': cannot read " + key + " '" +
+                     path + "'");
+                return false;
+            }
+            return true;
+        };
+        std::string ifacePath, ifaceJson, wasmPath, wasmBytes;
+        if (!readPath("interface", ifacePath, ifaceJson) ||
+            !readPath("module", wasmPath, wasmBytes)) {
+            return nullptr;
+        }
+        ModuleInterface iface;
+        std::string err;
+        if (!ModuleInterface::parse(ifaceJson, iface, err)) {
+            fail("node '" + raw.id + "': " + ifacePath + ": " + err);
+            return nullptr;
+        }
+
+        // capacity override (the §18.2 compute pattern): a number applies
+        // to every buffer output, the object form maps port -> count.
+        if (auto capIt = obj.find("capacity"); capIt != obj.end()) {
+            for (auto& o : iface.outputs) {
+                if (o.type != ValueType::Buffer) {
+                    continue;
+                }
+                const glz::generic* entry = &capIt->second;
+                if (capIt->second.is_object()) {
+                    const auto& map = capIt->second.get_object();
+                    auto it = map.find(o.name);
+                    if (it == map.end()) {
+                        continue; // unlisted ports keep the declared capacity
+                    }
+                    entry = &it->second;
+                }
+                if (!entry->is_number() ||
+                    entry->get_number() !=
+                        (double)(uint32_t)entry->get_number() ||
+                    entry->get_number() <= 0) {
+                    fail("node '" + raw.id +
+                         "': 'capacity' must be a positive integer");
+                    return nullptr;
+                }
+                o.capacity = (uint32_t)entry->get_number();
+                if ((uint64_t)o.stride * o.capacity > kModuleMaxBufferBytes) {
+                    fail("node '" + raw.id + "': capacity for '" + o.name +
+                         "' exceeds the staging limit");
+                    return nullptr;
+                }
+            }
+        }
+        iface.computeLayout();
+
+        if (!mModuleLoader) {
+            fail("node '" + raw.id +
+                 "': this runtime cannot run WASM modules");
+            return nullptr;
+        }
+        auto instance = mModuleLoader(wasmBytes, iface.ioSize, err);
+        if (!instance) {
+            fail("node '" + raw.id + "': " + wasmPath + ": " + err);
+            return nullptr;
+        }
+
+        // Ports: the interface's inputs, in its (lexicographic) order.
+        // Value inputs without a declared default must be bound; events
+        // are never required (unconnected just never fires).
+        portsOut.clear();
+        for (const auto& in : iface.inputs) {
+            PortDef def{ in.name, in.type,
+                         in.type != ValueType::Event && !in.hasDefault };
+            def.def = in.def.v;
+            portsOut.push_back(std::move(def));
+        }
+        return new ModuleNode(std::move(instance), std::move(iface));
+    }
+
     if (raw.type == "image") {
         const auto& obj = raw.json->get_object();
         auto srcIt = obj.find("src");
@@ -2964,6 +3070,7 @@ std::string nodePortsJson()
         { "split", kSplitInputs, table(kSplitInputs) },
         { "sequence", kSequenceInputs, table(kSequenceInputs), false },
         { "graph", nullptr, -1, false },
+        { "module", nullptr, -1, false }, // §4.5: ports from interface JSON
         { "time", nullptr, -1, true, true },
         { "mouse", nullptr, -1, true, true },
     };
@@ -3044,11 +3151,13 @@ std::string nodePortsJson()
 std::unique_ptr<Scene> Scene::load(const std::string& sceneJson,
                                    const AssetReader& readAsset,
                                    const VideoDecoderFactory& videoFactory,
+                                   const ModuleLoader& moduleLoader,
                                    const wgpu::Device& device,
                                    std::vector<std::string>& errors,
                                    std::vector<std::string>& warnings)
 {
-    Loader loader(readAsset, videoFactory, device, errors, warnings);
+    Loader loader(readAsset, videoFactory, moduleLoader, device, errors,
+                  warnings);
     auto scene = loader.load(sceneJson);
     if (!scene && errors.empty()) {
         errors.push_back("scene load failed");

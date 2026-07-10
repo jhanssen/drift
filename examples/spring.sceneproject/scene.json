@@ -1,0 +1,76 @@
+{
+    "version": 1,
+    "name": "Spring",
+    "description": "WASM logic module demo: a springy dot chases the pointer through a CPU-side integrator (DESIGN.md §4.5)",
+    "parameters": {
+        "stiffness": {
+            "type": "scalar",
+            "default": 90.0,
+            "min": 5.0,
+            "max": 400.0,
+            "step": 5.0,
+            "label": "Spring stiffness"
+        },
+        "damping": {
+            "type": "scalar",
+            "default": 6.0,
+            "min": 0.0,
+            "max": 30.0,
+            "step": 0.5,
+            "label": "Damping"
+        },
+        "warm": {
+            "type": "scalar",
+            "default": 0.2,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05,
+            "label": "Warmth"
+        }
+    },
+    "nodes": [
+        {
+            "id": "bg",
+            "type": "shader",
+            "shader": "shaders/bg.wgsl"
+        },
+        {
+            "id": "dot",
+            "type": "shader",
+            "shader": "shaders/dot.wgsl",
+            "size": [256, 256],
+            "inputs": { "warm": "$warm" }
+        },
+        {
+            "id": "brain",
+            "type": "module",
+            "module": "modules/spring.wasm",
+            "interface": "modules/spring.json",
+            "inputs": {
+                "target": "@mouse.position",
+                "tick": "@time.delta",
+                "stiffness": "$stiffness",
+                "damping": "$damping"
+            }
+        },
+        {
+            "id": "place",
+            "type": "transform",
+            "inputs": {
+                "source": "@dot",
+                "position": "@brain.position",
+                "scale": 0.2
+            }
+        },
+        {
+            "id": "comp",
+            "type": "compositor",
+            "inputs": { "layers": ["@bg", "@place"] }
+        },
+        {
+            "id": "out",
+            "type": "output",
+            "inputs": { "color": "@comp" }
+        }
+    ]
+}

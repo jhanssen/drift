@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "Module.h"
 #include "Value.h"
 #include "Video.h"
 
@@ -109,9 +110,12 @@ public:
     // human-readable messages appended to errors; non-fatal findings (§13:
     // unknown fields/properties/hints, unreachable nodes) go to warnings.
     // videoFactory may be null: scenes with video nodes then fail to load.
+    // moduleLoader likewise (§4.5): null means this runtime cannot run
+    // WASM modules, and scenes containing a module node fail to load.
     static std::unique_ptr<Scene> load(const std::string& sceneJson,
                                        const AssetReader& readAsset,
                                        const VideoDecoderFactory& videoFactory,
+                                       const ModuleLoader& moduleLoader,
                                        const wgpu::Device& device,
                                        std::vector<std::string>& errors,
                                        std::vector<std::string>& warnings);

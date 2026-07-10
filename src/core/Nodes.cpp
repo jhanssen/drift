@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -3706,6 +3707,171 @@ void TrailsNode::evaluate(FrameContext& ctx)
     out.texHeight = mHeight;
     outputs[0].value = out;
     outputs[0].dirty = true;
+}
+
+// ---- ModuleNode (DESIGN.md §4.5) ----
+
+ModuleNode::ModuleNode(std::unique_ptr<ModuleInstance> instance,
+                       ModuleInterface iface)
+    : mInstance(std::move(instance)), mIface(std::move(iface))
+{
+    // Outputs are named and typed at construction (like compute), so load
+    // time can resolve references and validate buffer strides before the
+    // module ever runs.
+    outputs.resize(mIface.outputs.size());
+    mBuffers.resize(mIface.outputs.size());
+    for (size_t i = 0; i < mIface.outputs.size(); ++i) {
+        const ModuleInterface::Output& o = mIface.outputs[i];
+        outputs[i].name = o.name;
+        outputs[i].value.type = o.type;
+        if (o.type == ValueType::Buffer) {
+            outputs[i].value.bufStride = o.stride;
+            outputs[i].value.bufCapacity = o.capacity;
+        }
+    }
+}
+
+void ModuleNode::evaluate(FrameContext& ctx)
+{
+    if (mDead) {
+        return;
+    }
+    const auto die = [this](const std::string& why) {
+        mDead = true;
+        fprintf(stderr, "drift: module node '%s': %s\n", id.c_str(),
+                why.c_str());
+    };
+
+    // GPU buffers exist from the first evaluation (zero-initialized by
+    // WebGPU — the §18.1 first-frame rule), so downstream bindings hold
+    // even before the module's first write. A pure value module never
+    // touches the device.
+    if (firstEvaluate) {
+        for (size_t i = 0; i < mIface.outputs.size(); ++i) {
+            const ModuleInterface::Output& o = mIface.outputs[i];
+            if (o.type != ValueType::Buffer) {
+                continue;
+            }
+            wgpu::BufferDescriptor desc{};
+            desc.size = (uint64_t)o.stride * o.capacity;
+            desc.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc |
+                         wgpu::BufferUsage::CopyDst;
+            mBuffers[i] = ctx.device.CreateBuffer(&desc);
+            outputs[i].value.buffer = mBuffers[i];
+        }
+    }
+
+    // Header + value inputs, staged host-side then written in one span.
+    mScratch.resize(std::max(mIface.inputEnd,
+                             mIface.valueOutEnd - mIface.valueOutBegin));
+    uint8_t* p = mScratch.data();
+    const auto put32 = [p](uint32_t off, uint32_t v) {
+        std::memcpy(p + off, &v, 4);
+    };
+    const auto putf = [p](uint32_t off, float v) {
+        std::memcpy(p + off, &v, 4);
+    };
+    putf(kModuleHdrTime, (float)ctx.seconds);
+    putf(kModuleHdrDt,
+         firstEvaluate ? 0.0f : (float)(ctx.seconds - mLastSeconds));
+    mLastSeconds = ctx.seconds;
+    put32(kModuleHdrFrame, (uint32_t)ctx.frame);
+    put32(kModuleHdrFlags, firstEvaluate ? 1u : 0u);
+    uint32_t eventsIn = 0;
+    for (size_t i = 0; i < mIface.inputs.size(); ++i) {
+        const ModuleInterface::Input& in = mIface.inputs[i];
+        if (in.type == ValueType::Event) {
+            if (inputFired(i)) {
+                eventsIn |= 1u << in.eventBit;
+            }
+            continue;
+        }
+        const Value v = inputValue(i);
+        for (int c = 0; c < componentCount(in.type); ++c) {
+            putf(in.offset + 4 * c, (float)v.v[c]);
+        }
+    }
+    put32(kModuleHdrEventsIn, eventsIn);
+    put32(kModuleHdrEventsOut, 0);
+    put32(kModuleHdrWakeAfterMs, 0);
+    put32(kModuleHdrReserved, 0);
+    if (!mInstance->writeIo(0, p, mIface.inputEnd)) {
+        die("io write failed");
+        return;
+    }
+
+    std::string err;
+    if (!mInstance->update(err)) {
+        die("trapped: " + err);
+        return;
+    }
+
+    // Value outputs: change-detected like any value node. Event outputs:
+    // fired iff the module set their bit this update.
+    uint32_t eventsOut = 0;
+    if (!mInstance->readIo(kModuleHdrEventsOut, &eventsOut, 4) ||
+        (mIface.valueOutEnd > mIface.valueOutBegin &&
+         !mInstance->readIo(mIface.valueOutBegin, p,
+                            mIface.valueOutEnd - mIface.valueOutBegin))) {
+        die("io read failed");
+        return;
+    }
+    for (size_t i = 0; i < mIface.outputs.size(); ++i) {
+        const ModuleInterface::Output& o = mIface.outputs[i];
+        if (o.type == ValueType::Event) {
+            if (eventsOut & (1u << o.eventBit)) {
+                outputs[i].dirty = true;
+            }
+            continue;
+        }
+        if (o.type == ValueType::Buffer) {
+            continue; // below
+        }
+        Value v{};
+        v.type = o.type;
+        for (int c = 0; c < componentCount(o.type); ++c) {
+            float f = 0.0f;
+            std::memcpy(&f, p + (o.offset - mIface.valueOutBegin) + 4 * c, 4);
+            v.v[c] = f;
+        }
+        writeOutput(outputs[i], v);
+    }
+
+    // Buffer outputs: upload and dirty only when the module set 'written'
+    // this update (the §18.1 refinement declared-port staging makes
+    // possible) — an update that writes nothing propagates no GPU work.
+    for (size_t i = 0; i < mIface.outputs.size(); ++i) {
+        const ModuleInterface::Output& o = mIface.outputs[i];
+        if (o.type != ValueType::Buffer) {
+            continue;
+        }
+        uint32_t control[2] = { 0, 0 }; // count, written
+        if (!mInstance->readIo(o.offset, control, 8)) {
+            die("io read failed");
+            return;
+        }
+        if (!control[1]) {
+            continue;
+        }
+        const uint32_t count = std::min(control[0], o.capacity);
+        const uint32_t bytes = count * o.stride;
+        if (bytes) {
+            mScratch.resize(std::max<size_t>(mScratch.size(), bytes));
+            if (!mInstance->readIo(mIface.bufferDataOffset(o),
+                                   mScratch.data(), bytes)) {
+                die("io read failed");
+                return;
+            }
+            ctx.device.GetQueue().WriteBuffer(mBuffers[i], 0, mScratch.data(),
+                                              bytes);
+        }
+        const uint32_t zero = 0;
+        if (!mInstance->writeIo(o.offset + 4, &zero, 4)) { // clear written
+            die("io write failed");
+            return;
+        }
+        outputs[i].dirty = true;
+    }
 }
 
 // ---- OutputNode ----

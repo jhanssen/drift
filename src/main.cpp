@@ -154,8 +154,11 @@ std::unique_ptr<drift::core::Scene> loadScene(
     }
 
     std::vector<std::string> errors, warnings;
+    // No native module engine yet (§4.5: Wasmtime pending); module scenes
+    // fail to load with a clear message.
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
-                                          device, errors, warnings);
+                                          drift::core::ModuleLoader{}, device,
+                                          errors, warnings);
     for (const auto& w : warnings) {
         fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
     }
