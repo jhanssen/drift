@@ -42,7 +42,7 @@ std::string wat2wasm(const char* wat)
 TEST_CASE("wasmtime: the example spring module runs natively (§4.5)")
 {
     const std::string base =
-        std::string(DRIFT_SOURCE_DIR) + "/examples/spring.sceneproject/";
+        std::string(DRIFT_SOURCE_DIR) + "/library/spring/";
     ModuleInterface iface;
     std::string err;
     REQUIRE_MESSAGE(

@@ -168,6 +168,39 @@
       "description": "Masked mix: blend two layers per-pixel by a grayscale mask."
     },
     {
+      "name": "spring",
+      "version": "1.0.0",
+      "files": [
+        {
+          "path": "graphs/spring.json",
+          "sha256": "ecbf2d6cf326a8c063995d3e46d4d698172168500277e064b7eb867ceb85e866",
+          "size": 761
+        },
+        {
+          "path": "manifest.json",
+          "sha256": "4f64f5e4865760e42cdac5f4dd0bd79221562ce408b4df6143d18bc6dbafdb84",
+          "size": 250
+        },
+        {
+          "path": "modules/spring.c",
+          "sha256": "bc10f20aa6b8a64b17479f05050e72848c95fe7eaf212734fe89e5f15e029215",
+          "size": 1766
+        },
+        {
+          "path": "modules/spring.json",
+          "sha256": "c0ad8598ccc79d3554fa455084dd4c3d64186ea52e846782ecffa7c91902be48",
+          "size": 311
+        },
+        {
+          "path": "modules/spring.wasm",
+          "sha256": "96d080dbe7d07be3780988862b121474139b63f7ee391d33684004a41cfddee1",
+          "size": 597
+        }
+      ],
+      "hash": "f178cf3a1cb30e4a15b6b893fd24f9cbb5cb49fdb95335fc2611a767f542711d",
+      "description": "Springy follow: a WASM logic module (DESIGN.md §4.5) integrates damped spring physics toward the target — the position overshoots and settles instead of lerping."
+    },
+    {
       "name": "sway",
       "version": "1.0.0",
       "files": [

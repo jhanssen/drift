@@ -9,7 +9,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # First-party packages under library/ (§20.4): the web bundle ships them
 # as a store at /packages, and the test fixture installs them into a
 # build-dir store for the goldens.
-set(DRIFT_LIBRARY_PACKAGES sway bokeh adjust gradient blur glow displace mask)
+set(DRIFT_LIBRARY_PACKAGES sway bokeh adjust gradient blur glow displace mask
+                           spring)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

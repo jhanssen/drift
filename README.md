@@ -47,6 +47,14 @@ build/drift examples/plasma.sceneproject --windowed   # dev window
 build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 ```
 
+Some examples (`sway`, `bokeh`, `effects`, `spring`) consume first-party
+packages (SCENE_FORMAT.md §20) resolved from the machine's package store
+rather than from the project. Install them once:
+
+```
+node tools/driftpkg.mjs install --all      # library/ -> ~/.local/share/drift/packages
+```
+
 Without a scene argument, a builtin placeholder gradient is rendered.
 `DRIFT_ADAPTER=<substring>` selects a specific GPU adapter by device name.
 `--set name=value` overrides scene parameters (repeatable). Headless runs

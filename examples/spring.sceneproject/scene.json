@@ -1,7 +1,8 @@
 {
     "version": 1,
     "name": "Spring",
-    "description": "WASM logic module demo: a springy dot chases the pointer through a CPU-side integrator (DESIGN.md §4.5)",
+    "description": "WASM logic module demo: a springy dot chases the pointer through the first-party spring package's CPU-side integrator (DESIGN.md §4.5, SCENE_FORMAT.md §20)",
+    "packages": { "spring": "1" },
     "parameters": {
         "stiffness": {
             "type": "scalar",
@@ -43,12 +44,10 @@
         },
         {
             "id": "brain",
-            "type": "module",
-            "module": "modules/spring.wasm",
-            "interface": "modules/spring.json",
+            "type": "graph",
+            "graph": "packages/spring/graphs/spring.json",
             "inputs": {
                 "target": "@mouse.position",
-                "tick": "@time.delta",
                 "stiffness": "$stiffness",
                 "damping": "$damping"
             }
@@ -58,7 +57,7 @@
             "type": "transform",
             "inputs": {
                 "source": "@dot",
-                "position": "@brain.position",
+                "position": "@brain",
                 "scale": 0.2
             }
         },

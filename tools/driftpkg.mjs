@@ -28,7 +28,7 @@ const defaultRepo = path.join(here, '..', 'library');
 function usage() {
   console.error('usage: driftpkg.mjs init PATH | ' +
                 'index [REPO-DIR] [--first-party] | ' +
-                'install NAME[@PIN] [--repo DIR|URL] [--store DIR] | ' +
+                'install NAME[@PIN]|--all [--repo DIR|URL] [--store DIR] | ' +
                 'list [--store DIR]');
   process.exit(2);
 }
@@ -133,6 +133,15 @@ function readManifest(text, context) {
 function repoFetcher(repo) {
   if (/^https?:\/\//.test(repo)) {
     const base = repo.endsWith('/') ? repo : repo + '/';
+    // Hash verification catches corruption, not an in-transit rewrite of
+    // the index itself — remote repos must be HTTPS; plain http is for
+    // local development only.
+    const { protocol, hostname } = new URL(base);
+    if (protocol === 'http:' &&
+        !['localhost', '127.0.0.1', '[::1]', '::1'].includes(hostname)) {
+      throw new Error(
+          `refusing plain http for non-localhost repo '${repo}' — use https`);
+    }
     return async (rel) => {
       const res = await fetch(base + rel);
       if (!res.ok) throw new Error(`GET ${base + rel}: ${res.status}`);
@@ -194,6 +203,22 @@ function cmdIndex(repoDir, firstParty) {
 }
 
 async function cmdInstall(spec, repo, store) {
+  const get = repoFetcher(repo);
+  const index = JSON.parse((await get('index.json')).toString('utf8'));
+  if (index.version !== 1) {
+    throw new Error(`unsupported repository index version ${index.version}`);
+  }
+
+  // install --all: every package in the repository, latest versions —
+  // the one-command bootstrap for the examples that consume library/.
+  if (spec === '--all') {
+    const names = [...new Set((index.packages ?? []).map((p) => p.name))];
+    for (const name of names.sort()) {
+      await installOne(name, null, null, index, get, repo, store);
+    }
+    return;
+  }
+
   const at = spec.indexOf('@');
   const name = at === -1 ? spec : spec.slice(0, at);
   const pinText = at === -1 ? null : spec.slice(at + 1);
@@ -202,12 +227,10 @@ async function cmdInstall(spec, repo, store) {
       (pinText !== null && !pin)) {
     usage();
   }
+  await installOne(name, pin, pinText, index, get, repo, store);
+}
 
-  const get = repoFetcher(repo);
-  const index = JSON.parse((await get('index.json')).toString('utf8'));
-  if (index.version !== 1) {
-    throw new Error(`unsupported repository index version ${index.version}`);
-  }
+async function installOne(name, pin, pinText, index, get, repo, store) {
   // §20.1: bare names are reserved for the first-party library.
   if (!name.includes('.') && !index.firstParty) {
     console.warn(`warning: installing bare-named '${name}' from a ` +

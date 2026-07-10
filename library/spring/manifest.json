@@ -1,0 +1,6 @@
+{
+  "name": "spring",
+  "version": "1.0.0",
+  "description": "Springy follow: a WASM logic module (DESIGN.md §4.5) integrates damped spring physics toward the target — the position overshoots and settles instead of lerping.",
+  "license": "MIT"
+}

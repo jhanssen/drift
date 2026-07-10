@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "name": "Spring",
+  "description": "Damped spring chase: position accelerates toward target, overshoots, and settles. Stiffness is pull strength (snappier), damping bleeds velocity (higher = less wobble). The integrator is a WASM module; the clock is wired internally.",
+  "inputs": {
+    "target":    { "type": "vec2", "bind": "@brain.target" },
+    "stiffness": { "type": "scalar", "default": 90, "bind": "@brain.stiffness" },
+    "damping":   { "type": "scalar", "default": 6, "bind": "@brain.damping" }
+  },
+  "outputs": { "result": "@brain.position" },
+  "nodes": [
+    { "id": "brain", "type": "module",
+      "module": "modules/spring.wasm",
+      "interface": "modules/spring.json",
+      "inputs": { "tick": "@time.delta" } }
+  ]
+}
