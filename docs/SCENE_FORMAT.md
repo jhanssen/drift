@@ -726,12 +726,11 @@ accounts for but v1 does not implement:
 - The `module` node type (DESIGN.md §4.5): WASM logic as a graph node
   with JSON-declared typed ports — `buffer` outputs staged in module
   memory, uploaded and marked dirty only on a written flag (refining
-  §18.1's dirty-on-execute). **Implemented in the browser runtime
-  2026-07-10** (properties `module`, `interface`, optional `capacity`
-  in the §18.2 form; ports lexicographic; package paths may name
-  `modules/` content) — a normative section here is owed when the
-  native engine lands and the format stabilizes. Still reserved with
-  it: a declared `draw`/mesh node (vertex+fragment WGSL, geometry via
+  §18.1's dirty-on-execute). **Implemented on both targets 2026-07-10**
+  (properties `module`, `interface`, optional `capacity` in the §18.2
+  form; ports lexicographic; package paths may name `modules/` content;
+  natively Wasmtime, golden-tested) — a normative section here is owed
+  once the format stabilizes. Still reserved with it: a declared `draw`/mesh node (vertex+fragment WGSL, geometry via
   `buffer` ports), `dispatch` promoted from property to wireable port
   on `compute`, indirect dispatch, subgraph iteration for dynamic pass
   counts, and async GPU→CPU readback ports

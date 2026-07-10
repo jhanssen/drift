@@ -15,6 +15,7 @@
 
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/ModuleWasmtime.h"
 #include "platform/PackageStore.h"
 #include "platform/linux/ControlServer.h"
 #include "platform/linux/Gpu.h"
@@ -154,11 +155,9 @@ std::unique_ptr<drift::core::Scene> loadScene(
     }
 
     std::vector<std::string> errors, warnings;
-    // No native module engine yet (§4.5: Wasmtime pending); module scenes
-    // fail to load with a clear message.
-    auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
-                                          drift::core::ModuleLoader{}, device,
-                                          errors, warnings);
+    auto scene = drift::core::Scene::load(
+        sceneJson, readAsset, videoFactory,
+        drift::platform::wasmtimeModuleLoader(), device, errors, warnings);
     for (const auto& w : warnings) {
         fprintf(stderr, "drift: scene warning: %s\n", w.c_str());
     }

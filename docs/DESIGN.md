@@ -194,15 +194,21 @@ a polling module (weather, transit) does not defeat the idle story.
 
 ### 4.5 Modules and the GPU: Ports, Not Pipelines
 
-Design adopted 2026-07-10; **first implementation the same day** — the
-`module` node runs in the browser runtime and editor (per-node
-`WebAssembly.Instance`s, the interface JSON, the I/O block ABI, value/
-event/buffer outputs, `examples/spring.sceneproject` as the pure
-CPU-transform demo; unit tests drive the whole contract through a fake
-instance). Not yet implemented: the native Wasmtime embedding (module
-scenes fail native load with a clear message — goldens for module
-scenes wait on it), `wake_after_ms` (accepted, not yet honored), and
-the §4.4 storage/network capability imports.
+Design adopted 2026-07-10; **implemented the same day on both targets**
+— the `module` node runs in the browser runtime and editor (per-node
+`WebAssembly.Instance`s) and natively via the Wasmtime embedding
+(`platform/ModuleWasmtime`), with `examples/spring.sceneproject` as the
+pure CPU-transform demo, unit tests driving the whole contract through
+a fake instance, real-engine tests (convergence, watchdog trap,
+handshake failures), and a golden. The Pulley default holds: the pinned
+C-API artifact (v46.0.1) ships the Pulley feature — v36-line LTS
+artifacts do not — and the engine still probes `pulley64` with an empty
+module at startup, falling back to the Cranelift JIT with one stderr
+line if a Pulley-less build is ever substituted. Pulley and JIT produce
+bit-identical module output (NaN canonicalization + IEEE f32), so
+goldens hold across backends. Not yet implemented: `wake_after_ms`
+(accepted, not honored) and the §4.4 storage/network capability
+imports.
 **Everything that crosses the module boundary is data** — values,
 events, buffer contents — never a GPU handle. Modules do not create
 pipelines, encode passes, or submit work; a "GPU-using WASM effect" is
@@ -653,8 +659,8 @@ Deferred from implementation, but the scene format must account for them:
 
 - Compute nodes and GPU simulation
 - 3D meshes and mesh animation — added later as self-contained render-to-texture node types (geometry, camera, and animation internal to the node; output is an ordinary `texture` edge), requiring no scene-format changes
-- WASM logic modules — since implemented in the browser runtime and
-  editor (2026-07-10, §4.5); the native Wasmtime embedding remains open
+- WASM logic modules — since implemented on both targets (2026-07-10,
+  §4.5): browser runtime/editor and the native Wasmtime embedding
 - Browser runtime (WASM build) and browser-based editor
 - Editor↔runtime live-sync protocol
 - Node packages, `.wallpkg` packaging, and the distribution/repository system

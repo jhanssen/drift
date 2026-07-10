@@ -30,6 +30,8 @@ if(NOT EMSCRIPTEN)
     find_package(Dawn REQUIRED)
     find_package(PkgConfig REQUIRED)
     find_package(Threads REQUIRED)
+    # Wasmtime C API prebuilt (§4.5): the native WASM module engine.
+    add_subdirectory(3rdparty/wasmtime)
     pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
     pkg_check_modules(GBM REQUIRED gbm)
     pkg_check_modules(LIBDRM REQUIRED libdrm)
@@ -139,6 +141,7 @@ endif()
 set(WLGEN src/platform/linux/wayland-generated)
 add_executable(drift
     src/main.cpp
+    src/platform/ModuleWasmtime.cpp
     src/platform/linux/ControlServer.cpp
     src/platform/linux/Gpu.cpp
     src/platform/linux/WaylandApp.cpp
@@ -161,6 +164,7 @@ target_include_directories(drift PRIVATE
 )
 target_link_libraries(drift PRIVATE
     drift_core
+    wasmtime::wasmtime
     glaze::glaze
     ${WAYLAND_CLIENT_LIBRARIES}
     ${GBM_LIBRARIES}
@@ -192,10 +196,13 @@ if(BUILD_TESTING)
         tests/unit/package_store_test.cpp
         tests/unit/value_nodes_test.cpp
         tests/unit/module_test.cpp
+        tests/unit/module_native_test.cpp
+        src/platform/ModuleWasmtime.cpp
         src/platform/linux/WsCodec.cpp
     )
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest
-                                              glaze::glaze ktx)
+                                              glaze::glaze ktx
+                                              wasmtime::wasmtime)
     # mp4_demux_test parses committed fixtures instead of embedding bytes.
     target_compile_definitions(drift_tests
         PRIVATE DRIFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -247,4 +254,5 @@ if(BUILD_TESTING)
     drift_golden_test(sway)
     drift_golden_test(fit)
     drift_golden_test(effects)
+    drift_golden_test(spring)
 endif()
