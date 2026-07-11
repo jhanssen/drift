@@ -301,9 +301,9 @@ module at startup, falling back to the Cranelift JIT with one stderr
 line if a Pulley-less build is ever substituted. Pulley and JIT produce
 bit-identical module output (NaN canonicalization + IEEE f32), so
 goldens hold across backends. The §4.4 storage capability is
-implemented on both targets (2026-07-10). Not yet implemented:
-`wake_after_ms` (accepted, not honored) and the §4.4 network
-capability.
+implemented on both targets, `wake_after_ms` is honored, and the §4.4
+network capability (HTTP + WS) is implemented in the browser runtime
+(2026-07-10); the native curl backend is the one remaining §4.4 piece.
 **Everything that crosses the module boundary is data** — values,
 events, buffer contents — never a GPU handle. Modules do not create
 pipelines, encode passes, or submit work; a "GPU-using WASM effect" is

@@ -91,7 +91,7 @@ EM_JS(void, js_module_error, (const char* key, char* out, int cap), {
 // between the module's memory and the runtime heap, then call the
 // drift_storage_c_* shims.
 EM_JS(int, js_module_instantiate, (const char* key, int ioSize,
-                                   int storagePtr, char* errOut,
+                                   int storagePtr, int netPtr, char* errOut,
                                    int errCap), {
     const ent = (Module.driftModules || new Map()).get(UTF8ToString(key));
     const fail = (msg) => { stringToUTF8(String(msg), errOut, errCap); return 0; };
@@ -172,6 +172,60 @@ EM_JS(int, js_module_instantiate, (const char* key, int ioSize,
                 if (dh) _free(dh);
                 return r;
             },
+            // §4.4 network (core/Module.h ABI; -4 = invalid span).
+            drift_http_request: (uptr, ulen, bptr, blen, flags) => {
+                uptr >>>= 0; ulen >>>= 0; bptr >>>= 0; blen >>>= 0;
+                const m = guest();
+                if (uptr + ulen > m.length || bptr + blen > m.length) {
+                    return -4;
+                }
+                const uh = toHeap(m.subarray(uptr, uptr + ulen));
+                const bh = toHeap(m.subarray(bptr, bptr + blen));
+                const r = _drift_netm_request(netPtr, uh, ulen, bh, blen,
+                                              flags);
+                _free(bh);
+                _free(uh);
+                return r;
+            },
+            drift_ws_open: (uptr, ulen) => {
+                uptr >>>= 0; ulen >>>= 0;
+                const m = guest();
+                if (uptr + ulen > m.length) {
+                    return -4;
+                }
+                const uh = toHeap(m.subarray(uptr, uptr + ulen));
+                const r = _drift_netm_ws_open(netPtr, uh, ulen);
+                _free(uh);
+                return r;
+            },
+            drift_net_poll: (h, dptr, dcap) => {
+                dptr >>>= 0; dcap >>>= 0;
+                const m = guest();
+                if (dptr + dcap > m.length) {
+                    return -4;
+                }
+                const dh = dcap ? _malloc(dcap) : 0;
+                const r = _drift_netm_poll(netPtr, h, dh, dcap);
+                if (r > 0 && dcap) {
+                    const n = Math.min(r, dcap);
+                    guest().set(HEAPU8.subarray(dh, dh + n), dptr);
+                }
+                if (dh) _free(dh);
+                return r;
+            },
+            drift_net_send: (h, ptr, len, flags) => {
+                ptr >>>= 0; len >>>= 0;
+                const m = guest();
+                if (ptr + len > m.length) {
+                    return -4;
+                }
+                const ph = toHeap(m.subarray(ptr, ptr + len));
+                const r = _drift_netm_send(netPtr, h, ph, len, flags);
+                _free(ph);
+                return r;
+            },
+            drift_net_stat: (h, which) => _drift_netm_stat(netPtr, h, which),
+            drift_net_close: (h) => _drift_netm_close(netPtr, h),
         } });
     } catch (e) {
         return fail(e);
@@ -240,6 +294,120 @@ EM_JS(void, js_module_release, (int h), {
 
 EM_JS(void, js_module_set_ready, (), {
     Module.driftModuleReady = () => _drift_modules_ready();
+});
+
+// ---- §4.4 network backend: fetch + WebSocket ----
+// Same-thread by nature: ModuleNet's delivery surface is called from
+// completion callbacks on the main thread via the drift_net_c_* shims.
+// Cancellation marks the JS entry dead before returning, so a destroyed
+// ModuleNet can never be called back (the §4.4 cancel() contract).
+
+EM_JS(void, js_net_http, (void* net, int handle, const char* url,
+                          const uint8_t* body, int blen), {
+    const key = net + ':' + handle;
+    const reg = Module.driftNet || (Module.driftNet = new Map());
+    const ctrl = new AbortController();
+    reg.set(key, { abort: () => ctrl.abort(), cancelled: false });
+    const opts = { signal: ctrl.signal, method: 'GET' };
+    if (blen > 0) {
+        opts.method = 'POST';
+        opts.body = HEAPU8.slice(body, body + blen);
+    }
+    const cap = 8 << 20; // kModuleNetMaxResponse: abort mid-flight
+    const finish = (state, status, bytes) => {
+        const e = reg.get(key);
+        reg.delete(key);
+        if (!e || e.cancelled) return;
+        const n = bytes ? bytes.length : 0;
+        const p = n ? _malloc(n) : 0;
+        if (n) HEAPU8.set(bytes, p);
+        _drift_net_c_http(net, handle, state, status, p, n);
+        if (p) _free(p);
+    };
+    fetch(UTF8ToString(url), opts).then(async (res) => {
+        const chunks = [];
+        let total = 0;
+        if (res.body) {
+            const reader = res.body.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                total += value.length;
+                if (total > cap) {
+                    ctrl.abort();
+                    finish(2, res.status, null);
+                    return;
+                }
+                chunks.push(value);
+            }
+        }
+        const all = new Uint8Array(total);
+        let off = 0;
+        for (const c of chunks) {
+            all.set(c, off);
+            off += c.length;
+        }
+        finish(1, res.status, all);
+    }).catch(() => finish(2, 0, null));
+});
+
+EM_JS(void, js_net_ws_open, (void* net, int handle, const char* url), {
+    const key = net + ':' + handle;
+    const reg = Module.driftNet || (Module.driftNet = new Map());
+    let ws;
+    try {
+        ws = new WebSocket(UTF8ToString(url));
+    } catch (e) {
+        _drift_net_c_ws_state(net, handle, 2);
+        return;
+    }
+    ws.binaryType = 'arraybuffer';
+    const ent = { ws: ws, cancelled: false, terminal: false,
+                  abort: () => { try { ws.close(); } catch (e) {} } };
+    reg.set(key, ent);
+    const state = (s) => {
+        if (ent.cancelled || ent.terminal) return;
+        if (s !== 1) { // one terminal report: error beats the close after
+            ent.terminal = true;
+            reg.delete(key);
+        }
+        _drift_net_c_ws_state(net, handle, s);
+    };
+    ws.onopen = () => state(1);
+    ws.onerror = () => state(2);
+    ws.onclose = () => state(3);
+    ws.onmessage = (ev) => {
+        if (ent.cancelled) return;
+        const bytes = typeof ev.data === 'string'
+            ? new TextEncoder().encode(ev.data)
+            : new Uint8Array(ev.data);
+        const p = bytes.length ? _malloc(bytes.length) : 0;
+        if (bytes.length) HEAPU8.set(bytes, p);
+        _drift_net_c_ws_msg(net, handle, p, bytes.length);
+        if (p) _free(p);
+    };
+});
+
+EM_JS(void, js_net_ws_send, (void* net, int handle, const uint8_t* data,
+                             int len, int text), {
+    const e = (Module.driftNet || new Map()).get(net + ':' + handle);
+    if (!e || !e.ws || e.ws.readyState !== 1) return; // core gates anyway
+    const bytes = HEAPU8.slice(data, data + len);
+    try {
+        e.ws.send(text ? new TextDecoder().decode(bytes) : bytes);
+    } catch (err) { /* terminal state arrives via onclose/onerror */ }
+});
+
+EM_JS(void, js_net_cancel, (void* net, int handle), {
+    const reg = Module.driftNet;
+    if (!reg) return;
+    const e = reg.get(net + ':' + handle);
+    if (!e) return;
+    e.cancelled = true;
+    if (e.abort) {
+        try { e.abort(); } catch (err) {}
+    }
+    reg.delete(net + ':' + handle);
 });
 
 // ---- §4.4 module storage: IndexedDB-backed blob cache ----
@@ -349,6 +517,86 @@ EMSCRIPTEN_KEEPALIVE int drift_storage_c_keys(void* storage, uint8_t* d,
         ->keys(d, (uint32_t)dcap);
 }
 
+// §4.4 network delivery shims (fetch/WS completion callbacks -> core).
+EMSCRIPTEN_KEEPALIVE void drift_net_c_http(void* net, int handle, int state,
+                                           int status, const uint8_t* body,
+                                           int len)
+{
+    ((drift::core::ModuleNet*)net)
+        ->deliverHttp(handle, state, status,
+                      std::string((const char*)body, (size_t)len));
+}
+
+EMSCRIPTEN_KEEPALIVE void drift_net_c_ws_state(void* net, int handle,
+                                               int state)
+{
+    ((drift::core::ModuleNet*)net)->deliverWsState(handle, state);
+}
+
+EMSCRIPTEN_KEEPALIVE void drift_net_c_ws_msg(void* net, int handle,
+                                             const uint8_t* data, int len)
+{
+    ((drift::core::ModuleNet*)net)
+        ->deliverWsMessage(handle,
+                           std::string((const char*)data, (size_t)len));
+}
+
+// §4.4 network import shims (module trampolines -> core ModuleNet).
+EMSCRIPTEN_KEEPALIVE int drift_netm_request(void* net, const uint8_t* u,
+                                            int ul, const uint8_t* b, int bl,
+                                            int flags)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)
+        ->httpRequest(u, (uint32_t)ul, b, (uint32_t)bl, (uint32_t)flags);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_netm_ws_open(void* net, const uint8_t* u,
+                                            int ul)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)->wsOpen(u, (uint32_t)ul);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_netm_poll(void* net, int h, uint8_t* d,
+                                         int dcap)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)->poll(h, d, (uint32_t)dcap);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_netm_send(void* net, int h, const uint8_t* p,
+                                         int len, int flags)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)
+        ->send(h, p, (uint32_t)len, (uint32_t)flags);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_netm_stat(void* net, int h, int which)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)->stat(h, which);
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_netm_close(void* net, int h)
+{
+    if (!net) {
+        return drift::core::kModuleNetInvalid;
+    }
+    return ((drift::core::ModuleNet*)net)->close(h);
+}
+
 } // extern "C"
 
 namespace {
@@ -384,6 +632,34 @@ public:
 
 private:
     std::string mRoot;
+};
+
+// §4.4 network transport: everything single-threaded (fetch/WS callbacks
+// land on the main thread), so the backend methods just forward into the
+// JS bridge; the bridge's cancelled flags satisfy the cancel() contract.
+class WebNetBackend : public drift::core::ModuleNetBackend {
+public:
+    void httpRequest(drift::core::ModuleNet* net, int32_t handle,
+                     const std::string& url, std::string body) override
+    {
+        js_net_http(net, handle, url.c_str(), (const uint8_t*)body.data(),
+                    (int)body.size());
+    }
+    void wsOpen(drift::core::ModuleNet* net, int32_t handle,
+                const std::string& url) override
+    {
+        js_net_ws_open(net, handle, url.c_str());
+    }
+    void wsSend(drift::core::ModuleNet* net, int32_t handle,
+                std::string data, bool text) override
+    {
+        js_net_ws_send(net, handle, (const uint8_t*)data.data(),
+                       (int)data.size(), text ? 1 : 0);
+    }
+    void cancel(drift::core::ModuleNet* net, int32_t handle) override
+    {
+        js_net_cancel(net, handle);
+    }
 };
 
 class WebModuleInstance : public drift::core::ModuleInstance {
@@ -428,7 +704,6 @@ makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
                    drift::core::ModuleStorage* storage,
                    drift::core::ModuleNet* net, std::string& error)
 {
-    (void)net; // §4.4 network trampolines land with the browser backend
 
     // Content-hash key (FNV-1a 64): editor rewrites of a module file get a
     // fresh compile, unchanged files share the cached one.
@@ -454,7 +729,8 @@ makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
     }
     char err[512] = {};
     const int handle = js_module_instantiate(key, (int)ioSize,
-                                             (int)(uintptr_t)storage, err,
+                                             (int)(uintptr_t)storage,
+                                             (int)(uintptr_t)net, err,
                                              sizeof(err));
     if (!handle) {
         error = err;
@@ -548,10 +824,13 @@ std::unique_ptr<drift::core::Scene> loadScene(const std::string& root,
     // Package grants ride the store's .installed.json through readAsset;
     // no project-grant surface in the browser yet (the editor prompt is a
     // later slice) — ungranted capabilities warn and read as offline.
-    // Storage persists through the preloaded IndexedDB cache.
+    // Storage persists through the preloaded IndexedDB cache; network
+    // rides fetch/WebSocket (no requestFrame: the rAF loop already polls
+    // wakes).
+    static const auto netBackend = std::make_shared<WebNetBackend>();
     drift::core::ModulePlatform modules{
         makeModuleInstance, nullptr,
-        std::make_shared<IdbStoragePersistence>(root)
+        std::make_shared<IdbStoragePersistence>(root), netBackend, nullptr
     };
     auto scene = drift::core::Scene::load(sceneJson, readAsset, videoFactory,
                                           modules, device, errors, warnings);
