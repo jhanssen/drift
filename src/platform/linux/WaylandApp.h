@@ -90,6 +90,20 @@ public:
         mControlCb = std::move(cb);
     }
 
+    // §4.4 external wakes. fd (an eventfd, owned by the caller) becomes
+    // readable when a module delivery needs a frame — the ModuleNet wake
+    // callback writes it from the network thread; the loop drains it and
+    // redraws, and the scene graph decides what actually re-executes.
+    void setWakeFd(int fd) { mWakeFd = fd; }
+
+    // Earliest module timer deadline (wake_after_ms, in *scene time*) for
+    // an output's scene; negative = none. Consulted for the idle poll
+    // timeout, and to let the scene clock stride past the usual resume
+    // cap up to a due deadline — a deliberate timer sleep is elapsed
+    // scene time, unlike an occlusion pause (SCENE_FORMAT.md §9.7).
+    using WakeQuery = std::function<double(uint32_t outputId)>;
+    void setWakeQuery(WakeQuery query) { mWakeQuery = std::move(query); }
+
     // Requests a redraw on every surface (a parameter changed): the frame
     // evaluates the graph, which decides what actually re-executes (§11) —
     // for non-animated scenes this is the only wakeup a set would get.
@@ -168,6 +182,14 @@ public:
         double pointerX = 0.0, pointerY = 0.0; // surface-local
         double sceneTime = 0.0;
         double lastDrawTime = -1.0;
+        // §4.4 module timer: wall-clock instant the earliest
+        // wake_after_ms deadline is due, anchored once when the idle
+        // loop arms a sleep for it (so interleaved wakeups shrink the
+        // remaining wait instead of restarting it) and cleared by every
+        // draw. Negative = not armed. Only armed sleeps may stretch the
+        // scene clock past the §9.7 resume cap — an occlusion pause
+        // never arms, so it still resumes at +0.1s.
+        double wakeDueWall = -1.0;
     };
 
     void onGlobal(uint32_t name, const char* interface, uint32_t version);
@@ -243,6 +265,8 @@ private:
     OutputRemoved mOutputRemoved;
     int mControlFd = -1;
     std::function<void()> mControlCb;
+    int mWakeFd = -1;
+    WakeQuery mWakeQuery;
     double mStartTime = 0.0;
 };
 

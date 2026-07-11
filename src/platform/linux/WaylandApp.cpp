@@ -808,12 +808,25 @@ void WaylandApp::drawFrame(OutputSurface& surf)
 
     // Scene time advances by capped wall-clock deltas: across a pause
     // (occlusion, lock — no frames drawn) it stays put, so scenes resume
-    // where they left off (SCENE_FORMAT.md §9.7).
+    // where they left off (SCENE_FORMAT.md §9.7). Exception: while the
+    // run loop has a deliberate idle sleep armed toward a §4.4
+    // wake_after_ms deadline (wakeDueWall — never set for occluded,
+    // paused, or animated surfaces), the slept wall time is elapsed
+    // scene time and the clock may stride up to the deadline; otherwise
+    // a scene-time deadline could never come due on an idle wall.
     const double t = now();
     if (surf.lastDrawTime >= 0.0 && !mScenePaused) {
-        surf.sceneTime += std::min(t - surf.lastDrawTime, 0.1);
+        double cap = 0.1;
+        if (surf.wakeDueWall >= 0.0 && mWakeQuery) {
+            const double deadline = mWakeQuery(surf.id);
+            if (deadline > surf.sceneTime) {
+                cap = std::max(cap, deadline - surf.sceneTime + 0.017);
+            }
+        }
+        surf.sceneTime += std::min(t - surf.lastDrawTime, cap);
     }
     surf.lastDrawTime = t;
+    surf.wakeDueWall = -1.0; // deadlines re-derive after every draw
 
     FrameRequest request;
     request.outputId = surf.id;
@@ -893,9 +906,50 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
                 }
             }
         }
-        const int timeout = tick ? 16 : -1;
-        pollfd pfds[2] = { { fd, POLLIN, 0 }, { mControlFd, POLLIN, 0 } };
-        const nfds_t nfds = mControlFd >= 0 ? 2 : 1;
+        int timeout = tick ? 16 : -1;
+        // §4.4 module timers: a quiescent scene with a wake_after_ms
+        // deadline sleeps exactly until it is due (drawFrame then lets
+        // the clock stride to the deadline), instead of forever. The
+        // deadline lives in scene time, which is frozen while idle, so
+        // it is anchored in wall clock once per arming — unrelated poll
+        // wakeups (control traffic, pointer events) then shrink the
+        // remaining wait instead of restarting it. A paused clock can
+        // never reach a scene-time deadline, so paused surfaces do not
+        // arm (and do not wake the loop).
+        if (!tick && mWakeQuery) {
+            const double tnow = now();
+            for (const auto& surf : mSurfaces) {
+                if (!surf->configured || surf->framePending ||
+                    mScenePaused) {
+                    surf->wakeDueWall = -1.0;
+                    continue;
+                }
+                const double deadline = mWakeQuery(surf->id);
+                if (deadline < 0.0) {
+                    surf->wakeDueWall = -1.0;
+                    continue;
+                }
+                if (surf->wakeDueWall < 0.0) {
+                    surf->wakeDueWall =
+                        tnow + std::max(0.0, deadline - surf->sceneTime);
+                }
+                const double waitMs =
+                    std::max(0.0, surf->wakeDueWall - tnow) * 1000.0;
+                const int ms = (int)std::min(waitMs + 1.0, 86400000.0);
+                timeout = timeout < 0 ? ms : std::min(timeout, ms);
+            }
+        }
+        pollfd pfds[3] = { { fd, POLLIN, 0 } };
+        nfds_t nfds = 1;
+        nfds_t controlIdx = 0, wakeIdx = 0; // 0 = absent
+        if (mControlFd >= 0) {
+            controlIdx = nfds;
+            pfds[nfds++] = { mControlFd, POLLIN, 0 };
+        }
+        if (mWakeFd >= 0) {
+            wakeIdx = nfds;
+            pfds[nfds++] = { mWakeFd, POLLIN, 0 };
+        }
         const int ready = poll(pfds, nfds, timeout);
         if (ready > 0 && (pfds[0].revents & POLLIN)) {
             wl_display_read_events(mDisplay);
@@ -913,9 +967,18 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
                 }
             }
         }
-        if (ready > 0 && nfds == 2 && (pfds[1].revents & (POLLIN | POLLHUP)) &&
-            mControlCb) {
+        if (ready > 0 && controlIdx &&
+            (pfds[controlIdx].revents & (POLLIN | POLLHUP)) && mControlCb) {
             mControlCb();
+        }
+        if (ready > 0 && wakeIdx && (pfds[wakeIdx].revents & POLLIN)) {
+            uint64_t drained = 0;
+            if (read(mWakeFd, &drained, sizeof(drained)) > 0) {
+                // A module delivery is pending somewhere: redraw; the
+                // graph evaluates only the woken nodes (§11). Occluded
+                // surfaces keep the flag until frames resume.
+                requestRedrawAll();
+            }
         }
     }
     return 0;

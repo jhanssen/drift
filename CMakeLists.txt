@@ -38,6 +38,12 @@ if(NOT EMSCRIPTEN)
     pkg_check_modules(LIBDRM REQUIRED libdrm)
     pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
     pkg_check_modules(LIBVA REQUIRED libva libva-drm)
+    # §4.4 native network backend. 7.86 is the compile floor (the ws API
+    # and CURLOPT_PREREQFUNCTION exist); the *supported* WebSocket floor
+    # is 8.11, where ws ships enabled by default — on a curl built
+    # without ws, WS handles degrade to the offline face at runtime and
+    # HTTP still works, so configure does not refuse older systems.
+    pkg_check_modules(LIBCURL REQUIRED libcurl>=7.86)
 endif()
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
@@ -144,6 +150,7 @@ endif()
 set(WLGEN src/platform/linux/wayland-generated)
 add_executable(drift
     src/main.cpp
+    src/platform/ModuleNetCurl.cpp
     src/platform/ModuleWasmtime.cpp
     src/platform/linux/ControlServer.cpp
     src/platform/linux/Gpu.cpp
@@ -163,6 +170,7 @@ target_include_directories(drift PRIVATE
     ${LIBDRM_INCLUDE_DIRS}
     ${FFMPEG_INCLUDE_DIRS}
     ${LIBVA_INCLUDE_DIRS}
+    ${LIBCURL_INCLUDE_DIRS}
     3rdparty/stb
 )
 target_link_libraries(drift PRIVATE
@@ -174,6 +182,7 @@ target_link_libraries(drift PRIVATE
     ${LIBDRM_LIBRARIES}
     ${FFMPEG_LIBRARIES}
     ${LIBVA_LIBRARIES}
+    ${LIBCURL_LIBRARIES}
     Threads::Threads
     dl
 )
@@ -200,12 +209,17 @@ if(BUILD_TESTING)
         tests/unit/value_nodes_test.cpp
         tests/unit/module_test.cpp
         tests/unit/module_native_test.cpp
+        tests/unit/module_net_curl_test.cpp
+        src/platform/ModuleNetCurl.cpp
         src/platform/ModuleWasmtime.cpp
         src/platform/linux/WsCodec.cpp
     )
+    target_include_directories(drift_tests PRIVATE ${LIBCURL_INCLUDE_DIRS})
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest
                                               glaze::glaze ktx
-                                              wasmtime::wasmtime)
+                                              wasmtime::wasmtime
+                                              ${LIBCURL_LIBRARIES}
+                                              Threads::Threads)
     # mp4_demux_test parses committed fixtures instead of embedding bytes.
     target_compile_definitions(drift_tests
         PRIVATE DRIFT_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

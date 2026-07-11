@@ -325,10 +325,14 @@ public:
     void deliverWsMessage(int32_t handle, std::string message);
     void setWakeCallback(std::function<void()> cb);
 
+    // Policy check, also for backends: manual redirect hops (§4.4 —
+    // "every hop re-checks the allowlist") ask the same question issue
+    // time did. Reads only immutable members; callable from any thread.
+    bool originAllowed(const std::string& url, bool ws) const;
+
 private:
     struct Handle;
     Handle* find(int32_t handle);
-    bool originAllowed(const std::string& url, bool ws) const;
     void wake();
 
     mutable std::mutex mMutex;

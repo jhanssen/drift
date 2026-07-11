@@ -13,8 +13,12 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/ModuleNetCurl.h"
 #include "platform/ModuleStorageFiles.h"
 #include "platform/ModuleWasmtime.h"
 #include "platform/PackageStore.h"
@@ -97,6 +101,14 @@ bool parseParamOverride(const char* arg, ParamOverride& out)
 // empty start); set at the top of runHeadless.
 static bool gHeadless = false;
 
+// §4.4 network transport, wayland runs only — headless/golden stays
+// offline (null backend: the offline face). One curl-multi thread for
+// the whole process; scene ModuleNets co-own it via shared_ptr.
+static std::shared_ptr<drift::core::ModuleNetBackend> gNetBackend;
+// Thread-safe "a module wake is pending" signal: writes the run loop's
+// eventfd. Deliveries fire it from the network thread.
+static std::function<void()> gRequestFrame;
+
 // Loads a .sceneproject directory (or a scene.json path) with project-root
 // confinement for asset reads.
 //
@@ -175,7 +187,8 @@ std::unique_ptr<drift::core::Scene> loadScene(
 
     std::vector<std::string> errors, warnings;
     drift::core::ModulePlatform modules{
-        drift::platform::wasmtimeModuleLoader(), projectGrants, nullptr
+        drift::platform::wasmtimeModuleLoader(), projectGrants, nullptr,
+        gNetBackend, gRequestFrame
     };
     // §4.4 storage persistence — except headless/golden runs, whose
     // stores stay in-memory for a deterministic empty start every run.
@@ -344,14 +357,37 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
         return 1;
     }
 
+    // §4.4 network wakes. The eventfd outlives the scenes (declared
+    // first): ModuleNet deliveries may fire gRequestFrame from the
+    // network thread until the last scene's teardown cancels them.
+    struct WakeFd {
+        int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        ~WakeFd()
+        {
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    } wakeFd;
+    gNetBackend = drift::platform::createCurlNetBackend();
+    gRequestFrame = [fd = wakeFd.fd] {
+        if (fd >= 0) {
+            const uint64_t one = 1;
+            (void)!write(fd, &one, sizeof(one));
+        }
+    };
+
     // Declared before app: ~WaylandApp tears down surfaces, which fires the
     // output-removed callback into this map, so it must still be alive then.
+    // firstScene likewise — the wake-query callback captures both.
     std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
+    std::unique_ptr<drift::core::Scene> firstScene;
 
     drift::platform::WaylandApp app;
     if (!app.setup(gpu, mode, width, height)) {
         return 1;
     }
+    app.setWakeFd(wakeFd.fd);
 
     // Outputs can differ in size, so each gets its own scene instance (with
     // its own graph state and clock); the first one reuses this validation
@@ -362,7 +398,6 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     // document as the visible outputs.
     std::string currentSceneJson;
 
-    std::unique_ptr<drift::core::Scene> firstScene;
     drift::core::Renderer placeholder;
     if (!scenePath.empty()) {
         firstScene = loadScene(scenePath, gpu.device(), overrides,
@@ -378,6 +413,15 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     const wgpu::Device device = gpu.device();
     const wgpu::TextureFormat format = app.targetFormat();
     const bool animated = !firstScene || firstScene->animated();
+
+    // §4.4 module timers: the run loop asks each output's scene for its
+    // earliest wake_after_ms deadline to size its idle sleep.
+    app.setWakeQuery([&scenes, &firstScene](uint32_t outputId) -> double {
+        auto it = scenes.find(outputId);
+        drift::core::Scene* scene =
+            it != scenes.end() ? it->second.get() : firstScene.get();
+        return scene ? scene->nextWake() : -1.0;
+    });
 
     app.setOutputRemoved([&scenes](uint32_t outputId) {
         scenes.erase(outputId);

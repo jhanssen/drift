@@ -217,8 +217,9 @@ matching native — decide before freezing the ABI (§13.1). Storage
 shared across scenes by package identity is deliberately absent (it is
 a tracking channel); opt-in sharing is reserved if a real need appears.
 
-**Network (design finalized 2026-07-10): HTTP and WebSockets, one
-handle space, never on the frame path.** `update()` is a synchronous
+**Network (design finalized 2026-07-10, implemented on both targets
+the same day): HTTP and WebSockets, one handle space, never on the
+frame path.** `update()` is a synchronous
 buffer exchange, so all network I/O is asynchronous and handle-based;
 `update()` only exchanges bookkeeping with queues that the platform's
 network machinery services (natively one lazily-started curl-multi
@@ -258,6 +259,24 @@ network exposure is an enqueue on issue and bounded memcpys on read.
   clamp the minimum and later stretch under §13.3 power policy. Wake
   vocabulary: input dirtied, parameter changed, first evaluation, timer
   due, HTTP completed, WS message/lifecycle.
+- *Native backend* (platform/ModuleNetCurl): one lazily-started
+  curl-multi thread; libcurl from the system via pkg-config (8.11+,
+  the WebSocket floor — a curl built without `ws` degrades WS handles
+  to the offline face). Redirects are followed manually (301/302/303
+  rewrite to GET, 307/308 keep the body, five-hop budget), each hop
+  re-asking `ModuleNet::originAllowed`. The post-DNS address check
+  rides `CURLOPT_PREREQFUNCTION`, exempting loopback only when the URL
+  host is itself the localhost carve-out. WS handshakes run through
+  the multi as `CONNECT_ONLY=2` transfers and the easy *stays in the
+  multi afterwards* (removal detaches the connection from
+  `curl_ws_recv/send`); the thread polls established sockets via
+  `curl_multi_poll` extra fds. Wakes reach the idle wall through an
+  eventfd in the Wayland poll set. One scheduling decision worth
+  recording: on an otherwise-idle wall the run loop sizes its sleep by
+  the scene's earliest `wake_after_ms` deadline and lets the scene
+  clock stride past the §9.7 resume cap up to that deadline — a
+  deliberate timer sleep is elapsed scene time, unlike an occlusion
+  pause, or a deadline stated in scene time could never come due.
 - *Enforcement* (per-call, against the granted record): origins from
   the allowlist only — `https://` and `wss://` (plain http/ws for
   localhost dev); private/link-local ranges blocked with the check
@@ -302,8 +321,9 @@ line if a Pulley-less build is ever substituted. Pulley and JIT produce
 bit-identical module output (NaN canonicalization + IEEE f32), so
 goldens hold across backends. The §4.4 storage capability is
 implemented on both targets, `wake_after_ms` is honored, and the §4.4
-network capability (HTTP + WS) is implemented in the browser runtime
-(2026-07-10); the native curl backend is the one remaining §4.4 piece.
+network capability (HTTP + WS) is implemented on both targets
+(2026-07-10): fetch + WebSocket in the browser, the curl-multi thread
+natively — §4.4 is complete.
 **Everything that crosses the module boundary is data** — values,
 events, buffer contents — never a GPU handle. Modules do not create
 pipelines, encode passes, or submit work; a "GPU-using WASM effect" is
@@ -781,7 +801,7 @@ To be nailed down on paper before runtime implementation begins:
 - Presentation: bypass Dawn's swapchain — render into self-allocated dmabuf textures imported into Dawn, committed to the layer surface via `linux-dmabuf` (prior art: [overdraw](https://github.com/jhanssen/overdraw)); the same dmabuf import path serves zero-copy video decode later
 - Dev modes, first-class from the start: `--windowed` (xdg-toplevel, develop without replacing the wallpaper) and `--headless` (offscreen render, dump frames as PNG — doubles as the golden-image test harness)
 - Toolchain: C++23, CMake + Ninja, single-threaded core (one decode thread per video node); Dawn via tarball download; glaze (JSON), ffmpeg/VAAPI (video), stb_image + libktx (images), raw wayland-client with scanner-generated protocols
-- Dependency policy: system-coupled C libraries (ffmpeg, libva, wayland-client, gbm, libdrm) come from the system via pkg-config — never vendored (ffmpeg is LGPL; dynamic system linking keeps the Apache-2.0 project clean); portable C++ dependencies (glaze, libktx) via CMake FetchContent pinned to exact release tags, each wrapped in a `3rdparty/<name>/CMakeLists.txt`; Dawn is the one prebuilt tarball; trivial single-headers (stb) vendored in `3rdparty/`
+- Dependency policy: system-coupled C libraries (ffmpeg, libva, wayland-client, gbm, libdrm, libcurl) come from the system via pkg-config — never vendored (ffmpeg is LGPL; dynamic system linking keeps the Apache-2.0 project clean); portable C++ dependencies (glaze, libktx) via CMake FetchContent pinned to exact release tags, each wrapped in a `3rdparty/<name>/CMakeLists.txt`; Dawn is the one prebuilt tarball; trivial single-headers (stb) vendored in `3rdparty/`
 
 ### 13.3 Explicitly Deferred (post-v1)
 
