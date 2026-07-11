@@ -80,7 +80,7 @@ enum ModuleHeaderField : uint32_t {
     kModuleHdrFlags = 12,      // u32, bit 0 = first update after (re)load
     kModuleHdrEventsIn = 16,   // u32 bitmask over declared input events
     kModuleHdrEventsOut = 20,  // u32, module sets; host reads and clears
-    kModuleHdrWakeAfterMs = 24, // u32, 0 = none (reserved; not yet honored)
+    kModuleHdrWakeAfterMs = 24, // u32, 0 = none; re-stated per update (§4.4)
     kModuleHdrReserved = 28,
 };
 

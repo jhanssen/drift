@@ -181,6 +181,19 @@ void httpHandler(int c)
         respond("200 OK", "hello from drift");
     } else if (path == "/echo") {
         respond("200 OK", body);
+    } else if (path == "/reqheaders") {
+        // Reflects the request headers the §4.4 parity rule cares about:
+        // a module POST must arrive header-bare on both targets.
+        const auto header = [&req](const std::string& name) {
+            const size_t at = req.find("\r\n" + name + ": ");
+            if (at == std::string::npos) {
+                return std::string("-");
+            }
+            const size_t begin = at + name.size() + 4;
+            return req.substr(begin, req.find("\r\n", begin) - begin);
+        };
+        respond("200 OK",
+                "ct=" + header("Content-Type") + " exp=" + header("Expect"));
     } else if (path == "/missing") {
         respond("404 Not Found", "nope");
     } else if (path == "/redir") {
@@ -346,6 +359,23 @@ TEST_CASE("curl backend: HTTP whole-response — GET, POST, status (§4.4)")
     const int32_t en = net.poll(p, (uint8_t*)ebuf, sizeof(ebuf));
     CHECK(std::string(ebuf, (size_t)en) == body);
     net.close(p);
+
+    // Browser header parity: fetch with a byte body sends no
+    // Content-Type, so the native backend must suppress curl's
+    // form-urlencoded default — and its Expect: 100-continue, which
+    // curl only adds past ~1 KiB (hence the big body).
+    const std::string hurl = origin + "/reqheaders";
+    const std::string big(2048, 'b');
+    const int32_t hp =
+        net.httpRequest((const uint8_t*)hurl.data(), (uint32_t)hurl.size(),
+                        (const uint8_t*)big.data(), (uint32_t)big.size(), 0);
+    REQUIRE(hp > 0);
+    REQUIRE(waitFor([&] { return settled(net, hp); }));
+    CHECK(net.stat(hp, 0) == kModuleNetStateReady);
+    char hbuf[64] = {};
+    const int32_t hn = net.poll(hp, (uint8_t*)hbuf, sizeof(hbuf));
+    CHECK(std::string(hbuf, (size_t)hn) == "ct=- exp=-");
+    net.close(hp);
 
     // Non-2xx is still a delivered response, like fetch.
     const int32_t m = httpGet(net, origin + "/missing");

@@ -242,6 +242,7 @@ private:
         bool allowLoopback = false;
         // http
         std::string body; // request body; empty = GET
+        curl_slist* headers = nullptr;
         std::string response;
         int redirects = 0;
         bool overflow = false;
@@ -390,6 +391,15 @@ private:
             curl_easy_setopt(e, CURLOPT_POSTFIELDS, t->body.data());
             curl_easy_setopt(e, CURLOPT_POSTFIELDSIZE_LARGE,
                              (curl_off_t)t->body.size());
+            // Header parity with the browser: fetch sends a bare binary
+            // body — no Content-Type, no Expect — so suppress curl's
+            // defaults (form-urlencoded, 100-continue) rather than show
+            // a server two different requests for the same module POST.
+            if (!t->headers) {
+                t->headers = curl_slist_append(nullptr, "Content-Type:");
+                t->headers = curl_slist_append(t->headers, "Expect:");
+            }
+            curl_easy_setopt(e, CURLOPT_HTTPHEADER, t->headers);
         }
         t->easy = e;
         t->inMulti = true;
@@ -439,6 +449,9 @@ private:
                 curl_multi_remove_handle(mMulti, t->easy);
             }
             curl_easy_cleanup(t->easy);
+        }
+        if (t->headers) {
+            curl_slist_free_all(t->headers);
         }
         mTransfers.erase(t->key);
     }

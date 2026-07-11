@@ -262,7 +262,11 @@ network exposure is an enqueue on issue and bounded memcpys on read.
 - *Native backend* (platform/ModuleNetCurl): one lazily-started
   curl-multi thread; libcurl from the system via pkg-config (8.11+,
   the WebSocket floor — a curl built without `ws` degrades WS handles
-  to the offline face). Redirects are followed manually (301/302/303
+  to the offline face). POST bodies go header-bare — curl's default
+  `Content-Type: application/x-www-form-urlencoded` and `Expect:
+  100-continue` are suppressed, because the browser's fetch sends a
+  bare byte body and both targets must show a server the same request.
+  Redirects are followed manually (301/302/303
   rewrite to GET, 307/308 keep the body, five-hop budget), each hop
   re-asking `ModuleNet::originAllowed`. The post-DNS address check
   rides `CURLOPT_PREREQFUNCTION`, exempting loopback only when the URL
