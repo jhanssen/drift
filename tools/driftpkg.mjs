@@ -38,13 +38,14 @@ function usage() {
 
 // --- §4.4 permissions: derive from interface JSONs, prompt, record ------
 
-// Mirrors core/Module.cpp's origin grammar: https://host[:port], plain
-// http only for localhost/127.0.0.1/[::1]. No path, no wildcard.
+// Mirrors core/Module.cpp's origin grammar: https:// or wss:// host
+// [:port]; plain http/ws only for localhost/127.0.0.1/[::1]. No path,
+// no wildcard.
 function validOrigin(origin) {
   const m = origin.match(
-      /^(https?):\/\/(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?$/);
+      /^(https?|wss?):\/\/(\[[0-9a-f:.]+\]|[a-z0-9.-]+)(:[0-9]{1,5})?$/);
   if (!m) return false;
-  if (m[1] === 'http' &&
+  if ((m[1] === 'http' || m[1] === 'ws') &&
       !['localhost', '127.0.0.1', '[::1]'].includes(m[2])) {
     return false;
   }

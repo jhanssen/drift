@@ -217,18 +217,63 @@ matching native — decide before freezing the ABI (§13.1). Storage
 shared across scenes by package identity is deliberately absent (it is
 a tracking channel); opt-in sharing is reserved if a real need appears.
 
-**HTTP: fetch-shaped, asynchronous, handle-based.** `update()` is a
-synchronous buffer exchange and browser fetch cannot block, so a module
-issues a request descriptor, receives a handle, and observes completion
-in a later `update()`. Native enforcement to match the browser
-envelope: origins from the manifest allowlist only; HTTPS-only (plain
-`http://localhost` permitted only in `--windowed`/dev modes);
-private/link-local address ranges blocked, with the check applied
-*post-DNS-resolution* (DNS-rebinding defense); redirects confined to
-the allowlist; response-size and request-rate caps. CORS applies in the
-browser build and cannot be waived, so the browser is the compatibility
-floor: modules must target CORS-permissive endpoints, or they will work
-natively and silently fail in the web editor.
+**Network (design finalized 2026-07-10): HTTP and WebSockets, one
+handle space, never on the frame path.** `update()` is a synchronous
+buffer exchange, so all network I/O is asynchronous and handle-based;
+`update()` only exchanges bookkeeping with queues that the platform's
+network machinery services (natively one lazily-started curl-multi
+thread — the video-decoder-thread precedent; in the browser, fetch and
+WebSocket already are off-main-thread network). The frame path's total
+network exposure is an enqueue on issue and bounded memcpys on read.
+
+- *HTTP is whole-response.* The platform buffers the complete
+  (size-capped) body off-thread while the graph stays idle; the owning
+  node is woken once, on completion, and reads via probe-then-copy in
+  that single update. No streaming consumption — if a genuine need
+  appears it arrives as a WS-like queued-chunk shape, reserved.
+- *WebSockets are message-granular and bidirectional.* curl (8.11+)
+  provides the native client — the same dependency as HTTP. Complete
+  messages enter a bounded per-connection inbound queue
+  (**drop-oldest** + an overflow flag: a wallpaper wants the latest
+  data, and an occluded scene must not balloon); each arrival wakes the
+  owning node (coalesced per frame). Lifecycle transitions
+  (open/closed/error) wake it too — the open wake is where a module
+  sends its subscribe/hello. Sends are valid only while open, are
+  non-blocking enqueues to a bounded rate-capped outbound queue, and
+  the host owns reconnect/backoff policy. One browser nuance, recorded:
+  WebSockets have **no CORS** (Origin is advisory), so unlike HTTP the
+  browser envelope is not stricter here — the manifest allowlist is the
+  real control on both targets. Raw TCP/UDP are permanently excluded
+  (no browser parity, SSRF surface); SSE, if ever wanted, falls out of
+  HTTP streaming later.
+- *Scheduling: waiting is free.* Handles are host-side objects owned by
+  the issuing node, so completions target exactly one node via the
+  **external-wake flag** — a new evaluation trigger beside
+  inputs-dirty/params/first-evaluate (§11). Between issue and
+  completion the graph fully quiesces (zero frames on an otherwise
+  static wall). The same flag serves `wake_after_ms`, now honored:
+  "run me again in at most N ms", re-stated per update — one field, no
+  timer lifecycle, deadlines recomputed by the module from header time
+  (wakes mean "check what's due", never "the timer fired"), host may
+  clamp the minimum and later stretch under §13.3 power policy. Wake
+  vocabulary: input dirtied, parameter changed, first evaluation, timer
+  due, HTTP completed, WS message/lifecycle.
+- *Enforcement* (per-call, against the granted record): origins from
+  the allowlist only — `https://` and `wss://` (plain http/ws for
+  localhost dev); private/link-local ranges blocked with the check
+  applied *post-DNS-resolution* (DNS-rebinding defense; curl
+  `PREREQFUNCTION`); redirects followed manually so every hop re-checks
+  the allowlist; response-size, message-size, queue-depth, and
+  request/send-rate caps. The response cap (8 MiB) is enforced
+  **mid-flight** — backends abort the transfer as the byte count passes
+  it (curl write-callback error / fetch AbortController), never
+  download-then-discard — with a core backstop failing any oversized
+  delivery regardless; a per-package *declared* download size is the
+  reserved shape if larger assets are ever needed. CORS applies to
+  HTTP in the browser and
+  cannot be waived, so the browser remains HTTP's compatibility floor:
+  modules must target CORS-permissive endpoints or they work natively
+  and silently fail in the web editor.
 
 **Determinism.** Deterministic modules underpin golden tests and scrub
 preview (SCENE_FORMAT.md §16.1). Capabilities are injected effects: in

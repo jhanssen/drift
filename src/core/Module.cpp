@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <deque>
 
 #include <glaze/glaze.hpp>
 
@@ -130,8 +131,13 @@ bool ModulePermissions::validOrigin(const std::string& origin)
     bool localOnly = false;
     if (origin.starts_with("https://")) {
         rest = origin.substr(8);
+    } else if (origin.starts_with("wss://")) {
+        rest = origin.substr(6);
     } else if (origin.starts_with("http://")) {
         rest = origin.substr(7);
+        localOnly = true;
+    } else if (origin.starts_with("ws://")) {
+        rest = origin.substr(5);
         localOnly = true;
     } else {
         return false;
@@ -366,6 +372,321 @@ void ModuleStorage::deserialize(const std::string& blob)
         mUsed += bytes;
         mEntries[std::move(k)] = std::move(v);
     }
+}
+
+// ---- ModuleNet (§4.4) ----
+
+struct ModuleNet::Handle {
+    bool ws = false;
+    int32_t state = kModuleNetStateConnecting;
+    int32_t httpStatus = 0;
+    std::string body;                 // http: complete response
+    std::deque<std::string> queue;    // ws: whole inbound messages
+    uint64_t queueBytes = 0;
+    int32_t dropped = 0;              // ws: drop-oldest count since stat()
+    bool cancelled = false;           // close() ran; ignore late deliveries
+};
+
+ModuleNet::ModuleNet(std::vector<std::string> declaredOrigins,
+                     std::vector<std::string> grantedOrigins,
+                     std::shared_ptr<ModuleNetBackend> backend)
+    : mDeclared(std::move(declaredOrigins)),
+      mGranted(std::move(grantedOrigins)), mBackend(std::move(backend))
+{
+}
+
+ModuleNet::~ModuleNet()
+{
+    if (!mBackend) {
+        return;
+    }
+    // cancel() guarantees no further deliveries per handle, so after this
+    // loop the backend holds no reference to us.
+    for (auto& [id, handle] : mHandles) {
+        mBackend->cancel(this, id);
+    }
+}
+
+ModuleNet::Handle* ModuleNet::find(int32_t handle)
+{
+    auto it = mHandles.find(handle);
+    return it == mHandles.end() ? nullptr : it->second.get();
+}
+
+// Extracts scheme://authority and requires an exact allowlist match in
+// BOTH the declared and granted sets (§4.4 least privilege): modules
+// declare what they dial, byte for byte.
+bool ModuleNet::originAllowed(const std::string& url, bool ws) const
+{
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos) {
+        return false;
+    }
+    const std::string proto = url.substr(0, scheme);
+    if (ws ? (proto != "ws" && proto != "wss")
+           : (proto != "http" && proto != "https")) {
+        return false;
+    }
+    const size_t slash = url.find('/', scheme + 3);
+    const std::string origin =
+        slash == std::string::npos ? url : url.substr(0, slash);
+    if (!ModulePermissions::validOrigin(origin)) {
+        return false; // also rejects non-localhost plain http/ws
+    }
+    return std::binary_search(mDeclared.begin(), mDeclared.end(), origin) &&
+           std::binary_search(mGranted.begin(), mGranted.end(), origin);
+}
+
+void ModuleNet::beginUpdate(double now)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (now > mLastRefill) {
+        mTokens = std::min(kModuleNetTokensBurst,
+                           mTokens +
+                               (now - mLastRefill) * kModuleNetTokensPerSecond);
+    }
+    mLastRefill = now;
+    mWake = false; // consumed by this evaluation
+}
+
+bool ModuleNet::wakePending() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mWake;
+}
+
+void ModuleNet::setWakeCallback(std::function<void()> cb)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mWakeCb = std::move(cb);
+}
+
+void ModuleNet::wake()
+{
+    // mMutex held. The callback must be cheap and thread-safe (native:
+    // write an eventfd; browser: nothing — rAF already polls).
+    mWake = true;
+    if (mWakeCb) {
+        mWakeCb();
+    }
+}
+
+int32_t ModuleNet::httpRequest(const uint8_t* url, uint32_t ulen,
+                               const uint8_t* body, uint32_t blen,
+                               uint32_t flags)
+{
+    if (!url || ulen == 0 || ulen > kModuleNetMaxUrl || flags != 0) {
+        return kModuleNetInvalid;
+    }
+    const std::string u((const char*)url, ulen);
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (mHandles.size() >= kModuleNetMaxHandles) {
+        return kModuleNetAgain;
+    }
+    if (mTokens < 1.0) {
+        return kModuleNetAgain;
+    }
+    mTokens -= 1.0;
+    const int32_t id = mNextHandle++;
+    auto handle = std::make_unique<Handle>();
+    // Policy failures and a missing backend fail like an unplugged
+    // cable (§4.4): the handle exists and reports the offline face.
+    if (!originAllowed(u, /*ws=*/false) || !mBackend) {
+        handle->state = kModuleNetStateFailed;
+        mHandles[id] = std::move(handle);
+        return id;
+    }
+    mHandles[id] = std::move(handle);
+    mBackend->httpRequest(this, id, u,
+                          std::string((const char*)body, body ? blen : 0));
+    return id;
+}
+
+int32_t ModuleNet::wsOpen(const uint8_t* url, uint32_t ulen)
+{
+    if (!url || ulen == 0 || ulen > kModuleNetMaxUrl) {
+        return kModuleNetInvalid;
+    }
+    const std::string u((const char*)url, ulen);
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (mHandles.size() >= kModuleNetMaxHandles) {
+        return kModuleNetAgain;
+    }
+    if (mTokens < 1.0) {
+        return kModuleNetAgain;
+    }
+    mTokens -= 1.0;
+    const int32_t id = mNextHandle++;
+    auto handle = std::make_unique<Handle>();
+    handle->ws = true;
+    if (!originAllowed(u, /*ws=*/true) || !mBackend) {
+        handle->state = kModuleNetStateFailed;
+        mHandles[id] = std::move(handle);
+        return id;
+    }
+    mHandles[id] = std::move(handle);
+    mBackend->wsOpen(this, id, u);
+    return id;
+}
+
+int32_t ModuleNet::poll(int32_t handle, uint8_t* dst, uint32_t dcap)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h) {
+        return kModuleNetInvalid;
+    }
+    if (h->ws) {
+        if (h->queue.empty()) {
+            return h->state == kModuleNetStateFailed ? kModuleNetFailed
+                   : h->state == kModuleNetStateClosed ? kModuleNetClosed
+                                                       : kModuleNetPending;
+        }
+        const std::string& front = h->queue.front();
+        const int32_t size = (int32_t)front.size();
+        if (dcap == 0) {
+            return size; // probe, not popped
+        }
+        if (dcap < (uint32_t)size) {
+            return kModuleNetInvalid; // no partial messages
+        }
+        std::memcpy(dst, front.data(), front.size());
+        h->queueBytes -= front.size();
+        h->queue.pop_front();
+        return size;
+    }
+    switch (h->state) {
+    case kModuleNetStateConnecting: return kModuleNetPending;
+    case kModuleNetStateFailed: return kModuleNetFailed;
+    case kModuleNetStateClosed: return kModuleNetClosed;
+    default: break;
+    }
+    const int32_t size = (int32_t)h->body.size();
+    if (dst && dcap) {
+        std::memcpy(dst, h->body.data(),
+                    std::min<size_t>(h->body.size(), dcap));
+    }
+    return size; // re-readable until close
+}
+
+int32_t ModuleNet::send(int32_t handle, const uint8_t* data, uint32_t len,
+                        uint32_t flags)
+{
+    if (len > kModuleNetMaxMessage || (flags & ~1u)) {
+        return kModuleNetInvalid;
+    }
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h) {
+        return kModuleNetInvalid;
+    }
+    if (!h->ws) {
+        return kModuleNetInvalid;
+    }
+    if (h->state != kModuleNetStateReady) {
+        return h->state == kModuleNetStateConnecting ? kModuleNetPending
+                                                     : kModuleNetClosed;
+    }
+    if (mTokens < 1.0) {
+        return kModuleNetAgain;
+    }
+    mTokens -= 1.0;
+    mBackend->wsSend(this, handle,
+                     std::string((const char*)data, data ? len : 0),
+                     (flags & 1) != 0);
+    return 0;
+}
+
+int32_t ModuleNet::stat(int32_t handle, int32_t which)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h) {
+        return kModuleNetInvalid;
+    }
+    switch (which) {
+    case 0: return h->state;
+    case 1: return h->ws ? kModuleNetInvalid : h->httpStatus;
+    case 2: {
+        if (!h->ws) {
+            return kModuleNetInvalid;
+        }
+        const int32_t dropped = h->dropped;
+        h->dropped = 0;
+        return dropped;
+    }
+    default: return kModuleNetInvalid;
+    }
+}
+
+int32_t ModuleNet::close(int32_t handle)
+{
+    std::unique_ptr<Handle> gone;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto it = mHandles.find(handle);
+        if (it == mHandles.end()) {
+            return 0; // idempotent
+        }
+        it->second->cancelled = true;
+        gone = std::move(it->second);
+        mHandles.erase(it);
+    }
+    if (mBackend) {
+        mBackend->cancel(this, handle); // no deliveries after this
+    }
+    return 0;
+}
+
+void ModuleNet::deliverHttp(int32_t handle, int32_t state, int32_t status,
+                            std::string body)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h || h->ws || h->cancelled ||
+        h->state != kModuleNetStateConnecting) {
+        return;
+    }
+    if (body.size() > kModuleNetMaxResponse) {
+        state = kModuleNetStateFailed; // cap enforced even on late bodies
+        body.clear();
+    }
+    h->state = state;
+    h->httpStatus = status;
+    h->body = std::move(body);
+    wake();
+}
+
+void ModuleNet::deliverWsState(int32_t handle, int32_t state)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h || !h->ws || h->cancelled) {
+        return;
+    }
+    h->state = state;
+    wake();
+}
+
+void ModuleNet::deliverWsMessage(int32_t handle, std::string message)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    Handle* h = find(handle);
+    if (!h || !h->ws || h->cancelled ||
+        message.size() > kModuleNetMaxMessage) {
+        return;
+    }
+    h->queueBytes += message.size();
+    h->queue.push_back(std::move(message));
+    // Drop-oldest (§4.4): a wallpaper wants the latest data, and an
+    // occluded scene must not balloon.
+    while (h->queue.size() > kModuleNetQueueMessages ||
+           h->queueBytes > kModuleNetQueueBytes) {
+        h->queueBytes -= h->queue.front().size();
+        h->queue.pop_front();
+        ++h->dropped;
+    }
+    wake();
 }
 
 bool parseGrantRecord(const std::string& json, ModulePermissions& out)

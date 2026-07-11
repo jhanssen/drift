@@ -255,7 +255,8 @@ TEST_CASE("module permissions: request grammar (§4.4)")
 
     CHECK(ModulePermissions::validOrigin("https://[2001:db8::1]:8443"));
     CHECK(!ModulePermissions::validOrigin("https://"));
-    CHECK(!ModulePermissions::validOrigin("wss://api.example.com"));
+    CHECK(ModulePermissions::validOrigin("wss://api.example.com"));
+    CHECK(!ModulePermissions::validOrigin("ftp://api.example.com"));
     CHECK(!ModulePermissions::validOrigin("https://api.example.com:"));
 
     // Coverage: the record is the policy; excess requests are the
@@ -537,7 +538,7 @@ LoadResult loadScene(const std::string& nodesJson, bool withLoader = true,
     platform.projectGrants = projectGrants;
     if (withLoader) {
         platform.load = [&r](const std::string&, uint32_t ioSize,
-                             ModuleStorage*,
+                             ModuleStorage*, ModuleNet*,
                              std::string&) -> std::unique_ptr<ModuleInstance> {
             auto fake = std::make_unique<FakeModule>(ioSize);
             r.modules.push_back(fake.get());
@@ -723,4 +724,172 @@ TEST_CASE("module grants: package grants ride .installed.json (§4.4)")
     r = loadScene(nodes, true, granted);
     REQUIRE(r.scene != nullptr);
     CHECK(r.warnings.empty());
+}
+
+TEST_CASE("module net: policy, offline face, mailboxes, queues (§4.4)")
+{
+    struct FakeBackend : ModuleNetBackend {
+        std::vector<std::pair<int32_t, std::string>> http, ws, sent;
+        void httpRequest(ModuleNet*, int32_t h, const std::string& u,
+                         std::string) override
+        {
+            http.push_back({ h, u });
+        }
+        void wsOpen(ModuleNet*, int32_t h, const std::string& u) override
+        {
+            ws.push_back({ h, u });
+        }
+        void wsSend(ModuleNet*, int32_t h, std::string d, bool) override
+        {
+            sent.push_back({ h, std::move(d) });
+        }
+        void cancel(ModuleNet*, int32_t) override {}
+    };
+    auto backend = std::make_shared<FakeBackend>();
+    const auto U = [](const char* s) { return (const uint8_t*)s; };
+
+    ModuleNet net({ "https://api.example.com", "wss://feed.example.com" },
+                  { "https://api.example.com", "wss://feed.example.com" },
+                  backend);
+    net.beginUpdate(0.0);
+
+    // Undeclared origin: the handle exists and reports the offline face —
+    // indistinguishable from an unplugged cable; nothing reaches the wire.
+    int32_t h = net.httpRequest(U("https://evil.example.com/x"), 26,
+                                nullptr, 0, 0);
+    CHECK(h > 0);
+    CHECK(net.stat(h, 0) == kModuleNetStateFailed);
+    CHECK(net.poll(h, nullptr, 0) == kModuleNetFailed);
+    CHECK(backend->http.empty());
+
+    // Allowed origin (path allowed in the URL, origin matched exactly).
+    h = net.httpRequest(U("https://api.example.com/v1?q=1"), 30, nullptr,
+                        0, 0);
+    REQUIRE(backend->http.size() == 1);
+    CHECK(backend->http[0].second == "https://api.example.com/v1?q=1");
+    CHECK(net.poll(h, nullptr, 0) == kModuleNetPending);
+    CHECK(!net.wakePending());
+    net.deliverHttp(h, kModuleNetStateReady, 200, "hello");
+    CHECK(net.wakePending());
+    CHECK(net.stat(h, 1) == 200);
+    uint8_t buf[16];
+    REQUIRE(net.poll(h, buf, sizeof(buf)) == 5);
+    CHECK(std::memcmp(buf, "hello", 5) == 0);
+    CHECK(net.poll(h, buf, sizeof(buf)) == 5); // re-readable until close
+    net.close(h);
+    CHECK(net.poll(h, nullptr, 0) == kModuleNetInvalid);
+
+    // WS lifecycle: send gated on open; messages pop on full copy only;
+    // the bounded queue drops oldest and reports via self-clearing stat.
+    const int32_t w = net.wsOpen(U("wss://feed.example.com/live"), 27);
+    REQUIRE(backend->ws.size() == 1);
+    CHECK(net.stat(w, 0) == kModuleNetStateConnecting);
+    CHECK(net.send(w, U("x"), 1, 1) == kModuleNetPending);
+    net.deliverWsState(w, kModuleNetStateReady);
+    CHECK(net.send(w, U("sub"), 3, 1) == 0);
+    REQUIRE(backend->sent.size() == 1);
+    net.deliverWsMessage(w, "m1");
+    net.deliverWsMessage(w, "m2");
+    CHECK(net.poll(w, nullptr, 0) == 2);             // probe, not popped
+    CHECK(net.poll(w, buf, 1) == kModuleNetInvalid); // no partial messages
+    CHECK(net.poll(w, buf, sizeof(buf)) == 2);       // pops m1
+    CHECK(net.poll(w, buf, sizeof(buf)) == 2);       // pops m2
+    CHECK(net.poll(w, buf, sizeof(buf)) == kModuleNetPending);
+    for (size_t i = 0; i < kModuleNetQueueMessages + 5; ++i) {
+        net.deliverWsMessage(w, "x");
+    }
+    CHECK(net.stat(w, 2) == 5); // dropped-oldest count
+    CHECK(net.stat(w, 2) == 0); // self-clearing
+    net.deliverWsState(w, kModuleNetStateClosed);
+    CHECK(net.send(w, U("y"), 1, 1) == kModuleNetClosed);
+
+    // Token bucket: the burst runs out, then Again until scene time
+    // refills it.
+    int issued = 0;
+    while (net.httpRequest(U("https://api.example.com/t"), 25, nullptr, 0,
+                           0) > 0) {
+        ++issued;
+        REQUIRE(issued < 32);
+    }
+    CHECK(issued > 0);
+    net.beginUpdate(100.0); // refill
+    CHECK(net.httpRequest(U("https://api.example.com/t"), 25, nullptr, 0,
+                          0) > 0);
+
+    // Null backend: the headless/golden/offline configuration.
+    ModuleNet offline({ "https://api.example.com" },
+                      { "https://api.example.com" }, nullptr);
+    offline.beginUpdate(0.0);
+    h = offline.httpRequest(U("https://api.example.com/x"), 25, nullptr, 0,
+                            0);
+    CHECK(h > 0);
+    CHECK(offline.stat(h, 0) == kModuleNetStateFailed);
+
+    // Declared but not granted: offline face too (§4.4 soft-deny).
+    ModuleNet ungranted({ "https://api.example.com" }, {}, backend);
+    ungranted.beginUpdate(0.0);
+    h = ungranted.httpRequest(U("https://api.example.com/x"), 25, nullptr,
+                              0, 0);
+    CHECK(ungranted.stat(h, 0) == kModuleNetStateFailed);
+}
+
+TEST_CASE("module node: external wakes — deliveries and wake_after_ms "
+          "(§4.4)")
+{
+    ModuleInterface iface = parseIface(R"({
+        "abi": 1,
+        "permissions": {
+            "network": { "origins": ["https://api.example.com"] } },
+        "outputs": { "n": { "type": "scalar" } } })");
+    auto fake = std::make_unique<FakeModule>(iface.ioSize);
+    FakeModule* fp = fake.get();
+    struct NullBackend : ModuleNetBackend {
+        void httpRequest(ModuleNet*, int32_t, const std::string&,
+                         std::string) override {}
+        void wsOpen(ModuleNet*, int32_t, const std::string&) override {}
+        void wsSend(ModuleNet*, int32_t, std::string, bool) override {}
+        void cancel(ModuleNet*, int32_t) override {}
+    };
+    auto net = std::make_unique<ModuleNet>(
+        iface.permissions.networkOrigins, iface.permissions.networkOrigins,
+        std::make_shared<NullBackend>());
+    ModuleNet* np = net.get();
+
+    ModuleNode node(std::move(fake), iface, {}, nullptr, std::move(net));
+    FrameContext ctx{};
+    ctx.seconds = 0.0;
+    CHECK(!node.wakePending(0.0)); // pre-first-run: firstEvaluate drives
+    node.evaluate(ctx);
+    node.firstEvaluate = false;
+    CHECK(fp->updates == 1);
+    CHECK(!node.wakePending(10.0)); // idle: no deliveries, no timer
+
+    // A delivery wakes exactly this node; evaluation consumes the wake.
+    np->beginUpdate(0.0);
+    const int32_t h = np->httpRequest(
+        (const uint8_t*)"https://api.example.com/x", 25, nullptr, 0, 0);
+    (void)h;
+    np->deliverHttp(h, kModuleNetStateFailed, 0, {});
+    CHECK(node.wakePending(0.0));
+    ctx.seconds = 1.0;
+    node.evaluate(ctx);
+    CHECK(fp->updates == 2);
+    CHECK(!node.wakePending(1.0));
+
+    // wake_after_ms: re-stated per update; due -> wakePending; a later
+    // update writing 0 clears it.
+    fp->onUpdate = [&](std::vector<uint8_t>& m) {
+        const uint32_t ms = 500;
+        std::memcpy(m.data() + kModuleHdrWakeAfterMs, &ms, 4);
+    };
+    ctx.seconds = 2.0;
+    node.evaluate(ctx);
+    CHECK(node.nextWake() == doctest::Approx(2.5));
+    CHECK(!node.wakePending(2.4));
+    CHECK(node.wakePending(2.6));
+    fp->onUpdate = nullptr; // writes nothing; host cleared the field
+    ctx.seconds = 2.6;
+    node.evaluate(ctx);
+    CHECK(node.nextWake() < 0.0);
+    CHECK(!node.wakePending(100.0));
 }

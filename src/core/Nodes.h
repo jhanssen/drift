@@ -537,17 +537,24 @@ public:
     // destroyed last.
     ModuleNode(std::unique_ptr<ModuleInstance> instance,
                ModuleInterface iface, ModulePermissions granted = {},
-               std::unique_ptr<ModuleStorage> storage = nullptr);
+               std::unique_ptr<ModuleStorage> storage = nullptr,
+               std::unique_ptr<ModuleNet> net = nullptr);
     void evaluate(FrameContext& ctx) override;
+    // §4.4 external wakes: network deliveries and wake_after_ms.
+    bool wakePending(double now) const override;
+    double nextWake() const override { return mWakeDeadline; }
 
     const ModuleInterface& interface() const { return mIface; }
     const ModulePermissions& granted() const { return mGranted; }
+    ModuleNet* net() const { return mNet.get(); }
 
 private:
     std::unique_ptr<ModuleStorage> mStorage; // before mInstance: see ctor
+    std::unique_ptr<ModuleNet> mNet;         // likewise
     std::unique_ptr<ModuleInstance> mInstance;
     const ModuleInterface mIface;
     const ModulePermissions mGranted;
+    double mWakeDeadline = -1.0; // wake_after_ms: scene time it is due
     std::vector<uint8_t> mScratch;      // io exchange staging (host heap)
     std::vector<wgpu::Buffer> mBuffers; // one per buffer output, iface order
     double mLastSeconds = 0.0;

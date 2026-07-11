@@ -3713,9 +3713,11 @@ void TrailsNode::evaluate(FrameContext& ctx)
 
 ModuleNode::ModuleNode(std::unique_ptr<ModuleInstance> instance,
                        ModuleInterface iface, ModulePermissions granted,
-                       std::unique_ptr<ModuleStorage> storage)
-    : mStorage(std::move(storage)), mInstance(std::move(instance)),
-      mIface(std::move(iface)), mGranted(std::move(granted))
+                       std::unique_ptr<ModuleStorage> storage,
+                       std::unique_ptr<ModuleNet> net)
+    : mStorage(std::move(storage)), mNet(std::move(net)),
+      mInstance(std::move(instance)), mIface(std::move(iface)),
+      mGranted(std::move(granted))
 {
     // Outputs are named and typed at construction (like compute), so load
     // time can resolve references and validate buffer strides before the
@@ -3733,10 +3735,24 @@ ModuleNode::ModuleNode(std::unique_ptr<ModuleInstance> instance,
     }
 }
 
+bool ModuleNode::wakePending(double now) const
+{
+    if (mDead) {
+        return false;
+    }
+    if (mNet && mNet->wakePending()) {
+        return true;
+    }
+    return mWakeDeadline >= 0.0 && now >= mWakeDeadline;
+}
+
 void ModuleNode::evaluate(FrameContext& ctx)
 {
     if (mDead) {
         return;
+    }
+    if (mNet) {
+        mNet->beginUpdate(ctx.seconds); // token refill + wake consumed
     }
     const auto die = [this](const std::string& why) {
         mDead = true;
@@ -3810,6 +3826,14 @@ void ModuleNode::evaluate(FrameContext& ctx)
     if (mStorage) {
         mStorage->maybeFlush(ctx.seconds); // §4.4 debounced write-behind
     }
+    // wake_after_ms (§4.4/§4.5): "run me again in at most N ms",
+    // re-stated on every update — 0 clears any previous request. The
+    // floor is clamped: anything hotter than a frame should be an
+    // honest tick wire.
+    uint32_t wakeMs = 0;
+    mInstance->readIo(kModuleHdrWakeAfterMs, &wakeMs, 4);
+    mWakeDeadline =
+        wakeMs ? ctx.seconds + std::max(wakeMs, 16u) / 1000.0 : -1.0;
 
     // Value outputs: change-detected like any value node. Event outputs:
     // fired iff the module set their bit this update.

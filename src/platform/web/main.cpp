@@ -425,8 +425,11 @@ std::string gRetryJson; // the failed attempt's document; "" = read bundle
 
 std::unique_ptr<drift::core::ModuleInstance>
 makeModuleInstance(const std::string& wasmBytes, uint32_t ioSize,
-                   drift::core::ModuleStorage* storage, std::string& error)
+                   drift::core::ModuleStorage* storage,
+                   drift::core::ModuleNet* net, std::string& error)
 {
+    (void)net; // §4.4 network trampolines land with the browser backend
+
     // Content-hash key (FNV-1a 64): editor rewrites of a module file get a
     // fresh compile, unchanged files share the cached one.
     uint64_t hash = 1469598103934665603ull;

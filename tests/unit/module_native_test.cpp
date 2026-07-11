@@ -70,7 +70,7 @@ TEST_CASE("wasmtime: the example spring module runs natively (§4.5)")
     auto loader = drift::platform::wasmtimeModuleLoader();
     auto instance =
         loader(readFile(base + "modules/spring.wasm"), iface.ioSize,
-               nullptr, err);
+               nullptr, nullptr, err);
     REQUIRE_MESSAGE(instance != nullptr, err);
 
     // Drive the real wasm through the real node. Inputs sorted:
@@ -115,7 +115,7 @@ TEST_CASE("wasmtime: the watchdog traps a runaway update (§4.5)")
 
     auto loader = drift::platform::wasmtimeModuleLoader();
     std::string err;
-    auto instance = loader(wasm, 64, nullptr, err);
+    auto instance = loader(wasm, 64, nullptr, nullptr, err);
     REQUIRE_MESSAGE(instance != nullptr, err);
 
     const auto start = std::chrono::steady_clock::now();
@@ -175,7 +175,7 @@ TEST_CASE("wasmtime: storage imports — counter survives reinstantiation "
     {
         auto storage = std::make_unique<ModuleStorage>(4096);
         storage->attach(backend, "counter");
-        auto instance = loader(wasm, iface.ioSize, storage.get(), err);
+        auto instance = loader(wasm, iface.ioSize, storage.get(), nullptr, err);
         REQUIRE_MESSAGE(instance != nullptr, err);
         ModuleNode node(std::move(instance), iface, {}, std::move(storage));
         FrameContext ctx{};
@@ -191,7 +191,7 @@ TEST_CASE("wasmtime: storage imports — counter survives reinstantiation "
     // write-behind persisted through the real import path.
     auto storage = std::make_unique<ModuleStorage>(4096);
     storage->attach(backend, "counter");
-    auto instance = loader(wasm, iface.ioSize, storage.get(), err);
+    auto instance = loader(wasm, iface.ioSize, storage.get(), nullptr, err);
     REQUIRE_MESSAGE(instance != nullptr, err);
     ModuleNode node(std::move(instance), iface, {}, std::move(storage));
     FrameContext ctx{};
@@ -200,7 +200,7 @@ TEST_CASE("wasmtime: storage imports — counter survives reinstantiation "
 
     // Ungranted (null storage): the import answers denied, the module
     // still runs — its counter just restarts every instantiation.
-    auto deniedInstance = loader(wasm, iface.ioSize, nullptr, err);
+    auto deniedInstance = loader(wasm, iface.ioSize, nullptr, nullptr, err);
     REQUIRE_MESSAGE(deniedInstance != nullptr, err);
     ModuleNode deniedNode(std::move(deniedInstance), iface);
     deniedNode.evaluate(ctx);
@@ -218,12 +218,12 @@ TEST_CASE("wasmtime: handshake failures are load errors (§4.5)")
         (func (export "drift_abi") (result i32) i32.const 99)
         (func (export "drift_init") (param i32) (result i32) i32.const 1024)
         (func (export "drift_update"))))"),
-                 64, nullptr, err) == nullptr);
+                 64, nullptr, nullptr, err) == nullptr);
     CHECK(err.find("ABI") != std::string::npos);
 
     // Missing exports.
     CHECK(loader(wat2wasm("(module)"),
-                 64, nullptr, err) == nullptr);
+                 64, nullptr, nullptr, err) == nullptr);
     CHECK(err.find("does not export") != std::string::npos);
 
     // An io block that does not fit the module's memory.
@@ -232,10 +232,10 @@ TEST_CASE("wasmtime: handshake failures are load errors (§4.5)")
         (func (export "drift_abi") (result i32) i32.const 1)
         (func (export "drift_init") (param i32) (result i32) i32.const 0)
         (func (export "drift_update"))))"),
-                 64, nullptr, err) == nullptr);
+                 64, nullptr, nullptr, err) == nullptr);
     CHECK(err.find("bad io block") != std::string::npos);
 
     // Not wasm at all.
-    CHECK(loader("garbage", 64, nullptr, err) == nullptr);
+    CHECK(loader("garbage", 64, nullptr, nullptr, err) == nullptr);
     CHECK(!err.empty());
 }

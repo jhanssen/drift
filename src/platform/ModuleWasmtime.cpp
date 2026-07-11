@@ -174,10 +174,118 @@ wasm_trap_t* storageKeys(void* env, wasmtime_caller_t* caller,
     return nullptr;
 }
 
+// §4.4 network imports. env = the node's ModuleNet (null when the
+// module declared no network: calls answer invalid). Spans validated
+// like storage.
+using drift::core::kModuleNetInvalid;
+
+wasm_trap_t* netHttpRequest(void* env, wasmtime_caller_t* caller,
+                            const wasmtime_val_t* args, size_t,
+                            wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
+    const uint64_t uptr = (uint32_t)args[0].of.i32;
+    const uint64_t ulen = (uint32_t)args[1].of.i32;
+    const uint64_t bptr = (uint32_t)args[2].of.i32;
+    const uint64_t blen = (uint32_t)args[3].of.i32;
+    if (!data || uptr + ulen > size || bptr + blen > size) {
+        results[0].of.i32 = kModuleNetInvalid;
+    } else if (!net) {
+        results[0].of.i32 = kModuleNetInvalid;
+    } else {
+        results[0].of.i32 =
+            net->httpRequest(data + uptr, (uint32_t)ulen, data + bptr,
+                             (uint32_t)blen, (uint32_t)args[4].of.i32);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* netWsOpen(void* env, wasmtime_caller_t* caller,
+                       const wasmtime_val_t* args, size_t,
+                       wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
+    const uint64_t uptr = (uint32_t)args[0].of.i32;
+    const uint64_t ulen = (uint32_t)args[1].of.i32;
+    if (!data || uptr + ulen > size || !net) {
+        results[0].of.i32 = kModuleNetInvalid;
+    } else {
+        results[0].of.i32 = net->wsOpen(data + uptr, (uint32_t)ulen);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* netPoll(void* env, wasmtime_caller_t* caller,
+                     const wasmtime_val_t* args, size_t,
+                     wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    size_t size = 0;
+    uint8_t* data = callerMemory(caller, size);
+    const uint64_t dptr = (uint32_t)args[1].of.i32;
+    const uint64_t dcap = (uint32_t)args[2].of.i32;
+    if (!data || dptr + dcap > size || !net) {
+        results[0].of.i32 = kModuleNetInvalid;
+    } else {
+        results[0].of.i32 = net->poll(args[0].of.i32,
+                                      dcap ? data + dptr : nullptr,
+                                      (uint32_t)dcap);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* netSend(void* env, wasmtime_caller_t* caller,
+                     const wasmtime_val_t* args, size_t,
+                     wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    size_t size = 0;
+    const uint8_t* data = callerMemory(caller, size);
+    const uint64_t ptr = (uint32_t)args[1].of.i32;
+    const uint64_t len = (uint32_t)args[2].of.i32;
+    if (!data || ptr + len > size || !net) {
+        results[0].of.i32 = kModuleNetInvalid;
+    } else {
+        results[0].of.i32 = net->send(args[0].of.i32, data + ptr,
+                                      (uint32_t)len,
+                                      (uint32_t)args[3].of.i32);
+    }
+    return nullptr;
+}
+
+wasm_trap_t* netStat(void* env, wasmtime_caller_t*,
+                     const wasmtime_val_t* args, size_t,
+                     wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    results[0].of.i32 =
+        net ? net->stat(args[0].of.i32, args[1].of.i32) : kModuleNetInvalid;
+    return nullptr;
+}
+
+wasm_trap_t* netClose(void* env, wasmtime_caller_t*,
+                      const wasmtime_val_t* args, size_t,
+                      wasmtime_val_t* results, size_t)
+{
+    results[0].kind = WASMTIME_I32;
+    auto* net = (drift::core::ModuleNet*)env;
+    results[0].of.i32 = net ? net->close(args[0].of.i32) : kModuleNetInvalid;
+    return nullptr;
+}
+
 // i32^n -> i32 function type (the wasm.h helpers stop at 3 params).
 wasm_functype_t* i32FuncType(size_t nparams)
 {
-    wasm_valtype_t* ps[4];
+    wasm_valtype_t* ps[5];
     for (size_t i = 0; i < nparams; ++i) {
         ps[i] = wasm_valtype_new_i32();
     }
@@ -300,7 +408,8 @@ public:
     // Takes ownership of store on success only; use create().
     static std::unique_ptr<ModuleInstance>
     create(wasmtime_module_t* module, uint32_t ioSize,
-           drift::core::ModuleStorage* storage, std::string& error)
+           drift::core::ModuleStorage* storage, drift::core::ModuleNet* net,
+           std::string& error)
     {
         auto self = std::unique_ptr<WasmtimeModuleInstance>(
             new WasmtimeModuleInstance());
@@ -312,13 +421,13 @@ public:
         wasmtime_error_t* err = nullptr;
         const auto defineFunc = [&](const char* name, size_t nameLen,
                                     size_t nparams,
-                                    wasmtime_func_callback_t cb) {
+                                    wasmtime_func_callback_t cb, void* env) {
             if (err) {
                 return;
             }
             wasm_functype_t* type = i32FuncType(nparams);
             err = wasmtime_linker_define_func(linker, "env", 3, name,
-                                              nameLen, type, cb, storage,
+                                              nameLen, type, cb, env,
                                               nullptr);
             wasm_functype_delete(type);
         };
@@ -330,10 +439,16 @@ public:
                                               nullptr);
             wasm_functype_delete(logType);
         }
-        defineFunc("drift_storage_get", 17, 4, storageGet);
-        defineFunc("drift_storage_put", 17, 4, storagePut);
-        defineFunc("drift_storage_delete", 20, 2, storageDelete);
-        defineFunc("drift_storage_keys", 18, 2, storageKeys);
+        defineFunc("drift_storage_get", 17, 4, storageGet, storage);
+        defineFunc("drift_storage_put", 17, 4, storagePut, storage);
+        defineFunc("drift_storage_delete", 20, 2, storageDelete, storage);
+        defineFunc("drift_storage_keys", 18, 2, storageKeys, storage);
+        defineFunc("drift_http_request", 18, 5, netHttpRequest, net);
+        defineFunc("drift_ws_open", 13, 2, netWsOpen, net);
+        defineFunc("drift_net_poll", 14, 3, netPoll, net);
+        defineFunc("drift_net_send", 14, 4, netSend, net);
+        defineFunc("drift_net_stat", 14, 2, netStat, net);
+        defineFunc("drift_net_close", 15, 1, netClose, net);
         if (err) {
             error = messageOf(err);
             wasmtime_linker_delete(linker);
@@ -484,12 +599,13 @@ drift::core::ModuleLoader wasmtimeModuleLoader()
 {
     return [](const std::string& wasmBytes, uint32_t ioSize,
               drift::core::ModuleStorage* storage,
+              drift::core::ModuleNet* net,
               std::string& error) -> std::unique_ptr<ModuleInstance> {
         wasmtime_module_t* module = runtime().moduleFor(wasmBytes, error);
         if (!module) {
             return nullptr;
         }
-        return WasmtimeModuleInstance::create(module, ioSize, storage,
+        return WasmtimeModuleInstance::create(module, ioSize, storage, net,
                                               error);
     };
 }

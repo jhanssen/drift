@@ -2239,8 +2239,20 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             }
         }
 
-        auto instance =
-            mModules.load(wasmBytes, iface.ioSize, storage.get(), err);
+        // §4.4 network: origins dialable iff declared AND granted; a
+        // null backend (headless/golden) serves the offline face.
+        std::unique_ptr<ModuleNet> net;
+        if (!iface.permissions.networkOrigins.empty()) {
+            net = std::make_unique<ModuleNet>(
+                iface.permissions.networkOrigins, granted.networkOrigins,
+                mModules.net);
+            if (mModules.requestFrame) {
+                net->setWakeCallback(mModules.requestFrame);
+            }
+        }
+
+        auto instance = mModules.load(wasmBytes, iface.ioSize, storage.get(),
+                                      net.get(), err);
         if (!instance) {
             fail("node '" + raw.id + "': " + wasmPath + ": " + err);
             return nullptr;
@@ -2257,7 +2269,8 @@ Node* Loader::makeNode(const RawNode& raw, std::vector<PortDef>& portsOut)
             portsOut.push_back(std::move(def));
         }
         return new ModuleNode(std::move(instance), std::move(iface),
-                              std::move(granted), std::move(storage));
+                              std::move(granted), std::move(storage),
+                              std::move(net));
     }
 
     if (raw.type == "image") {

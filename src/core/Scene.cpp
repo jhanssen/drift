@@ -220,13 +220,36 @@ bool Scene::render(FrameContext& ctx)
 
     for (auto& node : mNodes) {
         if (node->alwaysEvaluate() || node->firstEvaluate ||
-            node->paramsChanged || node->inputsDirty()) {
+            node->paramsChanged || node->wakePending(ctx.seconds) ||
+            node->inputsDirty()) {
             node->evaluate(ctx);
             node->firstEvaluate = false;
             node->paramsChanged = false;
         }
     }
     return ctx.presented;
+}
+
+bool Scene::wakesPending(double now) const
+{
+    for (const auto& node : mNodes) {
+        if (node->wakePending(now)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+double Scene::nextWake() const
+{
+    double next = -1.0;
+    for (const auto& node : mNodes) {
+        const double t = node->nextWake();
+        if (t >= 0.0 && (next < 0.0 || t < next)) {
+            next = t;
+        }
+    }
+    return next;
 }
 
 } // namespace drift::core

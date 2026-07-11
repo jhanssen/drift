@@ -73,6 +73,19 @@ public:
     // True for nodes whose output advances with scene time (time, video):
     // scenes containing one need frames even without external events.
     virtual bool drivesFrames() const { return false; }
+    // External wake (§4.4): the node asked to run at `now` without any
+    // input dirtying — a module's wake_after_ms deadline is due, or its
+    // network capability delivered a completion/message/lifecycle event.
+    // The platform must schedule a frame when one is pending (the wake
+    // callback natively; the rAF loop in the browser).
+    virtual bool wakePending(double now) const
+    {
+        (void)now;
+        return false;
+    }
+    // Earliest future wake_after_ms deadline, or a negative value: what a
+    // platform arms its idle timer with.
+    virtual double nextWake() const { return -1.0; }
 
     Value inputValue(size_t index) const;
     bool inputsDirty() const;
@@ -144,6 +157,12 @@ public:
     {
         return mSequences;
     }
+
+    // §4.4 scheduling queries for the platform's idle loop: does any
+    // node hold an undelivered external wake, and what is the earliest
+    // future timer deadline (negative = none)?
+    bool wakesPending(double now) const;
+    double nextWake() const;
 
     // Manually fires an event output on the next frame (the editor's
     // "fire now" verb, §16.1). Returns false for an unknown node/port or a
