@@ -298,6 +298,14 @@ network exposure is an enqueue on issue and bounded memcpys on read.
   modules must target CORS-permissive endpoints or they work natively
   and silently fail in the web editor.
 
+Both backends are tested end to end: the native one by loopback
+servers under the real curl-multi thread (tests/unit/module_net_curl),
+the browser one by headless Chrome driven over CDP (tests/web) — a
+probe module that reports everything it observes back through the
+network, so the loopback servers' transcript is the assertion and the
+genuine browser envelope (CORS refusal, header-bare POSTs, the
+ungranted offline face) is what's exercised.
+
 **Determinism.** Deterministic modules underpin golden tests and scrub
 preview (SCENE_FORMAT.md §16.1). Capabilities are injected effects: in
 headless/golden/scrub modes the host denies them with a defined error

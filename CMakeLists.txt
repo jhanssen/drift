@@ -272,4 +272,13 @@ if(BUILD_TESTING)
     drift_golden_test(fit)
     drift_golden_test(effects)
     drift_golden_test(spring)
+
+    # §4.4 browser network backend: the wasm bundle in headless Chrome
+    # via CDP against loopback servers (tests/web/net_test.mjs). Exits
+    # 77 — reported as skipped, not failed — when Chrome or the web
+    # bundle (build-web/, or $DRIFT_WEB_BUNDLE) is absent, so the
+    # native-only workflow needs neither.
+    add_test(NAME web_net COMMAND
+        node ${CMAKE_SOURCE_DIR}/tests/web/net_test.mjs)
+    set_tests_properties(web_net PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
