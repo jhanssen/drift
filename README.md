@@ -12,7 +12,8 @@ opaque), video
 transform, compositor, wave, remap, combine, split, the implicit
 time/mouse inputs, and previous-frame feedback edges (`"previous": true`)
 for trails and iterative effects. Wallpaper mode covers every output with
-runtime hotplug; the dirty-driven graph skips GPU work and commits when
+runtime hotplug (`--output` restricts to named outputs, or assigns each
+output its own scene); the dirty-driven graph skips GPU work and commits when
 nothing changed (a static scene idles at zero GPU cost, and scene time
 freezes while occluded); presentation uses sync-fd fences, not CPU waits.
 Video decodes in hardware where available (`DRIFT_HWDEC=auto|vaapi|cuda|off`),
@@ -43,6 +44,9 @@ ninja -C build
 
 ```
 build/drift examples/plasma.sceneproject              # wallpaper (layer-shell)
+build/drift examples/plasma.sceneproject --output DP-1        # only that output
+build/drift --output DP-1=examples/plasma.sceneproject \
+            --output HDMI-A-1=examples/fireworks.sceneproject # scene per output
 build/drift examples/plasma.sceneproject --windowed   # dev window
 build/drift examples/plasma.sceneproject --headless 60 --out /tmp/frames
 ```

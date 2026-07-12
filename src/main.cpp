@@ -63,6 +63,13 @@ void usage(const char* argv0)
             "                     comma-separated components); repeatable\n"
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
+            "      --output NAMES wallpaper: only claim the named outputs\n"
+            "                     (comma-separated connector names, e.g. DP-1;\n"
+            "                     repeatable; default: every output)\n"
+            "      --output NAME=SCENE\n"
+            "                     wallpaper: run SCENE on output NAME\n"
+            "                     (repeatable; replaces the scene argument;\n"
+            "                     unlisted outputs are left unclaimed)\n"
             "      --out DIR      output directory for --headless (default .)\n"
             "      --listen PORT  WebSocket control endpoint on 127.0.0.1:PORT\n"
             "                     (describe/set; not available with --headless)\n"
@@ -365,7 +372,9 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
 
 int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
            uint32_t width, uint32_t height,
-           const std::vector<ParamOverride>& overrides, uint16_t listenPort)
+           const std::vector<ParamOverride>& overrides, uint16_t listenPort,
+           const std::vector<std::string>& outputFilter,
+           const std::vector<std::pair<std::string, std::string>>& outputScenes)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/true)) {
@@ -413,50 +422,90 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
         }
     };
 
+    // Which scene runs on which output: named entries from --output
+    // NAME=SCENE, or one ""-keyed default (the positional scene) for every
+    // claimed output. Empty = builtin placeholder.
+    std::map<std::string, std::string> scenePaths;
+    for (const auto& [name, path] : outputScenes) {
+        scenePaths[name] = path;
+    }
+    if (scenePaths.empty() && !scenePath.empty()) {
+        scenePaths[""] = scenePath;
+    }
+
     // Declared before app: app teardown destroys surfaces, which fires the
     // output-removed callback into this map, so it must still be alive then.
-    // firstScene likewise — the wake-query callback captures both.
+    // preloaded likewise — the wake-query callback captures both.
     std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
-    std::unique_ptr<drift::core::Scene> firstScene;
+    // Validation instances, keyed like scenePaths; each is moved into
+    // `scenes` when its output's first frame arrives.
+    std::map<std::string, std::unique_ptr<drift::core::Scene>> preloaded;
+    // The document each entry currently runs: the on-disk scene.json, or
+    // the last one pushed over the control endpoint ("load"). Every
+    // instance creation path uses it, so hotplug and seek-rebuilds stay on
+    // the same document as the visible outputs.
+    std::map<std::string, std::string> currentDocs;
 
     App app;
+#ifndef __APPLE__
+    // Wallpaper mode only claims the outputs scenes were assigned to;
+    // empty = all of them. (macOS has no wallpaper mode yet, and main()
+    // refuses --output there.)
+    std::vector<std::string> filter = outputFilter;
+    for (const auto& [name, path] : outputScenes) {
+        filter.push_back(name);
+    }
+    app.setOutputFilter(std::move(filter));
+#else
+    (void)outputFilter;
+#endif
     if (!app.setup(gpu, mode, width, height)) {
         return 1;
     }
     app.setWakeFd(wakeFd.readFd);
 
     // Outputs can differ in size, so each gets its own scene instance (with
-    // its own graph state and clock); the first one reuses this validation
-    // load. nullptr in the map = a load that failed; don't retry per frame.
-    // The scene document currently running: the on-disk scene.json, or the
-    // last one pushed over the control endpoint ("load"). Every instance
-    // creation path uses it, so hotplug and seek-rebuilds stay on the same
-    // document as the visible outputs.
-    std::string currentSceneJson;
-
+    // its own graph state and clock); the first output on each entry reuses
+    // that entry's validation load. nullptr in the scenes map = a load that
+    // failed; don't retry per frame.
     drift::core::Renderer placeholder;
-    if (!scenePath.empty()) {
-        firstScene = loadScene(scenePath, gpu.device(), overrides,
-                               &currentSceneJson);
-        if (!firstScene) {
+    for (const auto& [key, path] : scenePaths) {
+        auto scene = loadScene(path, gpu.device(), overrides,
+                               &currentDocs[key]);
+        if (!scene) {
             return 1;
         }
-    } else if (!placeholder.init(gpu.device(), app.targetFormat())) {
+        preloaded[key] = std::move(scene);
+    }
+    if (scenePaths.empty() &&
+        !placeholder.init(gpu.device(), app.targetFormat())) {
         fprintf(stderr, "drift: renderer init failed\n");
         return 1;
     }
 
     const wgpu::Device device = gpu.device();
     const wgpu::TextureFormat format = app.targetFormat();
-    const bool animated = !firstScene || firstScene->animated();
+    bool animated = preloaded.empty(); // the placeholder animates
+    for (const auto& [key, scene] : preloaded) {
+        animated = animated || scene->animated();
+    }
 
     // §4.4 module timers: the run loop asks each output's scene for its
     // earliest wake_after_ms deadline to size its idle sleep.
-    app.setWakeQuery([&scenes, &firstScene](uint32_t outputId) -> double {
+    app.setWakeQuery([&scenes, &preloaded](uint32_t outputId) -> double {
         auto it = scenes.find(outputId);
-        drift::core::Scene* scene =
-            it != scenes.end() ? it->second.get() : firstScene.get();
-        return scene ? scene->nextWake() : -1.0;
+        if (it != scenes.end()) {
+            return it->second ? it->second->nextWake() : -1.0;
+        }
+        // Not instantiated yet: earliest across the validation instances.
+        double next = -1.0;
+        for (const auto& [key, scene] : preloaded) {
+            const double wake = scene ? scene->nextWake() : -1.0;
+            if (wake >= 0.0 && (next < 0.0 || wake < next)) {
+                next = wake;
+            }
+        }
+        return next;
     });
 
     app.setOutputRemoved([&scenes](uint32_t outputId) {
@@ -473,10 +522,12 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
     drift::platform::ControlServer control;
     if (listenPort) {
         auto anyScene = [&]() -> drift::core::Scene* {
-            if (firstScene) {
-                return firstScene.get();
-            }
             for (auto& [id, scene] : scenes) {
+                if (scene) {
+                    return scene.get();
+                }
+            }
+            for (auto& [key, scene] : preloaded) {
                 if (scene) {
                     return scene.get();
                 }
@@ -495,7 +546,7 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             }
             return info;
         };
-        callbacks.setParameter = [anyScene, &firstScene, &scenes, &app,
+        callbacks.setParameter = [anyScene, &preloaded, &scenes, &app,
                                   &runtimeParams](
                                      const std::string& name,
                                      const drift::core::Value& value,
@@ -507,8 +558,10 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                 return false;
             }
             bool ok = false;
-            if (firstScene) {
-                ok = firstScene->setParameter(name, value);
+            for (auto& [key, scene] : preloaded) {
+                if (scene) {
+                    ok = scene->setParameter(name, value) || ok;
+                }
             }
             for (auto& [id, scene] : scenes) {
                 if (scene) {
@@ -535,64 +588,92 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             app.setScenePaused(paused);
         };
 
-        // Fresh instances, keeping runtime parameter values; the clock is
-        // left alone (reload/load) or set by the caller (seek). newJson:
-        // a pushed document; nullptr re-reads scene.json from disk. The
-        // old instances keep running if the new document fails to load.
-        auto applyDocument = [&scenePath, &device, &overrides, &scenes,
-                              &firstScene, &runtimeParams, &currentSceneJson,
-                              &app](const std::string* newJson,
-                                    std::string& error) {
-            if (scenePath.empty()) {
+        // Fresh instances for every entry, keeping runtime parameter
+        // values; the clock is left alone (reload/load) or set by the
+        // caller (seek). newJson: a pushed document (single-document runs
+        // only — the load callback rejects it under --output NAME=SCENE);
+        // otherwise each entry rebuilds from its current document, or
+        // re-reads its scene.json when rereadDisk. The old instances keep
+        // running if any new document fails to load.
+        auto applyDocuments = [&scenePaths, &device, &overrides, &scenes,
+                               &preloaded, &runtimeParams, &currentDocs,
+                               &app](const std::string* newJson,
+                                     bool rereadDisk, std::string& error) {
+            if (scenePaths.empty()) {
                 error = "no scene loaded";
                 return false;
             }
-            std::string json = newJson ? *newJson : std::string();
-            std::vector<std::string> errors;
-            auto fresh = loadScene(scenePath, device, overrides, &json,
-                                   &errors);
-            if (!fresh) {
-                error = errors.empty() ? "scene load failed" : errors[0];
-                return false;
+            std::map<std::string, std::unique_ptr<drift::core::Scene>> fresh;
+            std::map<std::string, std::string> docs;
+            for (const auto& [key, path] : scenePaths) {
+                std::string json = newJson      ? *newJson
+                                   : rereadDisk ? std::string()
+                                                : currentDocs[key];
+                std::vector<std::string> errors;
+                auto scene = loadScene(path, device, overrides, &json,
+                                       &errors);
+                if (!scene) {
+                    error = errors.empty() ? "scene load failed" : errors[0];
+                    return false;
+                }
+                for (const auto& [name, value] : runtimeParams) {
+                    scene->setParameter(name, value);
+                }
+                fresh[key] = std::move(scene);
+                docs[key] = std::move(json);
             }
-            for (const auto& [name, value] : runtimeParams) {
-                fresh->setParameter(name, value);
-            }
-            currentSceneJson = json;
+            preloaded = std::move(fresh);
+            currentDocs = std::move(docs);
             scenes.clear();
-            firstScene = std::move(fresh);
             app.requestRedrawAll();
             return true;
         };
-        callbacks.seek = [&app, &currentSceneJson,
-                          applyDocument](double seconds, std::string& error) {
+        callbacks.seek = [&app, applyDocuments](double seconds,
+                                                std::string& error) {
             // Backward violates §9.7 within an instance; re-create on the
-            // same document instead.
+            // same documents instead.
             if (seconds < app.currentSceneTime() &&
-                !applyDocument(&currentSceneJson, error)) {
+                !applyDocuments(nullptr, /*rereadDisk=*/false, error)) {
                 return false;
             }
             app.seekSceneTime(seconds);
             return true;
         };
-        callbacks.reload = [applyDocument](std::string& error) {
-            return applyDocument(nullptr, error);
+        callbacks.reload = [applyDocuments](std::string& error) {
+            return applyDocuments(nullptr, /*rereadDisk=*/true, error);
         };
-        callbacks.source = [&currentSceneJson] { return currentSceneJson; };
-        callbacks.load = [applyDocument](const std::string& sceneJson,
-                                         std::string& error) {
-            return applyDocument(&sceneJson, error);
+        // source/load push one document, so they only serve single-document
+        // runs; a per-output-scene process is not an editing target.
+        callbacks.source = [&currentDocs] {
+            auto it = currentDocs.find("");
+            return it != currentDocs.end() ? it->second : std::string();
+        };
+        callbacks.load = [&scenePaths, applyDocuments](
+                             const std::string& sceneJson,
+                             std::string& error) {
+            if (!scenePaths.contains("")) {
+                error = scenePaths.empty()
+                            ? "no scene loaded"
+                            : "load: not supported with per-output scenes";
+                return false;
+            }
+            return applyDocuments(&sceneJson, /*rereadDisk=*/false, error);
         };
         // Project file access (write-asset/read-asset): same confinement
         // as the loader's AssetReader — project-root relative, no "..",
         // no absolute paths. Writes create directories, like the web
         // runtime's drift_write_asset; a follow-up load/reload applies.
-        auto confinedPath = [&scenePath](const std::string& rel,
-                                         std::filesystem::path& out,
-                                         std::string& error) {
+        auto confinedPath = [&scenePath, &outputScenes](
+                                const std::string& rel,
+                                std::filesystem::path& out,
+                                std::string& error) {
             namespace fs = std::filesystem;
             if (scenePath.empty()) {
-                error = "no scene loaded";
+                // Asset access needs the single project root; a
+                // per-output-scene process has several.
+                error = outputScenes.empty()
+                            ? "no scene loaded"
+                            : "not supported with per-output scenes";
                 return false;
             }
             for (const auto& part : fs::path(rel)) {
@@ -630,12 +711,14 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
         };
         // Reads also resolve through the package store (§20.6) so the
         // editor can drill into package graphs; writes stay project-only.
-        callbacks.readAsset = [&scenePath](const std::string& rel,
-                                           std::string& out,
-                                           std::string& error) {
+        callbacks.readAsset = [&scenePath, &outputScenes](
+                                  const std::string& rel, std::string& out,
+                                  std::string& error) {
             namespace fs = std::filesystem;
             if (scenePath.empty()) {
-                error = "no scene loaded";
+                error = outputScenes.empty()
+                            ? "no scene loaded"
+                            : "not supported with per-output scenes";
                 return false;
             }
             fs::path root(scenePath);
@@ -657,7 +740,7 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             out = ss.str();
             return true;
         };
-        callbacks.fire = [anyScene, &firstScene, &scenes, &app](
+        callbacks.fire = [anyScene, &preloaded, &scenes, &app](
                              const std::string& node, const std::string& port,
                              std::string& error) {
             if (!anyScene()) {
@@ -665,8 +748,10 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                 return false;
             }
             bool ok = false;
-            if (firstScene) {
-                ok = firstScene->fireEvent(node, port);
+            for (auto& [key, scene] : preloaded) {
+                if (scene) {
+                    ok = scene->fireEvent(node, port) || ok;
+                }
             }
             for (auto& [id, scene] : scenes) {
                 if (scene) {
@@ -691,25 +776,39 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
 
     return app.run(
         [&](const App::FrameRequest& req) -> bool {
-            if (scenePath.empty()) {
+            if (scenePaths.empty()) {
                 placeholder.render(req.target, (float)req.seconds);
                 return true;
             }
             auto it = scenes.find(req.outputId);
             if (it == scenes.end()) {
-                it = scenes
-                         .emplace(req.outputId,
-                                  firstScene ? std::move(firstScene)
-                                             : loadScene(scenePath, device,
-                                                         overrides,
-                                                         &currentSceneJson))
-                         .first;
-                if (it->second) {
-                    // Late instance (hotplug/reload): match runtime state.
-                    for (const auto& [name, value] : runtimeParams) {
-                        it->second->setParameter(name, value);
+#ifdef __APPLE__
+                // Single window; --output is refused on macOS so far.
+                const std::string key;
+#else
+                // The entry assigned to this output, else the ""-keyed
+                // default (the positional scene).
+                const std::string key =
+                    scenePaths.contains(req.outputName) ? req.outputName
+                                                        : std::string();
+#endif
+                std::unique_ptr<drift::core::Scene> instance;
+                if (auto pre = preloaded.find(key); pre != preloaded.end()) {
+                    instance = std::move(pre->second);
+                    preloaded.erase(pre);
+                } else if (auto path = scenePaths.find(key);
+                           path != scenePaths.end()) {
+                    // Late instance (hotplug/reload): same document,
+                    // matching runtime state.
+                    instance = loadScene(path->second, device, overrides,
+                                         &currentDocs[key]);
+                    if (instance) {
+                        for (const auto& [name, value] : runtimeParams) {
+                            instance->setParameter(name, value);
+                        }
                     }
                 }
+                it = scenes.emplace(req.outputId, std::move(instance)).first;
             }
             if (!it->second) {
                 return false;
@@ -743,6 +842,8 @@ int main(int argc, char** argv)
     std::set<int> writeFrames;
     MouseArg mouse;
     std::vector<ParamOverride> overrides;
+    std::vector<std::string> outputFilter;                          // --output NAME
+    std::vector<std::pair<std::string, std::string>> outputScenes;  // --output NAME=SCENE
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -786,6 +887,34 @@ int main(int argc, char** argv)
                 usage(argv[0]);
                 return 2;
             }
+        } else if (!strcmp(arg, "--output") && i + 1 < argc) {
+            const char* val = argv[++i];
+            if (const char* eq = strchr(val, '=')) {
+                std::string name(val, eq - val);
+                std::string scene(eq + 1);
+                if (name.empty() || scene.empty()) {
+                    fprintf(stderr, "drift: bad --output '%s' (want NAME=SCENE)\n", val);
+                    return 2;
+                }
+                for (const auto& [existing, s] : outputScenes) {
+                    if (existing == name) {
+                        fprintf(stderr, "drift: duplicate --output for '%s'\n",
+                                name.c_str());
+                        return 2;
+                    }
+                }
+                outputScenes.emplace_back(std::move(name), std::move(scene));
+            } else {
+                std::stringstream ss(val);
+                std::string name;
+                while (std::getline(ss, name, ',')) {
+                    if (name.empty()) {
+                        fprintf(stderr, "drift: bad --output '%s'\n", val);
+                        return 2;
+                    }
+                    outputFilter.push_back(name);
+                }
+            }
         } else if (!strcmp(arg, "--out") && i + 1 < argc) {
             outDir = argv[++i];
         } else if (!strcmp(arg, "--listen") && i + 1 < argc) {
@@ -807,6 +936,21 @@ int main(int argc, char** argv)
         }
     }
 
+    if (!outputScenes.empty() && !outputFilter.empty()) {
+        fprintf(stderr,
+                "drift: cannot mix --output NAME and --output NAME=SCENE\n");
+        return 2;
+    }
+    if (!outputScenes.empty() && !scenePath.empty()) {
+        fprintf(stderr,
+                "drift: --output NAME=SCENE replaces the scene argument\n");
+        return 2;
+    }
+    if ((!outputScenes.empty() || !outputFilter.empty()) &&
+        (windowed || fullscreen || headlessFrames >= 0 || !writeFrames.empty())) {
+        fprintf(stderr, "drift: --output requires wallpaper mode\n");
+        return 2;
+    }
     if (!writeFrames.empty() && headlessFrames < 0) {
         headlessFrames = *writeFrames.rbegin() + 1;
     }
@@ -833,5 +977,6 @@ int main(int argc, char** argv)
                   fullscreen ? drift::platform::SurfaceMode::Fullscreen
                   : windowed ? drift::platform::SurfaceMode::Windowed
                              : drift::platform::SurfaceMode::Wallpaper,
-                  width, height, overrides, listenPort);
+                  width, height, overrides, listenPort, outputFilter,
+                  outputScenes);
 }

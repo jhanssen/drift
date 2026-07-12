@@ -4,15 +4,18 @@
 // presenting dmabuf-backed render targets via linux-dmabuf.
 //
 // Wallpaper mode creates one background layer surface per wl_output (with
-// runtime hotplug: outputs appearing/disappearing create/destroy surfaces);
-// windowed dev mode creates a single xdg toplevel. Each surface has its own
-// buffer ring, frame-callback state, pointer state, and scene clock.
+// runtime hotplug: outputs appearing/disappearing create/destroy surfaces),
+// optionally restricted to named outputs (--output; one process per output
+// is how different outputs run different scenes); windowed dev mode creates
+// a single xdg toplevel. Each surface has its own buffer ring,
+// frame-callback state, pointer state, and scene clock.
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "Gpu.h"
@@ -57,17 +60,31 @@ public:
     // Wallpaper mode (the compositor sizes layer surfaces).
     bool setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t height);
 
+    // Wallpaper mode: only claim outputs whose connector name (wl_output.name,
+    // e.g. "DP-1") is listed; empty = every output. Set before setup().
+    // Names need wl_output v4 — on older compositors a filter matches
+    // nothing. Filtered-out outputs are released; names requested but not
+    // present attach if the output hotplugs later.
+    void setOutputFilter(std::vector<std::string> names)
+    {
+        mOutputFilter = std::move(names);
+    }
+
     wgpu::TextureFormat targetFormat() const { return mFormat; }
 
     // One render callback invocation per surface per frame. outputId is a
     // stable identity for the lifetime of that output's surface (the
     // wl_output registry name; 0 in windowed mode) — the app keeps one
-    // scene instance per outputId. seconds is that surface's scene clock:
-    // it advances by capped per-frame deltas, so it freezes across pauses
-    // (occlusion, lock) per SCENE_FORMAT.md §9.7. Returns whether the
-    // target was written; when false nothing is committed (§11).
+    // scene instance per outputId. outputName is the connector name
+    // ("DP-1"; empty in windowed mode and on compositors without wl_output
+    // v4) — the app picks which scene to instantiate by it. seconds is
+    // that surface's scene clock: it advances by capped per-frame deltas,
+    // so it freezes across pauses (occlusion, lock) per SCENE_FORMAT.md
+    // §9.7. Returns whether the target was written; when false nothing is
+    // committed (§11).
     struct FrameRequest {
         uint32_t outputId = 0;
+        std::string outputName;
         wgpu::TextureView target;
         uint32_t width = 0, height = 0;
         double seconds = 0.0;
@@ -156,7 +173,8 @@ public:
     };
     struct OutputSurface {
         WaylandApp* app = nullptr;
-        uint32_t id = 0; // wl_output registry name; 0 = windowed
+        uint32_t id = 0;  // wl_output registry name; 0 = windowed
+        std::string name; // connector name; empty = windowed or wl_output <v4
         wl_output* output = nullptr;
         wl_surface* surface = nullptr;
         zwlr_layer_surface_v1* layerSurface = nullptr;
@@ -192,8 +210,22 @@ public:
         double wakeDueWall = -1.0;
     };
 
+    // A bound wl_output whose surface decision is still pending: the name
+    // event (v4) must arrive before the filter can be evaluated, so
+    // surface creation waits for the initial property burst (the done
+    // event; for hotplug — setup()'s roundtrips cover the initial ones).
+    struct PendingOutput {
+        WaylandApp* app = nullptr;
+        wl_output* output = nullptr;
+        uint32_t id = 0;      // wl_output registry name
+        uint32_t version = 0; // bound version
+        std::string name;     // connector name; empty until the v4 event
+    };
+
     void onGlobal(uint32_t name, const char* interface, uint32_t version);
     void onGlobalRemove(uint32_t name);
+    void onOutputName(PendingOutput* pending, const char* name);
+    void onOutputDone(PendingOutput* pending);
     void onDmabufModifier(uint32_t fourcc, uint64_t modifier);
     void onFeedbackFormatTable(int32_t fd, uint32_t size);
     void onFeedbackTrancheFormats(const uint16_t* indices, size_t count);
@@ -213,8 +245,18 @@ public:
     void onBufferRelease(wl_buffer* buffer);
 
 private:
-    bool createOutputSurface(wl_output* output, uint32_t id);
+    bool createOutputSurface(wl_output* output, uint32_t id,
+                             const std::string& name = {});
     void destroyOutputSurface(OutputSurface* surf);
+    // Resolves a pending output: creates its surface if the filter admits
+    // it, releases it otherwise. Removes it from mPendingOutputs.
+    void adoptPendingOutput(PendingOutput* pending);
+    bool matchesFilter(const std::string& name) const
+    {
+        return mOutputFilter.empty() ||
+               std::find(mOutputFilter.begin(), mOutputFilter.end(), name) !=
+                   mOutputFilter.end();
+    }
     bool chooseFormat();
     bool createRing(OutputSurface& surf);
     void destroyRing(OutputSurface& surf);
@@ -249,7 +291,8 @@ private:
     wl_surface* mPointerSurface = nullptr; // surface under the pointer
 
     std::vector<std::unique_ptr<OutputSurface>> mSurfaces;
-    std::vector<std::pair<wl_output*, uint32_t>> mPendingOutputs;
+    std::vector<std::unique_ptr<PendingOutput>> mPendingOutputs;
+    std::vector<std::string> mOutputFilter;
     bool mSetupDone = false;
 
     // (fourcc, modifier) pairs the compositor accepts, from zwp_linux_dmabuf v3.

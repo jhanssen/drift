@@ -80,6 +80,31 @@ void seatCapabilities(void* data, wl_seat*, uint32_t capabilities)
 void seatName(void*, wl_seat*, const char*) {}
 const wl_seat_listener kSeatListener = { seatCapabilities, seatName };
 
+// The listener data starts as the PendingOutput and is nulled once the
+// output is adopted or released — later property bursts (mode changes
+// re-send done) must not touch the dead pending state.
+void outputGeometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t,
+                    int32_t, const char*, const char*, int32_t) {}
+void outputMode(void*, wl_output*, uint32_t, int32_t, int32_t, int32_t) {}
+void outputDone(void* data, wl_output*)
+{
+    if (auto* pending = static_cast<WaylandApp::PendingOutput*>(data)) {
+        pending->app->onOutputDone(pending);
+    }
+}
+void outputScale(void*, wl_output*, int32_t) {}
+void outputName(void* data, wl_output*, const char* name)
+{
+    if (auto* pending = static_cast<WaylandApp::PendingOutput*>(data)) {
+        pending->app->onOutputName(pending, name);
+    }
+}
+void outputDescription(void*, wl_output*, const char*) {}
+const wl_output_listener kOutputListener = {
+    outputGeometry, outputMode, outputDone, outputScale,
+    outputName,     outputDescription
+};
+
 void pointerEnter(void* data, wl_pointer*, uint32_t /*serial*/,
                   wl_surface* surface, wl_fixed_t sx, wl_fixed_t sy)
 {
@@ -208,6 +233,9 @@ WaylandApp::~WaylandApp()
     while (!mSurfaces.empty()) {
         destroyOutputSurface(mSurfaces.back().get());
     }
+    for (auto& pending : mPendingOutputs) {
+        wl_output_destroy(pending->output);
+    }
     if (mKeyboard) wl_keyboard_destroy(mKeyboard);
     if (mPointer) wl_pointer_destroy(mPointer);
     if (mSeat) wl_seat_destroy(mSeat);
@@ -266,15 +294,23 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         if (mMode != SurfaceMode::Wallpaper) {
             return;
         }
+        // v4 for the name event (connector names, what --output matches);
+        // older compositors still work, but a filter never matches there.
+        const uint32_t bound = std::min(version, 4u);
         auto* output = (wl_output*)wl_registry_bind(
-            mRegistry, name, &wl_output_interface, std::min(version, 2u));
-        if (mSetupDone) {
-            createOutputSurface(output, name); // hotplug
-        } else {
-            // The initial registry burst may announce outputs before
-            // wl_compositor / layer shell; setup() creates the surfaces
-            // after the roundtrips.
-            mPendingOutputs.emplace_back(output, name);
+            mRegistry, name, &wl_output_interface, bound);
+        auto pending = std::make_unique<PendingOutput>();
+        pending->app = this;
+        pending->output = output;
+        pending->id = name;
+        pending->version = bound;
+        wl_output_add_listener(output, &kOutputListener, pending.get());
+        mPendingOutputs.push_back(std::move(pending));
+        // Surface creation waits for the name: setup() drains the initial
+        // burst after its roundtrips; a hotplugged output resolves on its
+        // done event (v1 has no done — adopt immediately, namelessly).
+        if (mSetupDone && bound < 2) {
+            adoptPendingOutput(mPendingOutputs.back().get());
         }
     }
 }
@@ -287,6 +323,46 @@ void WaylandApp::onGlobalRemove(uint32_t name)
             return;
         }
     }
+    for (size_t i = 0; i < mPendingOutputs.size(); ++i) {
+        if (mPendingOutputs[i]->id == name) {
+            wl_output_destroy(mPendingOutputs[i]->output);
+            mPendingOutputs.erase(mPendingOutputs.begin() + i);
+            return;
+        }
+    }
+}
+
+void WaylandApp::onOutputName(PendingOutput* pending, const char* name)
+{
+    pending->name = name;
+}
+
+void WaylandApp::onOutputDone(PendingOutput* pending)
+{
+    if (mSetupDone) { // initial burst: setup() drains after its roundtrips
+        adoptPendingOutput(pending);
+    }
+}
+
+void WaylandApp::adoptPendingOutput(PendingOutput* pending)
+{
+    std::unique_ptr<PendingOutput> owned;
+    for (size_t i = 0; i < mPendingOutputs.size(); ++i) {
+        if (mPendingOutputs[i].get() == pending) {
+            owned = std::move(mPendingOutputs[i]);
+            mPendingOutputs.erase(mPendingOutputs.begin() + i);
+            break;
+        }
+    }
+    wl_output_set_user_data(pending->output, nullptr); // pending state ends
+    if (!matchesFilter(pending->name)) {
+        printf("drift: output %s (id %u) not in --output, released\n",
+               pending->name.empty() ? "(unnamed)" : pending->name.c_str(),
+               pending->id);
+        wl_output_destroy(pending->output);
+        return;
+    }
+    createOutputSurface(pending->output, pending->id, pending->name);
 }
 
 void WaylandApp::onDmabufModifier(uint32_t fourcc, uint64_t modifier)
@@ -498,11 +574,13 @@ void WaylandApp::onBufferRelease(wl_buffer* buffer)
     }
 }
 
-bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
+bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id,
+                                     const std::string& name)
 {
     auto surf = std::make_unique<OutputSurface>();
     surf->app = this;
     surf->id = id;
+    surf->name = name;
     surf->output = output;
     surf->surface = wl_compositor_create_surface(mCompositor);
 
@@ -520,7 +598,8 @@ bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id)
         zwlr_layer_surface_v1_set_exclusive_zone(surf->layerSurface, -1);
         zwlr_layer_surface_v1_set_keyboard_interactivity(
             surf->layerSurface, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
-        printf("drift: output %u added\n", id);
+        printf("drift: output %s (id %u) added\n",
+               name.empty() ? "(unnamed)" : name.c_str(), id);
     } else {
         surf->xdgSurface = xdg_wm_base_get_xdg_surface(mWmBase, surf->surface);
         xdg_surface_add_listener(surf->xdgSurface, &kXdgSurfaceListener,
@@ -571,6 +650,7 @@ void WaylandApp::destroyOutputSurface(OutputSurface* surf)
     }
 
     const uint32_t id = surf->id;
+    const std::string name = surf->name;
     for (size_t i = 0; i < mSurfaces.size(); ++i) {
         if (mSurfaces[i].get() == surf) {
             mSurfaces.erase(mSurfaces.begin() + i);
@@ -578,7 +658,8 @@ void WaylandApp::destroyOutputSurface(OutputSurface* surf)
         }
     }
     if (mMode == SurfaceMode::Wallpaper) {
-        printf("drift: output %u removed\n", id);
+        printf("drift: output %s (id %u) removed\n",
+               name.empty() ? "(unnamed)" : name.c_str(), id);
     }
     if (mOutputRemoved) {
         mOutputRemoved(id);
@@ -618,13 +699,36 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
                     "(required for wallpaper mode; try --windowed)\n");
             return false;
         }
-        for (auto& [output, name] : mPendingOutputs) {
-            createOutputSurface(output, name);
+        // The roundtrips above delivered every initial output's property
+        // burst, so names (v4) are known; resolve them against the filter.
+        std::string available;
+        for (const auto& pending : mPendingOutputs) {
+            available += available.empty() ? "" : ", ";
+            available += pending->name.empty() ? "(unnamed)" : pending->name;
         }
-        mPendingOutputs.clear();
+        while (!mPendingOutputs.empty()) {
+            adoptPendingOutput(mPendingOutputs.front().get());
+        }
         if (mSurfaces.empty()) {
-            fprintf(stderr, "drift: no wl_output advertised\n");
+            if (!mOutputFilter.empty()) {
+                fprintf(stderr,
+                        "drift: no output matched --output (available: %s)\n",
+                        available.empty() ? "none" : available.c_str());
+            } else {
+                fprintf(stderr, "drift: no wl_output advertised\n");
+            }
             return false;
+        }
+        for (const auto& want : mOutputFilter) {
+            const bool found = std::any_of(
+                mSurfaces.begin(), mSurfaces.end(),
+                [&want](const auto& surf) { return surf->name == want; });
+            if (!found) {
+                fprintf(stderr,
+                        "drift: --output %s: no such output yet (attaches on "
+                        "hotplug; available: %s)\n",
+                        want.c_str(), available.c_str());
+            }
         }
     } else {
         if (!mWmBase) {
@@ -830,6 +934,7 @@ void WaylandApp::drawFrame(OutputSurface& surf)
 
     FrameRequest request;
     request.outputId = surf.id;
+    request.outputName = surf.name;
     request.target = buf->target.texture.CreateView();
     request.width = surf.bufferWidth;
     request.height = surf.bufferHeight;
