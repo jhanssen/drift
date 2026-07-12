@@ -38,6 +38,11 @@ struct VideoFrame {
     // consumers can cache their imports; the fds stay valid until the next
     // frameAt call.
     std::vector<VideoPlane> planes;
+    // Zero-copy path, macOS variant (rgba and planes empty): the decode
+    // surface as an IOSurfaceRef, passed as a plain pointer so core stays
+    // free of platform video headers. NV12; the decoder keeps it alive
+    // until the next frameAt call, and surfaceId caching applies the same.
+    void* ioSurface = nullptr;
     uint64_t surfaceId = 0;
     bool bt709 = false;     // YUV matrix (else BT.601)
     bool fullRange = false; // YUV range (else limited/video)

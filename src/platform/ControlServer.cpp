@@ -7,10 +7,16 @@
 #include <cstring>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#else
+#include <sys/event.h>
+#endif
 
 #include <glaze/glaze.hpp>
 
@@ -103,6 +109,107 @@ bool containsToken(const std::string& headerValue, const char* token)
     return false;
 }
 
+// The poll set (fd() hands it to the app loop): epoll on Linux, kqueue
+// elsewhere — both are themselves pollable, so one fd covers the listener
+// and every client. Read interest is permanent; write interest tracks a
+// non-empty out buffer (updateWatch).
+#ifdef __linux__
+
+int pollCreate()
+{
+    return epoll_create1(EPOLL_CLOEXEC);
+}
+
+void pollWatch(int poll, int fd, bool write)
+{
+    epoll_event ev{};
+    ev.events = EPOLLIN | (write ? EPOLLOUT : 0);
+    ev.data.fd = fd;
+    if (epoll_ctl(poll, EPOLL_CTL_ADD, fd, &ev) != 0 && errno == EEXIST) {
+        epoll_ctl(poll, EPOLL_CTL_MOD, fd, &ev);
+    }
+}
+
+void pollUnwatch(int poll, int fd)
+{
+    epoll_ctl(poll, EPOLL_CTL_DEL, fd, nullptr);
+}
+
+struct PollEvent {
+    int fd;
+    bool read, write, error;
+};
+
+int pollWait(int poll, PollEvent* out, int max)
+{
+    epoll_event events[16];
+    const int n = epoll_wait(poll, events, std::min(max, 16), 0);
+    for (int i = 0; i < n; ++i) {
+        out[i].fd = events[i].data.fd;
+        out[i].read = events[i].events & EPOLLIN;
+        out[i].write = events[i].events & EPOLLOUT;
+        out[i].error = events[i].events & (EPOLLHUP | EPOLLERR);
+    }
+    return n;
+}
+
+#else // kqueue
+
+int pollCreate()
+{
+    return kqueue();
+}
+
+void pollWatch(int poll, int fd, bool write)
+{
+    struct kevent change;
+    EV_SET(&change, fd, EVFILT_READ, EV_ADD, 0, 0, nullptr);
+    kevent(poll, &change, 1, nullptr, 0, nullptr);
+    // Toggling write interest off deletes a possibly-unregistered filter;
+    // the resulting ENOENT is harmless.
+    EV_SET(&change, fd, EVFILT_WRITE, write ? EV_ADD : EV_DELETE, 0, 0,
+           nullptr);
+    kevent(poll, &change, 1, nullptr, 0, nullptr);
+}
+
+void pollUnwatch(int poll, int fd)
+{
+    struct kevent changes[2];
+    EV_SET(&changes[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    EV_SET(&changes[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    kevent(poll, changes, 2, nullptr, 0, nullptr);
+}
+
+struct PollEvent {
+    int fd;
+    bool read, write, error;
+};
+
+int pollWait(int poll, PollEvent* out, int max)
+{
+    struct kevent events[16];
+    const timespec zero{};
+    const int n = kevent(poll, nullptr, 0, events, std::min(max, 16), &zero);
+    for (int i = 0; i < n; ++i) {
+        out[i].fd = (int)events[i].ident;
+        // EV_EOF stays a read: recv drains buffered bytes, then returns 0.
+        out[i].read = events[i].filter == EVFILT_READ;
+        out[i].write = events[i].filter == EVFILT_WRITE;
+        out[i].error = events[i].flags & EV_ERROR;
+    }
+    return n;
+}
+
+#endif
+
+// socket(SOCK_NONBLOCK | SOCK_CLOEXEC) / accept4 are Linux-only; the
+// portable route sets both flags with fcntl after the fact.
+bool makeNonblockCloexec(int fd)
+{
+    return fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) == 0 &&
+           fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
+}
+
 } // namespace
 
 ControlServer::~ControlServer()
@@ -113,8 +220,8 @@ ControlServer::~ControlServer()
     if (mListen >= 0) {
         close(mListen);
     }
-    if (mEpoll >= 0) {
-        close(mEpoll);
+    if (mPoll >= 0) {
+        close(mPoll);
     }
 }
 
@@ -122,8 +229,8 @@ bool ControlServer::start(uint16_t port, Callbacks callbacks, std::string& error
 {
     mCallbacks = std::move(callbacks);
 
-    mListen = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (mListen < 0) {
+    mListen = socket(AF_INET, SOCK_STREAM, 0);
+    if (mListen < 0 || !makeNonblockCloexec(mListen)) {
         error = std::string("socket: ") + strerror(errno);
         return false;
     }
@@ -144,28 +251,25 @@ bool ControlServer::start(uint16_t port, Callbacks callbacks, std::string& error
         return false;
     }
 
-    mEpoll = epoll_create1(EPOLL_CLOEXEC);
-    if (mEpoll < 0) {
-        error = std::string("epoll_create1: ") + strerror(errno);
+    mPoll = pollCreate();
+    if (mPoll < 0) {
+        error = std::string("poll set: ") + strerror(errno);
         return false;
     }
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.fd = mListen;
-    epoll_ctl(mEpoll, EPOLL_CTL_ADD, mListen, &ev);
+    pollWatch(mPoll, mListen, false);
     return true;
 }
 
 void ControlServer::drive()
 {
-    epoll_event events[16];
+    PollEvent events[16];
     for (;;) {
-        const int n = epoll_wait(mEpoll, events, 16, 0);
+        const int n = pollWait(mPoll, events, 16);
         if (n <= 0) {
             return;
         }
         for (int i = 0; i < n; ++i) {
-            const int fd = events[i].data.fd;
+            const int fd = events[i].fd;
             if (fd == mListen) {
                 acceptClients();
                 continue;
@@ -173,14 +277,14 @@ void ControlServer::drive()
             if (!mClients.count(fd)) {
                 continue; // closed earlier in this batch
             }
-            if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+            if (events[i].error) {
                 closeClient(fd);
                 continue;
             }
-            if (events[i].events & EPOLLIN) {
+            if (events[i].read) {
                 readClient(fd);
             }
-            if (mClients.count(fd) && (events[i].events & EPOLLOUT)) {
+            if (mClients.count(fd) && events[i].write) {
                 flush(fd, mClients[fd]);
             }
         }
@@ -215,16 +319,21 @@ void ControlServer::broadcast(const std::string& message, int exceptFd)
 void ControlServer::acceptClients()
 {
     for (;;) {
-        const int fd = accept4(mListen, nullptr, nullptr,
-                               SOCK_NONBLOCK | SOCK_CLOEXEC);
+        const int fd = accept(mListen, nullptr, nullptr);
         if (fd < 0) {
             return;
         }
+        if (!makeNonblockCloexec(fd)) {
+            close(fd);
+            continue;
+        }
+#ifdef SO_NOSIGPIPE
+        // send() has no MSG_NOSIGNAL here; suppress SIGPIPE per socket.
+        const int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
         mClients.emplace(fd, Client{});
-        epoll_event ev{};
-        ev.events = EPOLLIN;
-        ev.data.fd = fd;
-        epoll_ctl(mEpoll, EPOLL_CTL_ADD, fd, &ev);
+        pollWatch(mPoll, fd, false);
     }
 }
 
@@ -625,14 +734,19 @@ void ControlServer::send(int fd, Client& client, std::string bytes)
 void ControlServer::flush(int fd, Client& client)
 {
     while (!client.out.empty()) {
+#ifdef MSG_NOSIGNAL
+        constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kSendFlags = 0; // SO_NOSIGPIPE set at accept
+#endif
         const ssize_t n =
-            ::send(fd, client.out.data(), client.out.size(), MSG_NOSIGNAL);
+            ::send(fd, client.out.data(), client.out.size(), kSendFlags);
         if (n > 0) {
             client.out.erase(0, (size_t)n);
             continue;
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            updateEpoll(fd, client);
+            updateWatch(fd, client);
             return;
         }
         closeClient(fd);
@@ -642,20 +756,17 @@ void ControlServer::flush(int fd, Client& client)
         closeClient(fd);
         return;
     }
-    updateEpoll(fd, client);
+    updateWatch(fd, client);
 }
 
-void ControlServer::updateEpoll(int fd, const Client& client)
+void ControlServer::updateWatch(int fd, const Client& client)
 {
-    epoll_event ev{};
-    ev.events = EPOLLIN | (client.out.empty() ? 0 : EPOLLOUT);
-    ev.data.fd = fd;
-    epoll_ctl(mEpoll, EPOLL_CTL_MOD, fd, &ev);
+    pollWatch(mPoll, fd, !client.out.empty());
 }
 
 void ControlServer::closeClient(int fd)
 {
-    epoll_ctl(mEpoll, EPOLL_CTL_DEL, fd, nullptr);
+    pollUnwatch(mPoll, fd);
     close(fd);
     mClients.erase(fd);
 }

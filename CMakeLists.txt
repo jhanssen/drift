@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(APPLE)
+    enable_language(OBJCXX) # the Cocoa platform layer is Objective-C++
+    set(CMAKE_OBJCXX_STANDARD 23)
+    set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+endif()
+
 # First-party packages under library/ (§20.4): the web bundle ships them
 # as a store at /packages, and the test fixture installs them into a
 # build-dir store for the goldens.
@@ -33,21 +39,26 @@ if(NOT EMSCRIPTEN)
     find_package(Threads REQUIRED)
     # Wasmtime C API prebuilt (§4.5): the native WASM module engine.
     add_subdirectory(3rdparty/wasmtime)
-    pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-    pkg_check_modules(GBM REQUIRED gbm)
-    pkg_check_modules(LIBDRM REQUIRED libdrm)
+    if(NOT APPLE)
+        pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+        pkg_check_modules(GBM REQUIRED gbm)
+        pkg_check_modules(LIBDRM REQUIRED libdrm)
+        pkg_check_modules(LIBVA REQUIRED libva libva-drm)
+    endif()
     pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
-    pkg_check_modules(LIBVA REQUIRED libva libva-drm)
     # §4.4 native network backend. 7.86 is the compile floor (the ws API
     # and CURLOPT_PREREQFUNCTION exist); the *supported* WebSocket floor
     # is 8.11, where ws ships enabled by default — on a curl built
-    # without ws, WS handles degrade to the offline face at runtime and
-    # HTTP still works, so configure does not refuse older systems.
+    # without ws (e.g. the macOS system curl), WS handles degrade to the
+    # offline face at runtime and HTTP still works, so configure does not
+    # refuse older systems.
     pkg_check_modules(LIBCURL REQUIRED libcurl>=7.86)
 endif()
 
 # Dawn is built -fno-rtti; match it to avoid typeinfo mismatches.
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>)
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fno-rtti>)
 
 # ---- drift_core: platform-agnostic scene/render code ----
 # Rule: core code sees only the portable WebGPU API (webgpu_cpp.h). No
@@ -70,6 +81,18 @@ if(EMSCRIPTEN)
     target_link_options(drift_core PUBLIC "--use-port=${DRIFT_EMDAWNWEBGPU_PORT}")
 else()
     target_link_libraries(drift_core PUBLIC dawn::webgpu_dawn)
+    if(APPLE)
+        # The Dawn monolith's CMake export does not carry its framework
+        # dependencies (Metal backend + IOSurface interop).
+        target_link_libraries(drift_core PUBLIC
+            "-framework CoreFoundation"
+            "-framework Foundation"
+            "-framework IOKit"
+            "-framework IOSurface"
+            "-framework Metal"
+            "-framework QuartzCore"
+        )
+    endif()
 endif()
 target_link_libraries(drift_core PRIVATE glaze::glaze webpdecoder ktx)
 
@@ -146,30 +169,17 @@ if(EMSCRIPTEN)
     return()
 endif()
 
-# ---- drift: native Linux/Wayland runtime ----
-set(WLGEN src/platform/linux/wayland-generated)
+# ---- drift: native runtime (Linux/Wayland, macOS/Cocoa) ----
 add_executable(drift
     src/main.cpp
+    src/platform/ControlServer.cpp
     src/platform/ModuleNetCurl.cpp
     src/platform/ModuleWasmtime.cpp
-    src/platform/linux/ControlServer.cpp
-    src/platform/linux/Gpu.cpp
-    src/platform/linux/WaylandApp.cpp
-    src/platform/linux/VideoDecoderFFmpeg.cpp
-    src/platform/linux/WsCodec.cpp
-    ${WLGEN}/xdg-shell-protocol.c
-    ${WLGEN}/wlr-layer-shell-unstable-v1-protocol.c
-    ${WLGEN}/linux-dmabuf-v1-protocol.c
-    ${WLGEN}/viewporter-protocol.c
-    ${WLGEN}/fractional-scale-v1-protocol.c
+    src/platform/VideoDecoderFFmpeg.cpp
+    src/platform/WsCodec.cpp
 )
 target_include_directories(drift PRIVATE
-    ${WLGEN}
-    ${WAYLAND_CLIENT_INCLUDE_DIRS}
-    ${GBM_INCLUDE_DIRS}
-    ${LIBDRM_INCLUDE_DIRS}
     ${FFMPEG_INCLUDE_DIRS}
-    ${LIBVA_INCLUDE_DIRS}
     ${LIBCURL_INCLUDE_DIRS}
     3rdparty/stb
 )
@@ -177,15 +187,52 @@ target_link_libraries(drift PRIVATE
     drift_core
     wasmtime::wasmtime
     glaze::glaze
-    ${WAYLAND_CLIENT_LIBRARIES}
-    ${GBM_LIBRARIES}
-    ${LIBDRM_LIBRARIES}
     ${FFMPEG_LIBRARIES}
-    ${LIBVA_LIBRARIES}
     ${LIBCURL_LIBRARIES}
     Threads::Threads
-    dl
 )
+if(APPLE)
+    target_sources(drift PRIVATE
+        src/platform/mac/CocoaApp.mm
+        src/platform/mac/Gpu.cpp
+    )
+    set_source_files_properties(src/platform/mac/CocoaApp.mm
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    # Metal/QuartzCore/IOSurface ride drift_core's interface with Dawn.
+    target_link_libraries(drift PRIVATE
+        "-framework Cocoa"
+        "-framework CoreVideo"
+    )
+    # Homebrew ffmpeg (and a keg-only curl, when PKG_CONFIG_PATH selects
+    # one) live outside the default search path.
+    target_link_directories(drift PRIVATE
+        ${FFMPEG_LIBRARY_DIRS} ${LIBCURL_LIBRARY_DIRS})
+else()
+    set(WLGEN src/platform/linux/wayland-generated)
+    target_sources(drift PRIVATE
+        src/platform/linux/Gpu.cpp
+        src/platform/linux/WaylandApp.cpp
+        ${WLGEN}/xdg-shell-protocol.c
+        ${WLGEN}/wlr-layer-shell-unstable-v1-protocol.c
+        ${WLGEN}/linux-dmabuf-v1-protocol.c
+        ${WLGEN}/viewporter-protocol.c
+        ${WLGEN}/fractional-scale-v1-protocol.c
+    )
+    target_include_directories(drift PRIVATE
+        ${WLGEN}
+        ${WAYLAND_CLIENT_INCLUDE_DIRS}
+        ${GBM_INCLUDE_DIRS}
+        ${LIBDRM_INCLUDE_DIRS}
+        ${LIBVA_INCLUDE_DIRS}
+    )
+    target_link_libraries(drift PRIVATE
+        ${WAYLAND_CLIENT_LIBRARIES}
+        ${GBM_LIBRARIES}
+        ${LIBDRM_LIBRARIES}
+        ${LIBVA_LIBRARIES}
+        dl
+    )
+endif()
 
 # ---- tests ----
 # Unit tests (doctest) for core logic, plus golden-image tests that render
@@ -212,9 +259,10 @@ if(BUILD_TESTING)
         tests/unit/module_net_curl_test.cpp
         src/platform/ModuleNetCurl.cpp
         src/platform/ModuleWasmtime.cpp
-        src/platform/linux/WsCodec.cpp
+        src/platform/WsCodec.cpp
     )
     target_include_directories(drift_tests PRIVATE ${LIBCURL_INCLUDE_DIRS})
+    target_link_directories(drift_tests PRIVATE ${LIBCURL_LIBRARY_DIRS})
     target_link_libraries(drift_tests PRIVATE drift_core doctest::doctest
                                               glaze::glaze ktx
                                               wasmtime::wasmtime

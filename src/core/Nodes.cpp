@@ -908,6 +908,149 @@ bool VideoNode::ensureConvertPipeline(FrameContext& ctx)
     return true;
 }
 
+bool VideoNode::convertYuv(FrameContext& ctx, const VideoFrame& frame,
+                           const wgpu::TextureView& y,
+                           const wgpu::TextureView& uv)
+{
+    if (!ensureConvertPipeline(ctx)) {
+        return false;
+    }
+    if (!mConverted || mConvertedWidth != frame.width ||
+        mConvertedHeight != frame.height) {
+        wgpu::TextureDescriptor desc{};
+        desc.format = wgpu::TextureFormat::RGBA16Float;
+        desc.size = { frame.width, frame.height, 1 };
+        desc.usage = wgpu::TextureUsage::RenderAttachment |
+                     wgpu::TextureUsage::TextureBinding |
+                     wgpu::TextureUsage::CopySrc;
+        mConverted = ctx.device.CreateTexture(&desc);
+        mConvertedWidth = frame.width;
+        mConvertedHeight = frame.height;
+    }
+
+    float rows[12];
+    yuvMatrix(frame.bt709, frame.fullRange, rows);
+    ctx.device.GetQueue().WriteBuffer(mConvertUniforms, 0, rows, sizeof(rows));
+
+    wgpu::BindGroupEntry entries[4] = {};
+    entries[0].binding = 0;
+    entries[0].buffer = mConvertUniforms;
+    entries[0].size = 48;
+    entries[1].binding = 1;
+    entries[1].textureView = y;
+    entries[2].binding = 2;
+    entries[2].textureView = uv;
+    entries[3].binding = 3;
+    entries[3].sampler = mConvertSampler;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = mConvertPipeline.GetBindGroupLayout(0);
+    bgDesc.entryCount = 4;
+    bgDesc.entries = entries;
+    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgDesc);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = mConverted.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 1.0 };
+    wgpu::RenderPassDescriptor desc{};
+    desc.colorAttachmentCount = 1;
+    desc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
+    pass.SetPipeline(mConvertPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(3);
+    pass.End();
+    wgpu::CommandBuffer commands = encoder.Finish();
+    ctx.device.GetQueue().Submit(1, &commands);
+
+    Value out{};
+    out.type = ValueType::Texture;
+    out.texture = mConverted;
+    out.texWidth = mConvertedWidth;
+    out.texHeight = mConvertedHeight;
+    outputs[0].value = out;
+    outputs[0].dirty = true;
+    return true;
+}
+
+#ifdef __APPLE__
+
+bool VideoNode::evaluateZeroCopyIOSurface(FrameContext& ctx,
+                                          const VideoFrame& frame)
+{
+    if (!ctx.device.HasFeature(
+            wgpu::FeatureName::SharedTextureMemoryIOSurface) ||
+        !ctx.device.HasFeature(wgpu::FeatureName::DawnMultiPlanarFormats) ||
+        !ctx.device.HasFeature(wgpu::FeatureName::SharedFenceMTLSharedEvent)) {
+        return false; // this device can't import; fall back quietly
+    }
+    auto it = mSurfaces.find(frame.surfaceId);
+    if (it == mSurfaces.end()) {
+        // Capture import rejections in an error scope: a failed probe
+        // means "fall back", not a GPU error.
+        ctx.device.PushErrorScope(wgpu::ErrorFilter::Validation);
+        ImportedSurface imported;
+        wgpu::SharedTextureMemoryIOSurfaceDescriptor io{};
+        io.ioSurface = frame.ioSurface;
+        wgpu::SharedTextureMemoryDescriptor desc{};
+        desc.nextInChain = &io;
+        imported.memory[0] = ctx.device.ImportSharedTextureMemory(&desc);
+        wgpu::SharedTextureMemoryProperties props{};
+        imported.memory[0].GetProperties(&props);
+        bool ok = props.size.width != 0;
+        if (ok) {
+            // One multiplanar (NV12) texture; the convert pass samples it
+            // through per-plane views, same shapes as the dmabuf planes.
+            imported.texture[0] = imported.memory[0].CreateTexture();
+            wgpu::TextureViewDescriptor viewDesc{};
+            viewDesc.dimension = wgpu::TextureViewDimension::e2D;
+            viewDesc.aspect = wgpu::TextureAspect::Plane0Only;
+            viewDesc.format = wgpu::TextureFormat::R8Unorm;
+            imported.view[0] = imported.texture[0].CreateView(&viewDesc);
+            viewDesc.aspect = wgpu::TextureAspect::Plane1Only;
+            viewDesc.format = wgpu::TextureFormat::RG8Unorm;
+            imported.view[1] = imported.texture[0].CreateView(&viewDesc);
+        }
+        // Validation is synchronous in Dawn native; a spontaneous callback
+        // resolves during the Pop call. If it somehow doesn't, treat the
+        // probe as failed rather than blocking the render thread.
+        bool scopeDone = false;
+        ctx.device.PopErrorScope(
+            wgpu::CallbackMode::AllowSpontaneous,
+            [&](wgpu::PopErrorScopeStatus, wgpu::ErrorType type,
+                wgpu::StringView) {
+                ok = ok && type == wgpu::ErrorType::NoError;
+                scopeDone = true;
+            });
+        if (!scopeDone || !ok) {
+            return false; // caller falls back to CPU frames
+        }
+        it = mSurfaces.emplace(frame.surfaceId, std::move(imported)).first;
+    }
+    ImportedSurface& surface = it->second;
+
+    // Access-scope the external texture around the conversion pass. The
+    // decoder finished the frame before handing it over, so contents are
+    // ready and no acquire fences are needed.
+    wgpu::SharedTextureMemoryBeginAccessDescriptor ba{};
+    ba.initialized = true;
+    ba.concurrentRead = false;
+    if (surface.memory[0].BeginAccess(surface.texture[0], &ba) !=
+        wgpu::Status::Success) {
+        return false;
+    }
+    const bool converted =
+        convertYuv(ctx, frame, surface.view[0], surface.view[1]);
+    wgpu::SharedTextureMemoryEndAccessState end{};
+    surface.memory[0].EndAccess(surface.texture[0], &end);
+    return converted;
+}
+
+#else // dmabuf zero-copy
+
 bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
 {
     if (!ctx.device.HasFeature(wgpu::FeatureName::SharedTextureMemoryDmaBuf)) {
@@ -942,6 +1085,7 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
                 break;
             }
             imported.texture[i] = imported.memory[i].CreateTexture();
+            imported.view[i] = imported.texture[i].CreateView();
         }
         // Validation is synchronous in Dawn native; a spontaneous callback
         // resolves during the Pop call. If it somehow doesn't, treat the
@@ -961,26 +1105,6 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
     }
     ImportedSurface& surface = it->second;
 
-    if (!ensureConvertPipeline(ctx)) {
-        return false;
-    }
-    if (!mConverted || mConvertedWidth != frame.width ||
-        mConvertedHeight != frame.height) {
-        wgpu::TextureDescriptor desc{};
-        desc.format = wgpu::TextureFormat::RGBA16Float;
-        desc.size = { frame.width, frame.height, 1 };
-        desc.usage = wgpu::TextureUsage::RenderAttachment |
-                     wgpu::TextureUsage::TextureBinding |
-                     wgpu::TextureUsage::CopySrc;
-        mConverted = ctx.device.CreateTexture(&desc);
-        mConvertedWidth = frame.width;
-        mConvertedHeight = frame.height;
-    }
-
-    float rows[12];
-    yuvMatrix(frame.bt709, frame.fullRange, rows);
-    ctx.device.GetQueue().WriteBuffer(mConvertUniforms, 0, rows, sizeof(rows));
-
     // Access-scope the external planes around the conversion pass. The
     // decoder synced the surface before export, so contents are ready.
     for (int i = 0; i < 2; ++i) {
@@ -997,39 +1121,8 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
         }
     }
 
-    wgpu::BindGroupEntry entries[4] = {};
-    entries[0].binding = 0;
-    entries[0].buffer = mConvertUniforms;
-    entries[0].size = 48;
-    entries[1].binding = 1;
-    entries[1].textureView = surface.texture[0].CreateView();
-    entries[2].binding = 2;
-    entries[2].textureView = surface.texture[1].CreateView();
-    entries[3].binding = 3;
-    entries[3].sampler = mConvertSampler;
-    wgpu::BindGroupDescriptor bgDesc{};
-    bgDesc.layout = mConvertPipeline.GetBindGroupLayout(0);
-    bgDesc.entryCount = 4;
-    bgDesc.entries = entries;
-    wgpu::BindGroup group = ctx.device.CreateBindGroup(&bgDesc);
-
-    wgpu::RenderPassColorAttachment attachment{};
-    attachment.view = mConverted.CreateView();
-    attachment.loadOp = wgpu::LoadOp::Clear;
-    attachment.storeOp = wgpu::StoreOp::Store;
-    attachment.clearValue = { 0.0, 0.0, 0.0, 1.0 };
-    wgpu::RenderPassDescriptor desc{};
-    desc.colorAttachmentCount = 1;
-    desc.colorAttachments = &attachment;
-
-    wgpu::CommandEncoder encoder = ctx.device.CreateCommandEncoder();
-    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&desc);
-    pass.SetPipeline(mConvertPipeline);
-    pass.SetBindGroup(0, group);
-    pass.Draw(3);
-    pass.End();
-    wgpu::CommandBuffer commands = encoder.Finish();
-    ctx.device.GetQueue().Submit(1, &commands);
+    const bool converted =
+        convertYuv(ctx, frame, surface.view[0], surface.view[1]);
 
     for (int i = 0; i < 2; ++i) {
         wgpu::SharedTextureMemoryVkImageLayoutEndState vkEnd{};
@@ -1037,16 +1130,10 @@ bool VideoNode::evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame)
         end.nextInChain = &vkEnd;
         surface.memory[i].EndAccess(surface.texture[i], &end);
     }
-
-    Value out{};
-    out.type = ValueType::Texture;
-    out.texture = mConverted;
-    out.texWidth = mConvertedWidth;
-    out.texHeight = mConvertedHeight;
-    outputs[0].value = out;
-    outputs[0].dirty = true;
-    return true;
+    return converted;
 }
+
+#endif // __APPLE__
 
 #endif // !__EMSCRIPTEN__
 
@@ -1104,8 +1191,15 @@ void VideoNode::evaluate(FrameContext& ctx)
     }
 
 #ifndef __EMSCRIPTEN__
-    if (frame->planes.size() == 2) {
-        if (evaluateZeroCopy(ctx, *frame)) {
+    if (frame->planes.size() == 2 || frame->ioSurface) {
+#ifdef __APPLE__
+        const bool imported =
+            frame->ioSurface && evaluateZeroCopyIOSurface(ctx, *frame);
+#else
+        const bool imported =
+            frame->planes.size() == 2 && evaluateZeroCopy(ctx, *frame);
+#endif
+        if (imported) {
             mLastIndex = frame->index;
         } else {
             // Import failed (or a stale zero-copy frame after fallback):

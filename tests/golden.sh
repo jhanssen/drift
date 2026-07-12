@@ -11,9 +11,11 @@
 #   presents - expected "presented N of M frames" count (efficiency
 #              contract: a static scene must present exactly once)
 #
-# Renders on the lavapipe software rasterizer by default so results are
-# reproducible across machines; set DRIFT_ADAPTER to override (imgcmp's
-# tolerances absorb real-GPU LSB differences). Regenerate goldens with:
+# Renders on the lavapipe software rasterizer by default (Linux) so results
+# are reproducible across machines; set DRIFT_ADAPTER to override (imgcmp's
+# tolerances absorb real-GPU LSB differences). macOS has no software
+# rasterizer, so goldens compare Metal output against the lavapipe-rendered
+# references there. Regenerate goldens with:
 #   DRIFT_ADAPTER=llvmpipe drift <scene> --frames <list> --size 320x180 --out <golden-dir>
 set -eu
 
@@ -22,7 +24,9 @@ imgcmp=$2
 scene=$3
 golden=$4
 
-: "${DRIFT_ADAPTER:=llvmpipe}"
+if [ -z "${DRIFT_ADAPTER:-}" ] && [ "$(uname)" = "Linux" ]; then
+    DRIFT_ADAPTER=llvmpipe
+fi
 export DRIFT_ADAPTER
 # Hardware video decode output can differ per vendor; goldens pin software.
 export DRIFT_HWDEC=off

@@ -804,7 +804,7 @@ To be nailed down on paper before runtime implementation begins:
 
 ### 13.2 V1 Scope
 
-- Native runtime only, Wayland only (layer-shell compositors; GNOME out of scope)
+- Native runtime only, Wayland only (layer-shell compositors; GNOME out of scope) — since joined by a macOS runtime (2026-07-12): Metal presentation through a CAMetalLayer-backed `wgpu::Surface`, `--windowed` and `--headless` modes (wallpaper and fullscreen still pending there), VideoToolbox decode with IOSurface zero-copy import
 - Scene loaded from a local `.sceneproject` directory (JSON; no `scene.bin`)
 - Node types: image texture, video, shader effect, transform/layer (2D position/rotation/scale/anchor as wireable ports), compositor, time/mouse input sources, basic value nodes (remap, wave)
 - Content model: a background layer (image or video) plus animated foreground layers with transparency; all texture edges carry premultiplied alpha
@@ -813,7 +813,7 @@ To be nailed down on paper before runtime implementation begins:
 - Presentation: bypass Dawn's swapchain — render into self-allocated dmabuf textures imported into Dawn, committed to the layer surface via `linux-dmabuf` (prior art: [overdraw](https://github.com/jhanssen/overdraw)); the same dmabuf import path serves zero-copy video decode later
 - Dev modes, first-class from the start: `--windowed` (xdg-toplevel, develop without replacing the wallpaper) and `--headless` (offscreen render, dump frames as PNG — doubles as the golden-image test harness)
 - Toolchain: C++23, CMake + Ninja, single-threaded core (one decode thread per video node); Dawn via tarball download; glaze (JSON), ffmpeg/VAAPI (video), stb_image + libktx (images), raw wayland-client with scanner-generated protocols
-- Dependency policy: system-coupled C libraries (ffmpeg, libva, wayland-client, gbm, libdrm, libcurl) come from the system via pkg-config — never vendored (ffmpeg is LGPL; dynamic system linking keeps the Apache-2.0 project clean); portable C++ dependencies (glaze, libktx) via CMake FetchContent pinned to exact release tags, each wrapped in a `3rdparty/<name>/CMakeLists.txt`; Dawn is the one prebuilt tarball; trivial single-headers (stb) vendored in `3rdparty/`
+- Dependency policy: system-coupled C libraries (ffmpeg, libva, wayland-client, gbm, libdrm, libcurl) come from the system via pkg-config — never vendored (ffmpeg is LGPL; dynamic system linking keeps the Apache-2.0 project clean); portable C++ dependencies (glaze, libktx) via CMake FetchContent pinned to exact release tags, each wrapped in a `3rdparty/<name>/CMakeLists.txt`; Dawn is the one prebuilt tarball; trivial single-headers (stb) vendored in `3rdparty/`. On macOS the system-coupled set shrinks to ffmpeg + libcurl (Homebrew/system pkg-config); Cocoa, Metal, VideoToolbox, and IOSurface come from the OS
 
 ### 13.3 Explicitly Deferred (post-v1)
 

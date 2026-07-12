@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "platform/linux/WsCodec.h"
+#include "platform/WsCodec.h"
 
 // RFC 6455 wire pieces for the control endpoint (ControlServer).
 

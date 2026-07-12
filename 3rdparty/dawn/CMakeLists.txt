@@ -1,19 +1,26 @@
-# Prebuilt Dawn (jhanssen/dawn), one pinned release for both targets:
-#  - native: Vulkan/Wayland bundle with libwebgpu_dawn.a and the Dawn CMake
-#    config; sets Dawn_DIR for find_package(Dawn).
+# Prebuilt Dawn (jhanssen/dawn), one pinned release for every target:
+#  - native Linux: Vulkan/Wayland bundle with libwebgpu_dawn.a and the Dawn
+#    CMake config; sets Dawn_DIR for find_package(Dawn).
+#  - native macOS: Metal bundle (arm64) from the same commit, same layout.
 #  - Emscripten: the emdawnwebgpu port package (text-only) built from the
-#    same commit, so webgpu_cpp.h matches the native bundle exactly; sets
+#    same commit, so webgpu_cpp.h matches the native bundles exactly; sets
 #    DRIFT_EMDAWNWEBGPU_PORT for --use-port.
-# Downloads/extracts on first configure. Both assets are produced by
-# scripts/build-wire-release.sh in the Dawn fork.
-if(NOT EMSCRIPTEN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
+# Downloads/extracts on first configure. The Linux/wasm assets are produced
+# by scripts/build-wire-release.sh in the Dawn fork; the macOS asset by the
+# same recipe with the Metal backend in place of Vulkan/Wayland.
+if(NOT EMSCRIPTEN)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(DAWN_PLATFORM "linux-x86_64-wayland")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        set(DAWN_PLATFORM "macos-arm64")
+    else()
+        message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
+    endif()
 endif()
 
 set(DAWN_VERSION "v20260703-linux-wayland-wire-alpha")
 set(DAWN_COMMIT "b4988e7895f17ec141360722b58923999cee6132")
 set(DAWN_REPO "jhanssen/dawn")
-set(DAWN_PLATFORM "linux-x86_64-wayland")
 set(DAWN_BUILD_TYPE "Release")
 
 if(EMSCRIPTEN)

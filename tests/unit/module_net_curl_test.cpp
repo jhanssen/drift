@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include <curl/curl.h>
 #include <wasm.h>
 #include <wasmtime.h>
 
@@ -19,7 +21,7 @@
 #include "core/Nodes.h"
 #include "platform/ModuleNetCurl.h"
 #include "platform/ModuleWasmtime.h"
-#include "platform/linux/WsCodec.h"
+#include "platform/WsCodec.h"
 
 // The §4.4 native network backend, end to end: the real curl-multi
 // thread against in-process loopback servers — whole-response HTTP
@@ -87,10 +89,13 @@ struct Listener {
 
     bool start(std::function<void(int)> handler)
     {
-        fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        // SOCK_CLOEXEC in socket() is Linux-only; a test helper doesn't
+        // exec, so plain fcntl after the fact covers both platforms.
+        fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             return false;
         }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
         const int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in addr{};
@@ -455,8 +460,27 @@ TEST_CASE("curl backend: cancellation mid-flight, then business as usual")
     net.close(next);
 }
 
+// The compile floor (7.86) is below the ws-enabled-by-default floor
+// (8.11): on a libcurl built without WebSocket (e.g. the macOS system
+// curl), ws handles degrade to the offline face at runtime by design, so
+// the echo tests below can only run where the feature exists.
+bool curlHasWebSocket()
+{
+    const curl_version_info_data* v = curl_version_info(CURLVERSION_NOW);
+    for (const char* const* p = v ? v->protocols : nullptr; p && *p; ++p) {
+        if (std::string_view(*p) == "ws") {
+            return true;
+        }
+    }
+    return false;
+}
+
 TEST_CASE("curl backend: WebSocket — open wake, echo, server close (§4.4)")
 {
+    if (!curlHasWebSocket()) {
+        MESSAGE("libcurl lacks WebSocket support; skipping");
+        return;
+    }
     Listener srv;
     REQUIRE(srv.start(wsHandler));
     const std::string origin = "ws://127.0.0.1:" + std::to_string(srv.port);
@@ -579,6 +603,10 @@ TEST_CASE("curl backend: the whole native chain — wasmtime imports, curl "
 
 TEST_CASE("curl backend: teardown with a live socket does not hang")
 {
+    if (!curlHasWebSocket()) {
+        MESSAGE("libcurl lacks WebSocket support; skipping");
+        return;
+    }
     Listener srv;
     REQUIRE(srv.start(wsHandler));
     const std::string origin = "ws://127.0.0.1:" + std::to_string(srv.port);

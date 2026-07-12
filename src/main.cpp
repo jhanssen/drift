@@ -13,20 +13,30 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
-#include <sys/eventfd.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "core/Renderer.h"
 #include "core/Scene.h"
+#include "platform/ControlServer.h"
 #include "platform/ModuleNetCurl.h"
 #include "platform/ModuleStorageFiles.h"
 #include "platform/ModuleWasmtime.h"
 #include "platform/PackageStore.h"
 #include "platform/ProjectGrants.h"
-#include "platform/linux/ControlServer.h"
+#include "platform/VideoDecoderFFmpeg.h"
+
+#ifdef __APPLE__
+#include "platform/mac/CocoaApp.h"
+#include "platform/mac/Gpu.h"
+using App = drift::platform::CocoaApp;
+#else
+#include <sys/eventfd.h>
+
 #include "platform/linux/Gpu.h"
-#include "platform/linux/VideoDecoderFFmpeg.h"
 #include "platform/linux/WaylandApp.h"
+using App = drift::platform::WaylandApp;
+#endif
 
 namespace {
 
@@ -34,7 +44,12 @@ void usage(const char* argv0)
 {
     fprintf(stderr,
             "usage: %s [scene.sceneproject] [options]\n"
+#ifdef __APPLE__
+            "  (default)          run as wallpaper (not yet available on\n"
+            "                     macOS; pass --windowed)\n"
+#else
             "  (default)          run as wallpaper (wlr-layer-shell background)\n"
+#endif
             "  -w, --windowed     run in a regular window (dev mode)\n"
             "  -f, --fullscreen   run as a fullscreen window (preview without\n"
             "                     other windows covering the wallpaper)\n"
@@ -348,46 +363,67 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
     return 0;
 }
 
-int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
-               uint32_t width, uint32_t height,
-               const std::vector<ParamOverride>& overrides, uint16_t listenPort)
+int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
+           uint32_t width, uint32_t height,
+           const std::vector<ParamOverride>& overrides, uint16_t listenPort)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/true)) {
         return 1;
     }
 
-    // §4.4 network wakes. The eventfd outlives the scenes (declared
+    // §4.4 network wakes. The wake fd outlives the scenes (declared
     // first): ModuleNet deliveries may fire gRequestFrame from the
     // network thread until the last scene's teardown cancels them.
+    // Linux: an eventfd. Elsewhere: a nonblocking self-pipe (a full
+    // pipe already holds a pending wake, so a dropped write is fine).
     struct WakeFd {
-        int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        int readFd = -1, writeFd = -1;
+        WakeFd()
+        {
+#ifdef __linux__
+            readFd = writeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+#else
+            int fds[2];
+            if (pipe(fds) == 0) {
+                for (const int fd : fds) {
+                    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+                    fcntl(fd, F_SETFD, FD_CLOEXEC);
+                }
+                readFd = fds[0];
+                writeFd = fds[1];
+            }
+#endif
+        }
         ~WakeFd()
         {
-            if (fd >= 0) {
-                close(fd);
+            if (readFd >= 0) {
+                close(readFd);
+            }
+            if (writeFd >= 0 && writeFd != readFd) {
+                close(writeFd);
             }
         }
     } wakeFd;
     gNetBackend = drift::platform::createCurlNetBackend();
-    gRequestFrame = [fd = wakeFd.fd] {
+    gRequestFrame = [fd = wakeFd.writeFd] {
         if (fd >= 0) {
             const uint64_t one = 1;
             (void)!write(fd, &one, sizeof(one));
         }
     };
 
-    // Declared before app: ~WaylandApp tears down surfaces, which fires the
+    // Declared before app: app teardown destroys surfaces, which fires the
     // output-removed callback into this map, so it must still be alive then.
     // firstScene likewise — the wake-query callback captures both.
     std::map<uint32_t, std::unique_ptr<drift::core::Scene>> scenes;
     std::unique_ptr<drift::core::Scene> firstScene;
 
-    drift::platform::WaylandApp app;
+    App app;
     if (!app.setup(gpu, mode, width, height)) {
         return 1;
     }
-    app.setWakeFd(wakeFd.fd);
+    app.setWakeFd(wakeFd.readFd);
 
     // Outputs can differ in size, so each gets its own scene instance (with
     // its own graph state and clock); the first one reuses this validation
@@ -654,7 +690,7 @@ int runWayland(const std::string& scenePath, drift::platform::SurfaceMode mode,
     }
 
     return app.run(
-        [&](const drift::platform::WaylandApp::FrameRequest& req) -> bool {
+        [&](const App::FrameRequest& req) -> bool {
             if (scenePath.empty()) {
                 placeholder.render(req.target, (float)req.seconds);
                 return true;
@@ -784,9 +820,18 @@ int main(int argc, char** argv)
                            writeFrames, mouse, overrides);
     }
     if (width == 0) { width = 1280; height = 720; }
-    return runWayland(scenePath,
-                      fullscreen ? drift::platform::SurfaceMode::Fullscreen
-                      : windowed ? drift::platform::SurfaceMode::Windowed
-                                 : drift::platform::SurfaceMode::Wallpaper,
-                      width, height, overrides, listenPort);
+#ifdef __APPLE__
+    // Wallpaper (the default) and fullscreen are not implemented on macOS
+    // yet; refuse rather than silently run something else.
+    if (!windowed || fullscreen) {
+        fprintf(stderr, "drift: only --windowed (and --headless) runs are "
+                        "supported on macOS so far\n");
+        return 2;
+    }
+#endif
+    return runApp(scenePath,
+                  fullscreen ? drift::platform::SurfaceMode::Fullscreen
+                  : windowed ? drift::platform::SurfaceMode::Windowed
+                             : drift::platform::SurfaceMode::Wallpaper,
+                  width, height, overrides, listenPort);
 }

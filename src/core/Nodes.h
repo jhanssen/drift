@@ -208,15 +208,27 @@ private:
 
 #ifndef __EMSCRIPTEN__
     // The zero-copy path is the one sanctioned exception to the portable-API
-    // rule: dmabuf import uses Dawn's SharedTextureMemory extension surface,
-    // which the browser's webgpu.h does not declare. Compiled out for the
-    // web, whose decoder (WebCodecs, §9.2) won't produce dmabuf planes.
+    // rule: dmabuf/IOSurface import uses Dawn's SharedTextureMemory
+    // extension surface, which the browser's webgpu.h does not declare.
+    // Compiled out for the web, whose decoder (WebCodecs, §9.2) won't
+    // produce decoder surfaces.
+#ifdef __APPLE__
+    // IOSurface variant: one multiplanar NV12 texture, sampled through
+    // per-plane views by the same convert pass.
+    bool evaluateZeroCopyIOSurface(FrameContext& ctx, const VideoFrame& frame);
+#else
     bool evaluateZeroCopy(FrameContext& ctx, const VideoFrame& frame);
+#endif
     bool ensureConvertPipeline(FrameContext& ctx);
+    // The YUV->linear-RGB pass shared by both import variants; leaves the
+    // result in mConverted and sets the node output.
+    bool convertYuv(FrameContext& ctx, const VideoFrame& frame,
+                    const wgpu::TextureView& y, const wgpu::TextureView& uv);
 
     struct ImportedSurface {
-        wgpu::SharedTextureMemory memory[2];
-        wgpu::Texture texture[2]; // Y, UV
+        wgpu::SharedTextureMemory memory[2]; // IOSurface: [0] only
+        wgpu::Texture texture[2];            // Y, UV (IOSurface: [0] only)
+        wgpu::TextureView view[2];           // Y, UV plane views
     };
     std::map<uint64_t, ImportedSurface> mSurfaces;
     wgpu::RenderPipeline mConvertPipeline;

@@ -9,13 +9,22 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_vaapi.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#ifdef __linux__
+#include <libavutil/hwcontext_vaapi.h>
+#endif
 }
 
+#ifdef __linux__
 #include <va/va.h>
 #include <va/va_drmcommon.h>
+#endif
+
+#ifdef __APPLE__
+#include <CoreVideo/CVPixelBuffer.h>
+#include <IOSurface/IOSurfaceRef.h>
+#endif
 
 #include <atomic>
 #include <cstdlib>
@@ -147,12 +156,13 @@ public:
         return true;
     }
 
-    // Picks a hardware decode backend per DRIFT_HWDEC (auto|vaapi|cuda|off;
-    // default auto: VAAPI then CUDA) and the decoder implementation that can
-    // drive it. Returns null for software decode (and logs the choice).
-    // Decoded frames transfer back to system memory once and feed the same
-    // swscale path as software; stage two (VAAPI dmabuf zero-copy) builds on
-    // this.
+    // Picks a hardware decode backend per DRIFT_HWDEC (Linux:
+    // auto|vaapi|cuda|off, default auto = VAAPI then CUDA; macOS:
+    // auto|videotoolbox|off) and the decoder implementation that can drive
+    // it. Returns null for software decode (and logs the choice). Decoded
+    // frames either export zero-copy (VAAPI dmabuf / VideoToolbox
+    // IOSurface) or transfer back to system memory once and feed the same
+    // swscale path as software.
     const AVCodec* setupHwDecode(const AVCodec* streamCodec)
     {
         const char* pref = getenv("DRIFT_HWDEC");
@@ -165,8 +175,12 @@ public:
             const char* name;
         };
         const Backend backends[] = {
+#ifdef __APPLE__
+            { AV_HWDEVICE_TYPE_VIDEOTOOLBOX, "videotoolbox" },
+#else
             { AV_HWDEVICE_TYPE_VAAPI, "vaapi" },
             { AV_HWDEVICE_TYPE_CUDA, "cuda" },
+#endif
         };
         for (const Backend& backend : backends) {
             if (pref && *pref && strcmp(pref, "auto") != 0 &&
@@ -204,18 +218,27 @@ public:
             }
             AVBufferRef* device = nullptr;
             if (av_hwdevice_ctx_create(&device, backend.type, nullptr, nullptr,
-                                       0) < 0 &&
-                av_hwdevice_ctx_create(&device, backend.type,
-                                       "/dev/dri/renderD128", nullptr, 0) < 0) {
+                                       0) < 0
+#ifdef __linux__
+                && av_hwdevice_ctx_create(&device, backend.type,
+                                          "/dev/dri/renderD128", nullptr, 0) < 0
+#endif
+            ) {
                 continue;
             }
             mHwDevice = device;
             mHwFormat = hwFormat;
-            // Zero-copy is a VAAPI concept (dmabuf surface export); CUDA
-            // frames have no dmabuf route and always transfer.
+            // Zero-copy needs a surface-export route: VAAPI dmabufs on
+            // Linux, VideoToolbox IOSurfaces on macOS. CUDA frames have
+            // neither and always transfer.
             const char* zc = getenv("DRIFT_ZEROCOPY");
+#ifdef __APPLE__
+            mZeroCopy = backend.type == AV_HWDEVICE_TYPE_VIDEOTOOLBOX &&
+                        !(zc && !strcmp(zc, "off"));
+#else
             mZeroCopy = backend.type == AV_HWDEVICE_TYPE_VAAPI &&
                         !(zc && !strcmp(zc, "off"));
+#endif
             printf("drift: video decode: %s (%s)%s\n", backend.name,
                    found->name, mZeroCopy ? " zero-copy" : "");
             return found;
@@ -377,6 +400,55 @@ private:
         av_packet_free(&packet);
     }
 
+#ifdef __APPLE__
+    // Exports a decoded VideoToolbox frame's IOSurface and queues it. The
+    // AVFrame is cloned so the CVPixelBuffer (and with it the IOSurface)
+    // isn't recycled while the consumer may still sample it.
+    bool exportFrame(AVFrame* frame)
+    {
+        const auto pixelBuffer = (CVPixelBufferRef)frame->data[3];
+        IOSurfaceRef surface =
+            pixelBuffer ? CVPixelBufferGetIOSurface(pixelBuffer) : nullptr;
+        if (!surface) {
+            return false;
+        }
+        // NV12 only (like the dmabuf path); 10-bit and exotic formats fall
+        // back to the transfer path.
+        const OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+        if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
+            format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+            return false;
+        }
+
+        Item item;
+        item.frame.ioSurface = surface;
+        item.frame.surfaceId = IOSurfaceGetID(surface);
+        item.frame.width = (uint32_t)frame->width;
+        item.frame.height = (uint32_t)frame->height;
+        item.frame.index = mNextIndex++;
+        item.frame.bt709 = frame->colorspace == AVCOL_SPC_BT709 ||
+                           (frame->colorspace == AVCOL_SPC_UNSPECIFIED &&
+                            frame->height >= 720);
+        item.frame.fullRange =
+            format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+            frame->color_range == AVCOL_RANGE_JPEG;
+        item.hwFrame = av_frame_clone(frame);
+
+        const int64_t ts = frame->best_effort_timestamp;
+        const double pts = ts != AV_NOPTS_VALUE ? ts * mTimeBase + mLoopOffset
+                                                : mMaxPts + mFrameSeconds;
+        item.pts = pts;
+        mMaxPts = std::max(mMaxPts, pts);
+        av_frame_unref(frame);
+
+        std::unique_lock lock(mMutex);
+        mQueue.push_back(std::move(item));
+        mProduced.notify_all();
+        return true;
+    }
+#endif
+
+#ifdef __linux__
     // Exports a decoded VAAPI frame as dmabuf planes and queues it. The
     // AVFrame is cloned so the surface isn't recycled while the consumer may
     // still sample it.
@@ -452,6 +524,7 @@ private:
         mProduced.notify_all();
         return true;
     }
+#endif // __linux__
 
     bool receiveFrames(AVFrame* frame)
     {
@@ -464,12 +537,18 @@ private:
                 return false;
             }
 
-            // Zero-copy: export the VAAPI surface as per-plane dmabufs (the
-            // portable route: single-plane R8+RG88 imports work even where
-            // tiled multiplanar NV12 does not, e.g. NVIDIA). The consumer
-            // imports them; a failed import flips mZeroCopy off and we fall
+            // Zero-copy: export the decode surface — VAAPI as per-plane
+            // dmabufs (the portable route: single-plane R8+RG88 imports
+            // work even where tiled multiplanar NV12 does not, e.g.
+            // NVIDIA), VideoToolbox as the frame's IOSurface. The consumer
+            // imports it; a failed import flips mZeroCopy off and we fall
             // back to transferring.
-            if (mZeroCopy && frame->format == AV_PIX_FMT_VAAPI) {
+#ifdef __APPLE__
+            constexpr AVPixelFormat kZeroCopyFormat = AV_PIX_FMT_VIDEOTOOLBOX;
+#else
+            constexpr AVPixelFormat kZeroCopyFormat = AV_PIX_FMT_VAAPI;
+#endif
+            if (mZeroCopy && frame->format == kZeroCopyFormat) {
                 if (exportFrame(frame)) {
                     continue;
                 }

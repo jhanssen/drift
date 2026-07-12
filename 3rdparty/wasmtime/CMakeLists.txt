@@ -13,9 +13,15 @@ endif()
 # v46+ release artifacts include the Pulley feature (the §4.5 hardened
 # interpreter default); the v36 LTS line does not ship it.
 set(WASMTIME_VERSION "v46.0.1")
-set(WASMTIME_PLATFORM "x86_64-linux")
-set(WASMTIME_SHA256
-    "4b7e7acf08467de6147f11c8fb71c4db7623035064c096976aa969d54171fed4")
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(WASMTIME_PLATFORM "aarch64-macos")
+    set(WASMTIME_SHA256
+        "f2a33c780715cbe740ca888ed3ee38a197d970800ca1b117b338db3aed819333")
+else()
+    set(WASMTIME_PLATFORM "x86_64-linux")
+    set(WASMTIME_SHA256
+        "4b7e7acf08467de6147f11c8fb71c4db7623035064c096976aa969d54171fed4")
+endif()
 
 set(WASMTIME_ARCHIVE_STEM
     "wasmtime-${WASMTIME_VERSION}-${WASMTIME_PLATFORM}-c-api")
@@ -51,7 +57,12 @@ add_library(wasmtime_prebuilt STATIC IMPORTED GLOBAL)
 set_target_properties(wasmtime_prebuilt PROPERTIES
     IMPORTED_LOCATION "${WASMTIME_EXTRACT_DIR}/lib/libwasmtime.a"
     INTERFACE_INCLUDE_DIRECTORIES "${WASMTIME_EXTRACT_DIR}/include")
-# Wasmtime's static library needs the usual Rust runtime underpinnings.
-target_link_libraries(wasmtime_prebuilt INTERFACE
-    Threads::Threads dl m rt)
+# Wasmtime's static library needs the usual Rust runtime underpinnings
+# (librt is Linux-only; macOS folds it into libSystem).
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_link_libraries(wasmtime_prebuilt INTERFACE Threads::Threads)
+else()
+    target_link_libraries(wasmtime_prebuilt INTERFACE
+        Threads::Threads dl m rt)
+endif()
 add_library(wasmtime::wasmtime ALIAS wasmtime_prebuilt)

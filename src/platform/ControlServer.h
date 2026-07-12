@@ -97,7 +97,9 @@ public:
     ~ControlServer();
 
     bool start(uint16_t port, Callbacks callbacks, std::string& error);
-    int fd() const { return mEpoll; }
+    // The poll set (epoll on Linux, kqueue elsewhere): one fd covering the
+    // listener and every connection; poll it for readability, then drive().
+    int fd() const { return mPoll; }
     void drive();
 
 private:
@@ -119,11 +121,11 @@ private:
     void send(int fd, Client& client, std::string bytes);
     void flush(int fd, Client& client);
     void closeClient(int fd);
-    void updateEpoll(int fd, const Client& client);
+    void updateWatch(int fd, const Client& client);
 
     Callbacks mCallbacks;
     int mListen = -1;
-    int mEpoll = -1;
+    int mPoll = -1;
     std::map<int, Client> mClients;
 };
 
