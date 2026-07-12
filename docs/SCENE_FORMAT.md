@@ -920,6 +920,15 @@ following sharing rules:
   a per-output source (in v1: `mouse`) as a pure optimization; this is
   observable-behavior-neutral and needs no format support.
 
+These rules cover one scene document driving N outputs. A runtime may also
+assign different documents to different outputs (natively: `--output
+NAME=SCENE`); each document then forms its own instance group, with the
+rules above applying within each group and nothing shared across groups
+except process-level control: transport (pause/seek) acts on every group,
+and a control-endpoint parameter set applies to each group that declares
+the parameter. Whole-document control verbs (source/load) assume a single
+document and are not required to serve per-output-scene processes.
+
 ### 17.7 Small Clarifications
 
 Independently adoptable one-liners. The first three codify what the runtime

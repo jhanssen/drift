@@ -808,7 +808,7 @@ To be nailed down on paper before runtime implementation begins:
 - Scene loaded from a local `.sceneproject` directory (JSON; no `scene.bin`)
 - Node types: image texture, video, shader effect, transform/layer (2D position/rotation/scale/anchor as wireable ports), compositor, time/mouse input sources, basic value nodes (remap, wave)
 - Content model: a background layer (image or video) plus animated foreground layers with transparency; all texture edges carry premultiplied alpha
-- Single output first; multi-monitor and hotplug as a fast follow within v1
+- Single output first; multi-monitor and hotplug as a fast follow within v1 — since shipped: one layer surface per output with runtime hotplug, and `--output` (2026-07-12) restricts a process to named outputs or assigns each output its own scene (`--output NAME=SCENE`, one instance group per document per SCENE_FORMAT.md §17.6)
 - Frame-callback-driven rendering with idle pause (occlusion/lock/DPMS handled by compositor callback throttling)
 - Presentation: bypass Dawn's swapchain — render into self-allocated dmabuf textures imported into Dawn, committed to the layer surface via `linux-dmabuf` (prior art: [overdraw](https://github.com/jhanssen/overdraw)); the same dmabuf import path serves zero-copy video decode later
 - Dev modes, first-class from the start: `--windowed` (xdg-toplevel, develop without replacing the wallpaper) and `--headless` (offscreen render, dump frames as PNG — doubles as the golden-image test harness)
