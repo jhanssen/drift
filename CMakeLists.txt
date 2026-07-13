@@ -134,6 +134,12 @@ if(EMSCRIPTEN)
     endforeach()
     target_link_options(drift_web PRIVATE
         "-sALLOW_MEMORY_GROWTH=1"
+        # Emscripten 6.x defaults to resizable-ArrayBuffer memory growth,
+        # but its TextDecoder paths still hand Chrome views of the
+        # resizable heap, which decode() rejects (UTF8ToString throws for
+        # any string over 16 bytes). Pin the classic detach-on-grow
+        # buffers until getUnsharedTextDecoderView guards resizability.
+        "-sGROWABLE_ARRAYBUFFERS=0"
         "-sSTACK_SIZE=1048576"
         "-sENVIRONMENT=web"
         # UTF8ToString/stringToUTF8 are used by the module bridge's EM_JS
