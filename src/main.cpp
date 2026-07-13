@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -140,7 +141,6 @@ static std::function<void()> gRequestFrame;
 // errorsOut (optional) receives the loader's error messages.
 std::unique_ptr<drift::core::Scene> loadScene(
     const std::string& scenePath, const wgpu::Device& device,
-    const std::vector<ParamOverride>& overrides,
     std::string* sceneJsonInOut = nullptr,
     std::vector<std::string>* errorsOut = nullptr)
 {
@@ -236,16 +236,24 @@ std::unique_ptr<drift::core::Scene> loadScene(
         *errorsOut = errors;
     }
     if (scene) {
-        for (const auto& [name, value] : overrides) {
-            if (!scene->setParameter(name, value)) {
-                fprintf(stderr, "drift: --set: no parameter '%s' of that type\n",
-                        name.c_str());
-                return nullptr;
-            }
-        }
         printf("drift: loaded scene '%s'\n", scene->name().c_str());
     }
     return scene;
+}
+
+// --set overrides apply to every scene that declares the parameter (one
+// per-output group need not declare another's, §17.6); acceptedOut
+// collects the names this scene took, so callers can reject an override
+// no scene declares.
+void applyOverrides(drift::core::Scene& scene,
+                    const std::vector<ParamOverride>& overrides,
+                    std::set<std::string>* acceptedOut = nullptr)
+{
+    for (const auto& [name, value] : overrides) {
+        if (scene.setParameter(name, value) && acceptedOut) {
+            acceptedOut->insert(name);
+        }
+    }
 }
 
 // writeFrames: frame indices to write as PNGs; empty = all. Every frame up
@@ -273,9 +281,19 @@ int runHeadless(const std::string& scenePath, int frames, uint32_t width,
     std::unique_ptr<drift::core::Scene> scene;
     drift::core::Renderer placeholder;
     if (!scenePath.empty()) {
-        scene = loadScene(scenePath, device, overrides);
+        scene = loadScene(scenePath, device);
         if (!scene) {
             return 1;
+        }
+        std::set<std::string> accepted;
+        applyOverrides(*scene, overrides, &accepted);
+        for (const auto& [name, value] : overrides) {
+            if (!accepted.contains(name)) {
+                fprintf(stderr,
+                        "drift: --set: no parameter '%s' of that type\n",
+                        name.c_str());
+                return 1;
+            }
         }
     } else if (!placeholder.init(device, format)) {
         fprintf(stderr, "drift: renderer init failed\n");
@@ -469,13 +487,23 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
     // that entry's validation load. nullptr in the scenes map = a load that
     // failed; don't retry per frame.
     drift::core::Renderer placeholder;
+    std::set<std::string> acceptedOverrides;
     for (const auto& [key, path] : scenePaths) {
-        auto scene = loadScene(path, gpu.device(), overrides,
-                               &currentDocs[key]);
+        auto scene = loadScene(path, gpu.device(), &currentDocs[key]);
         if (!scene) {
             return 1;
         }
+        applyOverrides(*scene, overrides, &acceptedOverrides);
         preloaded[key] = std::move(scene);
+    }
+    for (const auto& [name, value] : overrides) {
+        if (!scenePaths.empty() && !acceptedOverrides.contains(name)) {
+            fprintf(stderr,
+                    "drift: --set: no parameter '%s' of that type in any "
+                    "scene\n",
+                    name.c_str());
+            return 1;
+        }
     }
     if (scenePaths.empty() &&
         !placeholder.init(gpu.device(), app.targetFormat())) {
@@ -485,10 +513,29 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
 
     const wgpu::Device device = gpu.device();
     const wgpu::TextureFormat format = app.targetFormat();
+    // Animation is decided over every validation instance — including ones
+    // dropped below — so a named output hotplugging later still ticks.
     bool animated = preloaded.empty(); // the placeholder animates
     for (const auto& [key, scene] : preloaded) {
         animated = animated || scene->animated();
     }
+
+#ifndef __APPLE__
+    // Validation instances for named outputs that are absent would idle
+    // indefinitely (video decoder threads, module instances) — drop them;
+    // the frame callback lazy-loads from the validated document when the
+    // output attaches.
+    {
+        const auto claimed = app.claimedOutputs();
+        std::erase_if(preloaded, [&claimed](const auto& entry) {
+            if (entry.first.empty()) {
+                return claimed.empty(); // default entry: keep if any output
+            }
+            return std::find(claimed.begin(), claimed.end(), entry.first) ==
+                   claimed.end();
+        });
+    }
+#endif
 
     // §4.4 module timers: the run loop asks each output's scene for its
     // earliest wake_after_ms deadline to size its idle sleep.
@@ -535,14 +582,43 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             return nullptr;
         };
         drift::platform::ControlServer::Callbacks callbacks;
-        callbacks.describe = [anyScene] {
+        // Union across instance groups (§17.6): every settable parameter
+        // and sequence is discoverable whichever outputs are attached;
+        // duplicates (the same document on N outputs) collapse by name.
+        callbacks.describe = [&scenes, &preloaded] {
             drift::platform::ControlServer::SceneInfo info;
-            if (drift::core::Scene* scene = anyScene()) {
-                info.loaded = true;
-                info.name = scene->name();
-                info.animated = scene->animated();
-                info.parameters = scene->parameters();
-                info.sequences = drift::platform::sequenceDescs(*scene);
+            auto add = [&info](drift::core::Scene& scene) {
+                if (!info.loaded) {
+                    info.loaded = true;
+                    info.name = scene.name();
+                }
+                info.animated = info.animated || scene.animated();
+                for (const auto& p : scene.parameters()) {
+                    const bool seen = std::any_of(
+                        info.parameters.begin(), info.parameters.end(),
+                        [&p](const auto& q) { return q.name == p.name; });
+                    if (!seen) {
+                        info.parameters.push_back(p);
+                    }
+                }
+                for (auto& seq : drift::platform::sequenceDescs(scene)) {
+                    const bool seen = std::any_of(
+                        info.sequences.begin(), info.sequences.end(),
+                        [&seq](const auto& other) { return other.id == seq.id; });
+                    if (!seen) {
+                        info.sequences.push_back(std::move(seq));
+                    }
+                }
+            };
+            for (auto& [id, scene] : scenes) {
+                if (scene) {
+                    add(*scene);
+                }
+            }
+            for (auto& [key, scene] : preloaded) {
+                if (scene) {
+                    add(*scene);
+                }
             }
             return info;
         };
@@ -552,29 +628,36 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                                      const drift::core::Value& value,
                                      std::string& error,
                                      drift::core::Value& applied) {
-            drift::core::Scene* any = anyScene();
-            if (!any) {
+            if (!anyScene()) {
                 error = "no scene loaded";
                 return false;
             }
-            bool ok = false;
+            drift::core::Scene* accepted = nullptr;
+            auto apply = [&](drift::core::Scene& scene) {
+                if (scene.setParameter(name, value) && !accepted) {
+                    accepted = &scene;
+                }
+            };
             for (auto& [key, scene] : preloaded) {
                 if (scene) {
-                    ok = scene->setParameter(name, value) || ok;
+                    apply(*scene);
                 }
             }
             for (auto& [id, scene] : scenes) {
                 if (scene) {
-                    ok = scene->setParameter(name, value) || ok;
+                    apply(*scene);
                 }
             }
-            if (!ok) {
+            if (!accepted) {
                 error = "no parameter '" + name + "' of that type";
                 return false;
             }
-            for (const auto& p : any->parameters()) {
+            // Post-clamp value (§6) read back from a scene that took the
+            // set — not an arbitrary group, which may not declare the
+            // parameter at all.
+            for (const auto& p : accepted->parameters()) {
                 if (p.name == name) {
-                    applied = p.value; // post-clamp (§6)
+                    applied = p.value;
                     break;
                 }
             }
@@ -610,12 +693,12 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                                    : rereadDisk ? std::string()
                                                 : currentDocs[key];
                 std::vector<std::string> errors;
-                auto scene = loadScene(path, device, overrides, &json,
-                                       &errors);
+                auto scene = loadScene(path, device, &json, &errors);
                 if (!scene) {
                     error = errors.empty() ? "scene load failed" : errors[0];
                     return false;
                 }
+                applyOverrides(*scene, overrides);
                 for (const auto& [name, value] : runtimeParams) {
                     scene->setParameter(name, value);
                 }
@@ -800,9 +883,10 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                            path != scenePaths.end()) {
                     // Late instance (hotplug/reload): same document,
                     // matching runtime state.
-                    instance = loadScene(path->second, device, overrides,
+                    instance = loadScene(path->second, device,
                                          &currentDocs[key]);
                     if (instance) {
+                        applyOverrides(*instance, overrides);
                         for (const auto& [name, value] : runtimeParams) {
                             instance->setParameter(name, value);
                         }

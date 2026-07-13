@@ -64,10 +64,23 @@ public:
     // e.g. "DP-1") is listed; empty = every output. Set before setup().
     // Names need wl_output v4 — on older compositors a filter matches
     // nothing. Filtered-out outputs are released; names requested but not
-    // present attach if the output hotplugs later.
+    // present attach if the output hotplugs later (with a filter, setup()
+    // succeeds even when no output matches yet and waits for hotplug).
     void setOutputFilter(std::vector<std::string> names)
     {
         mOutputFilter = std::move(names);
+    }
+
+    // Connector names of the outputs claimed so far (surfaces created).
+    // After setup() the app uses this to drop validation scene instances
+    // for named outputs that are absent; hotplug re-loads lazily.
+    std::vector<std::string> claimedOutputs() const
+    {
+        std::vector<std::string> names;
+        for (const auto& surf : mSurfaces) {
+            names.push_back(surf->name);
+        }
+        return names;
     }
 
     wgpu::TextureFormat targetFormat() const { return mFormat; }
@@ -175,6 +188,7 @@ public:
         WaylandApp* app = nullptr;
         uint32_t id = 0;  // wl_output registry name; 0 = windowed
         std::string name; // connector name; empty = windowed or wl_output <v4
+        uint32_t outputVersion = 0; // bound wl_output version (release vs destroy)
         wl_output* output = nullptr;
         wl_surface* surface = nullptr;
         zwlr_layer_surface_v1* layerSurface = nullptr;
@@ -220,6 +234,7 @@ public:
         uint32_t id = 0;      // wl_output registry name
         uint32_t version = 0; // bound version
         std::string name;     // connector name; empty until the v4 event
+        bool done = false;    // initial property burst completed
     };
 
     void onGlobal(uint32_t name, const char* interface, uint32_t version);
@@ -246,7 +261,8 @@ public:
 
 private:
     bool createOutputSurface(wl_output* output, uint32_t id,
-                             const std::string& name = {});
+                             const std::string& name = {},
+                             uint32_t outputVersion = 0);
     void destroyOutputSurface(OutputSurface* surf);
     // Resolves a pending output: creates its surface if the filter admits
     // it, releases it otherwise. Removes it from mPendingOutputs.

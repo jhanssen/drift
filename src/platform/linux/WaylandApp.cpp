@@ -226,6 +226,17 @@ const FormatCandidate kFormatCandidates[] = {
 
 constexpr int kBufferCount = 2;
 
+// wl_output gained an explicit release request at v3; plain proxy destroy
+// would leave the server-side resource alive for the connection's lifetime.
+void releaseOutput(wl_output* output, uint32_t version)
+{
+    if (version >= WL_OUTPUT_RELEASE_SINCE_VERSION) {
+        wl_output_release(output);
+    } else {
+        wl_output_destroy(output);
+    }
+}
+
 } // namespace
 
 WaylandApp::~WaylandApp()
@@ -234,7 +245,7 @@ WaylandApp::~WaylandApp()
         destroyOutputSurface(mSurfaces.back().get());
     }
     for (auto& pending : mPendingOutputs) {
-        wl_output_destroy(pending->output);
+        releaseOutput(pending->output, pending->version);
     }
     if (mKeyboard) wl_keyboard_destroy(mKeyboard);
     if (mPointer) wl_pointer_destroy(mPointer);
@@ -325,7 +336,8 @@ void WaylandApp::onGlobalRemove(uint32_t name)
     }
     for (size_t i = 0; i < mPendingOutputs.size(); ++i) {
         if (mPendingOutputs[i]->id == name) {
-            wl_output_destroy(mPendingOutputs[i]->output);
+            releaseOutput(mPendingOutputs[i]->output,
+                          mPendingOutputs[i]->version);
             mPendingOutputs.erase(mPendingOutputs.begin() + i);
             return;
         }
@@ -339,7 +351,10 @@ void WaylandApp::onOutputName(PendingOutput* pending, const char* name)
 
 void WaylandApp::onOutputDone(PendingOutput* pending)
 {
-    if (mSetupDone) { // initial burst: setup() drains after its roundtrips
+    pending->done = true;
+    // During setup the drains adopt: outputs from the initial burst after
+    // the roundtrips, later arrivals after mSetupDone is set.
+    if (mSetupDone) {
         adoptPendingOutput(pending);
     }
 }
@@ -359,10 +374,11 @@ void WaylandApp::adoptPendingOutput(PendingOutput* pending)
         printf("drift: output %s (id %u) not in --output, released\n",
                pending->name.empty() ? "(unnamed)" : pending->name.c_str(),
                pending->id);
-        wl_output_destroy(pending->output);
+        releaseOutput(pending->output, pending->version);
         return;
     }
-    createOutputSurface(pending->output, pending->id, pending->name);
+    createOutputSurface(pending->output, pending->id, pending->name,
+                        pending->version);
 }
 
 void WaylandApp::onDmabufModifier(uint32_t fourcc, uint64_t modifier)
@@ -575,12 +591,14 @@ void WaylandApp::onBufferRelease(wl_buffer* buffer)
 }
 
 bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id,
-                                     const std::string& name)
+                                     const std::string& name,
+                                     uint32_t outputVersion)
 {
     auto surf = std::make_unique<OutputSurface>();
     surf->app = this;
     surf->id = id;
     surf->name = name;
+    surf->outputVersion = outputVersion;
     surf->output = output;
     surf->surface = wl_compositor_create_surface(mCompositor);
 
@@ -644,7 +662,7 @@ void WaylandApp::destroyOutputSurface(OutputSurface* surf)
     if (surf->toplevel) xdg_toplevel_destroy(surf->toplevel);
     if (surf->xdgSurface) xdg_surface_destroy(surf->xdgSurface);
     if (surf->surface) wl_surface_destroy(surf->surface);
-    if (surf->output) wl_output_destroy(surf->output);
+    if (surf->output) releaseOutput(surf->output, surf->outputVersion);
     if (mPointerSurface == surf->surface) {
         mPointerSurface = nullptr;
     }
@@ -699,35 +717,44 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
                     "(required for wallpaper mode; try --windowed)\n");
             return false;
         }
-        // The roundtrips above delivered every initial output's property
-        // burst, so names (v4) are known; resolve them against the filter.
+        // The roundtrips above delivered the full property burst (done
+        // received) of every output in the initial registry burst; resolve
+        // those against the filter. An output announced *during* the
+        // roundtrips may still have its name in flight — it stays pending
+        // and resolves once its done event arrives.
         std::string available;
         for (const auto& pending : mPendingOutputs) {
             available += available.empty() ? "" : ", ";
             available += pending->name.empty() ? "(unnamed)" : pending->name;
         }
-        while (!mPendingOutputs.empty()) {
-            adoptPendingOutput(mPendingOutputs.front().get());
+        for (size_t i = mPendingOutputs.size(); i-- > 0;) {
+            PendingOutput* pending = mPendingOutputs[i].get();
+            if (pending->done || pending->version < 2) { // v1 has no done
+                adoptPendingOutput(pending);
+            }
         }
         if (mSurfaces.empty()) {
-            if (!mOutputFilter.empty()) {
-                fprintf(stderr,
-                        "drift: no output matched --output (available: %s)\n",
-                        available.empty() ? "none" : available.c_str());
-            } else {
+            if (mOutputFilter.empty()) {
                 fprintf(stderr, "drift: no wl_output advertised\n");
+                return false;
             }
-            return false;
-        }
-        for (const auto& want : mOutputFilter) {
-            const bool found = std::any_of(
-                mSurfaces.begin(), mSurfaces.end(),
-                [&want](const auto& surf) { return surf->name == want; });
-            if (!found) {
-                fprintf(stderr,
-                        "drift: --output %s: no such output yet (attaches on "
-                        "hotplug; available: %s)\n",
-                        want.c_str(), available.c_str());
+            // Filtered runs keep going: the named outputs attach when
+            // they appear (the run loop idles on zero surfaces).
+            fprintf(stderr,
+                    "drift: no output matched --output yet (available: %s); "
+                    "waiting for hotplug\n",
+                    available.empty() ? "none" : available.c_str());
+        } else {
+            for (const auto& want : mOutputFilter) {
+                const bool found = std::any_of(
+                    mSurfaces.begin(), mSurfaces.end(),
+                    [&want](const auto& surf) { return surf->name == want; });
+                if (!found) {
+                    fprintf(stderr,
+                            "drift: --output %s: no such output yet (attaches "
+                            "on hotplug; available: %s)\n",
+                            want.c_str(), available.c_str());
+                }
             }
         }
     } else {
@@ -741,13 +768,15 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
     }
 
     // Wait for the initial configure of every surface created so far.
+    // Zero surfaces (a filter with no present match) has nothing to wait
+    // for — the run loop idles until a named output hotplugs.
     auto allConfigured = [this] {
         for (const auto& surf : mSurfaces) {
             if (!surf->configured) {
                 return false;
             }
         }
-        return !mSurfaces.empty();
+        return true;
     };
     while (!allConfigured() && mRunning) {
         if (wl_display_dispatch(mDisplay) == -1) {
@@ -763,6 +792,15 @@ bool WaylandApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t heig
         return false;
     }
     mSetupDone = true;
+    // Outputs whose property burst completed during the configure wait
+    // (announced mid-setup) were parked above; resolve them now. Bursts
+    // still in flight resolve via onOutputDone.
+    for (size_t i = mPendingOutputs.size(); i-- > 0;) {
+        PendingOutput* pending = mPendingOutputs[i].get();
+        if (pending->done || pending->version < 2) {
+            adoptPendingOutput(pending);
+        }
+    }
     return true;
 }
 
