@@ -60,6 +60,8 @@
                      display: flex; flex-direction: column;
                      align-items: center; justify-content: center;
                      gap: 8px; padding: 24px; background: var(--panel); }
+  /* display:flex above beats the hidden attribute's UA display:none. */
+  #nodePreviewPane[hidden] { display: none; }
   #nodePreviewPane canvas {
     max-width: 100%; max-height: calc(100% - 28px);
     border: 1px solid var(--edge);
