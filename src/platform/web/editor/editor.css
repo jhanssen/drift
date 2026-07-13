@@ -53,6 +53,24 @@
      scene — dim it so nobody mistakes it for the edited document. */
   body.draft #canvas { filter: grayscale(.8) brightness(.45); }
   body.draft #canvas { border-color: #e3c56d; }
+  /* Node preview drill-in: covers the graph canvas (below the corner
+     preview thumbnail at z-index 2) while a preview entry tops the view
+     stack. The checkerboard shows through transparent output. */
+  #nodePreviewPane { position: absolute; inset: 0; z-index: 1;
+                     display: flex; flex-direction: column;
+                     align-items: center; justify-content: center;
+                     gap: 8px; padding: 24px; background: var(--panel); }
+  #nodePreviewPane canvas {
+    max-width: 100%; max-height: calc(100% - 28px);
+    border: 1px solid var(--edge);
+    background: repeating-conic-gradient(#2a2a2e 0% 25%, #38383d 0% 50%)
+                0 0 / 16px 16px;
+  }
+  #nodePreviewPane .caption { color: var(--dim); font-size: 11px; }
+  .nodeThumb { display: block; margin: 6px 0; max-width: 100%;
+               border: 1px solid var(--edge);
+               background: repeating-conic-gradient(#2a2a2e 0% 25%,
+                           #38383d 0% 50%) 0 0 / 12px 12px; }
   #graphCanvas { position: absolute; inset: 0; width: 100%; height: 100%;
                  display: block; background: var(--bg); }
   body:not(.graph-mode) #graphCanvas { display: none; }

@@ -17,6 +17,7 @@ import { graphCanvas } from './canvas.js';
 import { startWireDrag, applyWireDrop, openPinEditor,
          unbindPort } from './wiring.js';
 import { enterSubgraph } from './subgraphs.js';
+import { enterNodePreview, previewableNode } from './nodepreview.js';
 import { renderInspector } from './inspector.js';
 
 export function fitGraphView() {
@@ -436,33 +437,48 @@ graphCanvas.addEventListener('wheel', (e) => {
   graphView.y = e.offsetY / next - wy;
 }, { passive: false });
 
-// Double- or middle-click on a graph instance drills into the subgraph
-// (§19.5); double-click elsewhere refits the view.
+// Double- or middle-click opens what a node contains: a graph instance
+// drills into the subgraph (§19.5), a texture-producing node opens its
+// live output preview (shift forces the preview for graph instances,
+// which also emit textures). Double-click elsewhere refits the view.
 function nodeAtClient(clientX, clientY) {
   const { x, y } = graphWorldOf(clientX, clientY);
   return [...(graph?.nodes ?? [])].reverse().find((n) =>
       x >= n.x && x <= n.x + n.w && y >= n.y && y <= n.y + n.h);
 }
 
-graphCanvas.ondblclick = (e) => {
-  const hit = nodeAtClient(e.clientX, e.clientY);
-  if (hit?.source?.type === 'graph' &&
-      typeof hit.source.graph === 'string') {
-    enterSubgraph(hit.source.graph, hit.id);
-    return;
+function openNode(hit, preferPreview) {
+  if (!hit) {
+    return false;
   }
-  fitGraphView();
+  const isGraph = hit.source?.type === 'graph' &&
+                  typeof hit.source.graph === 'string';
+  if (isGraph && !preferPreview) {
+    enterSubgraph(hit.source.graph, hit.id);
+    return true;
+  }
+  if (previewableNode(hit)) {
+    enterNodePreview(hit);
+    return true;
+  }
+  if (isGraph) {
+    enterSubgraph(hit.source.graph, hit.id);
+    return true;
+  }
+  return false;
+}
+
+graphCanvas.ondblclick = (e) => {
+  if (!openNode(nodeAtClient(e.clientX, e.clientY), e.shiftKey)) {
+    fitGraphView();
+  }
 };
 graphCanvas.addEventListener('auxclick', (e) => {
   if (e.button !== 1) {
     return;
   }
   e.preventDefault();
-  const hit = nodeAtClient(e.clientX, e.clientY);
-  if (hit?.source?.type === 'graph' &&
-      typeof hit.source.graph === 'string') {
-    enterSubgraph(hit.source.graph, hit.id);
-  }
+  openNode(nodeAtClient(e.clientX, e.clientY), e.shiftKey);
 });
 
 // ---- asset drag-drop (§5.4): a dropped file lands in the project (working

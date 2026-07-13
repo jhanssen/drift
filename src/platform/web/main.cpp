@@ -1165,6 +1165,64 @@ EMSCRIPTEN_KEEPALIVE int drift_fire(const char* node, const char* port)
     return gApp.scene && gApp.scene->fireEvent(node, port) ? 1 : 0;
 }
 
+// ---- node preview tap (editor thumbnails / drill-in view) ----
+// request encodes the readback; the result arrives via the browser event
+// loop, so the editor polls drift_preview_take on later frames. The taken
+// pixels stay valid until the next successful take.
+
+static std::unique_ptr<drift::core::Scene::NodePreview> gPreview;
+
+EMSCRIPTEN_KEEPALIVE double drift_node_revision(const char* node)
+{
+    return gApp.scene ? (double)gApp.scene->nodeOutputRevision(node) : -1.0;
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_preview_request(const char* node, int maxWidth,
+                                               int maxHeight)
+{
+    if (!gApp.scene || maxWidth <= 0 || maxHeight <= 0) {
+        return 0;
+    }
+    return gApp.scene->requestNodePreview(gApp.device, node,
+                                          (uint32_t)maxWidth,
+                                          (uint32_t)maxHeight)
+               ? 1
+               : 0;
+}
+
+// 1 = ready (dims/data valid), 0 = still pending, -1 = readback failed.
+EMSCRIPTEN_KEEPALIVE int drift_preview_take()
+{
+    if (!gApp.scene) {
+        return -1;
+    }
+    auto preview = gApp.scene->takeNodePreview();
+    if (!preview) {
+        return 0;
+    }
+    if (preview->width == 0) {
+        gPreview = nullptr;
+        return -1;
+    }
+    gPreview = std::move(preview);
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_preview_width()
+{
+    return gPreview ? (int)gPreview->width : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int drift_preview_height()
+{
+    return gPreview ? (int)gPreview->height : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE const uint8_t* drift_preview_data()
+{
+    return gPreview ? gPreview->rgba.data() : nullptr;
+}
+
 // Scene ids bundled under /scenes — the editor's scene picker fills from
 // this, so the CMake preload list stays the single source of truth.
 EMSCRIPTEN_KEEPALIVE const char* drift_scenes()

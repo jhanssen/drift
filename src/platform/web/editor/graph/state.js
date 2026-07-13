@@ -39,19 +39,33 @@ export const activeDoc = () =>
     viewStack.length ? viewStack[viewStack.length - 1].doc : sceneSource;
 export const inSubgraph = () => viewStack.length > 0;
 
+// The node-preview pane registers here so chrome updates can drive it
+// without a module cycle (nodepreview.js imports this module).
+let syncAuxPane = () => {};
+export function setSyncAuxPane(fn) { syncAuxPane = fn; }
+
 export function updateGraphChrome() {
   const showGraph = document.body.classList.contains('graph-mode');
   const view = viewStack[viewStack.length - 1];
+  const inPreview = view?.kind === 'preview';
   document.getElementById('backBtn').hidden = !showGraph || !view;
   const crumb = document.getElementById('crumb');
   crumb.hidden = !showGraph || !view;
   crumb.textContent =
-      view ? 'scene' + viewStack.map((v) => ' ▸ ' + v.path).join('') +
-             (viewReadOnly() ? ' (read-only)' : '') : '';
+      view ? 'scene' + viewStack.map((v) =>
+                 ' ▸ ' + (v.kind === 'preview' ? '👁 ' + v.nodeId : v.path))
+                 .join('') +
+             (!inPreview && viewReadOnly() ? ' (read-only)' : '') : '';
   document.getElementById('flattenBtn').hidden = !showGraph ||
-      viewStack.length !== 1 || !view?.viaInstance;
+      viewStack.length !== 1 || !view?.viaInstance || inPreview;
   document.getElementById('makeSubBtn').hidden =
       !showGraph || !!view || selectedIds.size < 2 || !wasm;
+  if (inPreview) {
+    // The pane covers the canvas; node edits have no visible target.
+    document.getElementById('addNodeBtn').hidden = true;
+    document.getElementById('graphHint').hidden = true;
+  }
+  syncAuxPane();
 }
 
 // §20.6: package graphs come from the store, not the project — the

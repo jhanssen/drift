@@ -55,6 +55,40 @@ export const Module = {
       set(name, v) {
         return set(name, v[0] ?? 0, v[1] ?? 0, v[2] ?? 0, v[3] ?? 0, v.length);
       },
+      nodeRevision: Module.cwrap('drift_node_revision', 'number', ['string']),
+      previewRequest: Module.cwrap('drift_preview_request', 'number',
+          ['string', 'number', 'number']),
+      previewTake: Module.cwrap('drift_preview_take', 'number', []),
+      previewWidth: Module.cwrap('drift_preview_width', 'number', []),
+      previewHeight: Module.cwrap('drift_preview_height', 'number', []),
+      previewData: Module.cwrap('drift_preview_data', 'number', []),
+      // Resolves to ImageData, or null when the node has no texture output
+      // yet (not evaluated / unknown id) or the readback failed. The tap
+      // completes via the browser event loop, hence the rAF polling.
+      nodePreview(id, maxWidth, maxHeight) {
+        if (!this.previewRequest(id, maxWidth, maxHeight)) {
+          return Promise.resolve(null);
+        }
+        return new Promise((resolve) => {
+          const poll = () => {
+            const state = this.previewTake();
+            if (state === 0) {
+              requestAnimationFrame(poll);
+              return;
+            }
+            if (state < 0) {
+              resolve(null);
+              return;
+            }
+            const width = this.previewWidth(), height = this.previewHeight();
+            const ptr = this.previewData();
+            const pixels = new Uint8ClampedArray(
+                Module.HEAPU8.subarray(ptr, ptr + width * height * 4));
+            resolve(new ImageData(pixels, width, height));
+          };
+          requestAnimationFrame(poll);
+        });
+      },
     };
     populateScenes(); // MEMFS is mounted; no need to wait for the scene
     // The scene loads after the async adapter/device dance; poll briefly.

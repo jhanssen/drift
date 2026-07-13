@@ -227,6 +227,17 @@ bool Scene::render(FrameContext& ctx)
             node->paramsChanged = false;
         }
     }
+
+    // Preview revisions: a written texture output invalidates the node's
+    // editor thumbnail.
+    for (auto& node : mNodes) {
+        for (const auto& out : node->outputs) {
+            if (out.dirty && out.value.type == ValueType::Texture) {
+                ++node->textureRevision;
+                break;
+            }
+        }
+    }
     return ctx.presented;
 }
 

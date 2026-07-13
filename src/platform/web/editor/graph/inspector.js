@@ -5,6 +5,7 @@ import { activeSequenceId, setActiveSequenceId,
          refreshTimeline } from '../timeline.js';
 import { graph, selectedNodeId } from './state.js';
 import { parseParamValue, deleteSelectedNode } from './interact.js';
+import { mountInspectorThumb } from './nodepreview.js';
 
 // ---- graph view: inspector -------------------------------------------------
 
@@ -17,6 +18,7 @@ export function renderInspector() {
   }
   section.hidden = !node;
   if (!node) {
+    mountInspectorThumb(null, null);
     return;
   }
   const info = document.getElementById('nodeInfo');
@@ -45,6 +47,7 @@ export function renderInspector() {
   };
   row('id', node.id);
   row('type', node.type);
+  mountInspectorThumb(info, node);
   const props = Object.entries(node.source)
       .filter(([key]) => key !== 'id' && key !== 'type' && key !== 'inputs');
   const unsetProps = nodePropDefs(node.source.type)

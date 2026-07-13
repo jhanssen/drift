@@ -4053,4 +4053,199 @@ void OutputNode::evaluate(FrameContext& ctx)
     ctx.presented = true;
 }
 
+// ---- editor preview tap -----------------------------------------------------
+// Scene methods live here so they can share the file-local shader helpers.
+
+namespace {
+
+// Unpremultiply (§12 edges are premultiplied) and sRGB-encode, matching
+// what the final blit shows on screen; alpha rides along for the editor's
+// checkerboard.
+const char* kPreviewShader = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var src_sampler: sampler;
+
+fn srgbEncode(c: f32) -> f32 {
+    if (c <= 0.0031308) {
+        return c * 12.92;
+    }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+@fragment
+fn drift_preview_fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let c = textureSample(src, src_sampler, uv);
+    let straight = clamp(c.rgb / max(c.a, 1e-4), vec3f(0.0), vec3f(1.0));
+    return vec4f(srgbEncode(straight.r), srgbEncode(straight.g),
+                 srgbEncode(straight.b), c.a);
+}
+)";
+
+} // namespace
+
+struct Scene::PreviewPending {
+    wgpu::Buffer buffer;
+    uint32_t width = 0, height = 0, rowBytes = 0;
+    bool done = false;
+    bool ok = false;
+};
+
+bool Scene::requestNodePreview(const wgpu::Device& device,
+                               const std::string& nodeId, uint32_t maxWidth,
+                               uint32_t maxHeight)
+{
+    if (maxWidth == 0 || maxHeight == 0) {
+        return false;
+    }
+    const Value* tex = nullptr;
+    for (const auto& node : mNodes) {
+        if (node->id != nodeId) {
+            continue;
+        }
+        for (const auto& out : node->outputs) {
+            if (out.value.type == ValueType::Texture && out.value.texture &&
+                out.value.texWidth && out.value.texHeight) {
+                tex = &out.value;
+                break;
+            }
+        }
+        break;
+    }
+    if (!tex) {
+        return false;
+    }
+
+    uint32_t width = tex->texWidth, height = tex->texHeight;
+    if (width > maxWidth) {
+        height = std::max(1u, (uint32_t)llround((double)height * maxWidth /
+                                                width));
+        width = maxWidth;
+    }
+    if (height > maxHeight) {
+        width = std::max(1u, (uint32_t)llround((double)width * maxHeight /
+                                               height));
+        height = maxHeight;
+    }
+
+    if (!mPreviewPipeline) {
+        const std::string source = std::string(kVertexPrelude) + kPreviewShader;
+        wgpu::ShaderModule module = makeModule(device, source);
+        if (!module) {
+            return false;
+        }
+        mPreviewPipeline = makeFullscreenPipeline(
+            device, module, "drift_preview_fs", wgpu::TextureFormat::RGBA8Unorm);
+        if (!mPreviewPipeline) {
+            return false;
+        }
+        mPreviewSampler = makeLinearClampSampler(device);
+    }
+
+    wgpu::TextureDescriptor td{};
+    td.format = wgpu::TextureFormat::RGBA8Unorm;
+    td.size = { width, height, 1 };
+    td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+    wgpu::Texture target = device.CreateTexture(&td);
+
+    auto pending = std::make_shared<PreviewPending>();
+    pending->width = width;
+    pending->height = height;
+    pending->rowBytes = ((width * 4) + 255) & ~255u;
+    wgpu::BufferDescriptor bd{};
+    bd.size = (uint64_t)pending->rowBytes * height;
+    bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+    pending->buffer = device.CreateBuffer(&bd);
+
+    wgpu::BindGroupEntry entries[2] = {};
+    entries[0].binding = 0;
+    entries[0].textureView = tex->texture.CreateView();
+    entries[1].binding = 1;
+    entries[1].sampler = mPreviewSampler;
+    wgpu::BindGroupDescriptor bgDesc{};
+    bgDesc.layout = mPreviewPipeline.GetBindGroupLayout(0);
+    bgDesc.entryCount = 2;
+    bgDesc.entries = entries;
+    wgpu::BindGroup group = device.CreateBindGroup(&bgDesc);
+
+    wgpu::RenderPassColorAttachment attachment{};
+    attachment.view = target.CreateView();
+    attachment.loadOp = wgpu::LoadOp::Clear;
+    attachment.storeOp = wgpu::StoreOp::Store;
+    attachment.clearValue = { 0.0, 0.0, 0.0, 0.0 };
+    wgpu::RenderPassDescriptor rpDesc{};
+    rpDesc.colorAttachmentCount = 1;
+    rpDesc.colorAttachments = &attachment;
+
+    wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rpDesc);
+    pass.SetPipeline(mPreviewPipeline);
+    pass.SetBindGroup(0, group);
+    pass.Draw(3);
+    pass.End();
+    wgpu::TexelCopyTextureInfo src{};
+    src.texture = target;
+    wgpu::TexelCopyBufferInfo dst{};
+    dst.buffer = pending->buffer;
+    dst.layout.bytesPerRow = pending->rowBytes;
+    dst.layout.rowsPerImage = height;
+    wgpu::Extent3D extent = { width, height, 1 };
+    encoder.CopyTextureToBuffer(&src, &dst, &extent);
+    wgpu::CommandBuffer commands = encoder.Finish();
+    device.GetQueue().Submit(1, &commands);
+
+    pending->buffer.MapAsync(wgpu::MapMode::Read, 0, bd.size,
+                             wgpu::CallbackMode::AllowSpontaneous,
+                             [pending](wgpu::MapAsyncStatus status,
+                                       wgpu::StringView) {
+                                 pending->done = true;
+                                 pending->ok =
+                                     status == wgpu::MapAsyncStatus::Success;
+                             });
+    mPreviewPending = std::move(pending);
+    return true;
+}
+
+std::unique_ptr<Scene::NodePreview> Scene::takeNodePreview()
+{
+    if (!mPreviewPending || !mPreviewPending->done) {
+        return nullptr;
+    }
+    auto pending = std::move(mPreviewPending);
+    auto preview = std::make_unique<NodePreview>();
+    if (!pending->ok) {
+        return preview; // 0x0 = readback failed
+    }
+    preview->width = pending->width;
+    preview->height = pending->height;
+    preview->rgba.resize((size_t)pending->width * pending->height * 4);
+    const auto* mapped = (const uint8_t*)pending->buffer.GetConstMappedRange(
+        0, (uint64_t)pending->rowBytes * pending->height);
+    if (!mapped) {
+        return std::make_unique<NodePreview>();
+    }
+    for (uint32_t y = 0; y < pending->height; ++y) {
+        std::memcpy(preview->rgba.data() + (size_t)y * pending->width * 4,
+                    mapped + (size_t)y * pending->rowBytes,
+                    (size_t)pending->width * 4);
+    }
+    pending->buffer.Unmap();
+    return preview;
+}
+
+int64_t Scene::nodeOutputRevision(const std::string& nodeId) const
+{
+    for (const auto& node : mNodes) {
+        if (node->id != nodeId) {
+            continue;
+        }
+        for (const auto& out : node->outputs) {
+            if (out.value.type == ValueType::Texture) {
+                return (int64_t)node->textureRevision;
+            }
+        }
+        return -1;
+    }
+    return -1;
+}
+
 } // namespace drift::core

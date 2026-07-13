@@ -98,6 +98,9 @@ public:
     std::vector<Output> outputs;
     bool firstEvaluate = true;
     bool paramsChanged = false; // a bound scene parameter changed (§11)
+    // Bumped by Scene::render whenever a texture output was written this
+    // frame; editors poll it to refresh node previews only on change.
+    uint64_t textureRevision = 0;
 };
 
 // A user-tweakable scene parameter (§6): declaration metadata plus the
@@ -170,6 +173,26 @@ public:
     // one: downstream consumers see it dirty for that one frame.
     bool fireEvent(const std::string& nodeId, const std::string& port);
 
+    // Editor preview tap: downscales a node's current texture output into
+    // a straight-alpha, sRGB-encoded RGBA8 thumbnail (internal edges are
+    // premultiplied linear, §12). request encodes the GPU work against the
+    // last evaluated output and returns false when the node is unknown or
+    // holds no texture yet; the readback completes via the device's
+    // callback processing, so poll take on later frames. One request in
+    // flight; a newer request supersedes an unclaimed result. take returns
+    // nullptr while pending and a 0x0 preview on readback failure.
+    struct NodePreview {
+        uint32_t width = 0, height = 0;
+        std::vector<uint8_t> rgba;
+    };
+    bool requestNodePreview(const wgpu::Device& device,
+                            const std::string& nodeId, uint32_t maxWidth,
+                            uint32_t maxHeight);
+    std::unique_ptr<NodePreview> takeNodePreview();
+    // The node's texture-output revision (see Node::textureRevision), or
+    // -1 for an unknown node or one that never produces a texture.
+    int64_t nodeOutputRevision(const std::string& nodeId) const;
+
 private:
     Scene() = default;
     friend struct SceneBuilder;
@@ -187,6 +210,13 @@ private:
     // 1x1 transparent texture: what a feedback edge reads before its
     // producer has ever been written (§10 first-frame rule).
     wgpu::Texture mBlank;
+
+    // Preview tap state (implementation lives in Nodes.cpp beside the
+    // shared shader helpers).
+    wgpu::RenderPipeline mPreviewPipeline;
+    wgpu::Sampler mPreviewSampler;
+    struct PreviewPending;
+    std::shared_ptr<PreviewPending> mPreviewPending;
 };
 
 } // namespace drift::core
