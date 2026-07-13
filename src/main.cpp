@@ -76,6 +76,9 @@ void usage(const char* argv0)
             "                     wallpaper: run SCENE on output NAME\n"
             "                     (repeatable; replaces the scene argument;\n"
             "                     unlisted outputs are left unclaimed)\n"
+            "      --fps N        present at most N frames per second (default:\n"
+            "                     display rate; scene time is unaffected —\n"
+            "                     animations play at speed with fewer frames)\n"
             "      --out DIR      output directory for --headless (default .)\n"
             "      --listen PORT  WebSocket control endpoint on 127.0.0.1:PORT\n"
             "                     (describe/set; not available with --headless)\n"
@@ -397,7 +400,8 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
            uint32_t width, uint32_t height,
            const std::vector<ParamOverride>& overrides, uint16_t listenPort,
            const std::vector<std::string>& outputFilter,
-           const std::vector<std::pair<std::string, std::string>>& outputScenes)
+           const std::vector<std::pair<std::string, std::string>>& outputScenes,
+           double maxFrameRate)
 {
     drift::platform::Gpu gpu;
     if (!gpu.init(/*needPresent=*/true)) {
@@ -470,6 +474,9 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
     std::map<std::string, std::string> currentDocs;
 
     App app;
+    if (maxFrameRate > 0.0) {
+        app.setMaxFrameRate(maxFrameRate);
+    }
     // Wallpaper mode only claims the outputs scenes were assigned to;
     // empty = all of them.
     std::vector<std::string> filter = outputFilter;
@@ -922,6 +929,7 @@ int main(int argc, char** argv)
     bool fullscreen = false;
     int headlessFrames = -1;
     uint16_t listenPort = 0;
+    double maxFrameRate = 0.0; // 0 = display rate
     uint32_t width = 0, height = 0;
     std::string outDir = ".";
     std::string scenePath;
@@ -1001,6 +1009,14 @@ int main(int argc, char** argv)
                     outputFilter.push_back(name);
                 }
             }
+        } else if (!strcmp(arg, "--fps") && i + 1 < argc) {
+            char* end = nullptr;
+            maxFrameRate = strtod(argv[++i], &end);
+            if (end == argv[i] || *end != '\0' || maxFrameRate <= 0.0 ||
+                maxFrameRate > 1000.0) {
+                fprintf(stderr, "drift: bad --fps '%s'\n", argv[i]);
+                return 2;
+            }
         } else if (!strcmp(arg, "--out") && i + 1 < argc) {
             outDir = argv[++i];
         } else if (!strcmp(arg, "--listen") && i + 1 < argc) {
@@ -1045,6 +1061,12 @@ int main(int argc, char** argv)
             fprintf(stderr, "drift: --listen is not available with --headless\n");
             return 2;
         }
+        if (maxFrameRate > 0.0) {
+            // Headless advances a fixed 1/60s step per frame; a
+            // presentation cap has nothing to act on.
+            fprintf(stderr, "drift: --fps is not available with --headless\n");
+            return 2;
+        }
         if (width == 0) { width = 1920; height = 1080; }
         return runHeadless(scenePath, headlessFrames, width, height, outDir,
                            writeFrames, mouse, overrides);
@@ -1064,5 +1086,5 @@ int main(int argc, char** argv)
                   : windowed ? drift::platform::SurfaceMode::Windowed
                              : drift::platform::SurfaceMode::Wallpaper,
                   width, height, overrides, listenPort, outputFilter,
-                  outputScenes);
+                  outputScenes, maxFrameRate);
 }

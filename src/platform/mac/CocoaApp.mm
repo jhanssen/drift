@@ -118,6 +118,7 @@ struct CocoaApp::Impl {
     bool started = false; // run() reached; display links may tick
     bool scenePaused = false;
     bool bypassSwapchain = false; // DRIFT_PRESENT=iosurface
+    double maxFrameRate = 0.0;    // 0 = display rate
     double startTime = 0.0;
 
     double now() const
@@ -801,6 +802,12 @@ bool CocoaApp::Impl::createOutput(NSScreen* screen)
     // Common modes keep frames coming during live window resize.
     [surf->link addToRunLoop:[NSRunLoop mainRunLoop]
                      forMode:NSRunLoopCommonModes];
+    if (maxFrameRate > 0.0) {
+        // A maximum: the link ticks at the nearest achievable rate (a
+        // divisor of a fixed display's refresh).
+        surf->link.preferredFrameRateRange = CAFrameRateRangeMake(
+            1.0f, (float)maxFrameRate, (float)maxFrameRate);
+    }
     surf->link.paused = YES; // kick() unpauses once run() has started
 
     if (screen) {
@@ -1059,6 +1066,11 @@ void CocoaApp::setWakeQuery(WakeQuery query)
 void CocoaApp::setAnimatedQuery(AnimatedQuery query)
 {
     mImpl->animatedQuery = std::move(query);
+}
+
+void CocoaApp::setMaxFrameRate(double fps)
+{
+    mImpl->maxFrameRate = fps;
 }
 
 void CocoaApp::requestRedrawAll()

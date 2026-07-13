@@ -143,6 +143,13 @@ public:
         mAnimatedQuery = std::move(query);
     }
 
+    // Present at most fps frames per second (0 = compositor rate). Set
+    // before setup(). NOT ENFORCED YET on this backend — the run loop's
+    // pacing (wp_commit_timing_v1 latch timestamps where available, timer
+    // pacing otherwise) is pending; until then the cap is stored and
+    // ignored.
+    void setMaxFrameRate(double fps) { mMaxFrameRate = fps; }
+
     // Requests a redraw on every surface (a parameter changed): the frame
     // evaluates the graph, which decides what actually re-executes (§11) —
     // for non-animated scenes this is the only wakeup a set would get.
@@ -335,6 +342,7 @@ private:
     int mWakeFd = -1;
     WakeQuery mWakeQuery;
     AnimatedQuery mAnimatedQuery;
+    double mMaxFrameRate = 0.0; // 0 = uncapped; see setMaxFrameRate
     double mStartTime = 0.0;
 };
 

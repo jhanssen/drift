@@ -100,6 +100,11 @@ public:
     using AnimatedQuery = std::function<bool(uint32_t outputId)>;
     void setAnimatedQuery(AnimatedQuery query);
 
+    // Present at most fps frames per second (0 = display rate). A maximum:
+    // the display link picks the nearest rate it can honor (a divisor of a
+    // fixed display's refresh). Set before setup().
+    void setMaxFrameRate(double fps);
+
     // Requests a redraw (a parameter changed): the frame evaluates the
     // graph, which decides what actually re-executes (§11).
     void requestRedrawAll();
