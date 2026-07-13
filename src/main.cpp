@@ -465,18 +465,13 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
     std::map<std::string, std::string> currentDocs;
 
     App app;
-#ifndef __APPLE__
     // Wallpaper mode only claims the outputs scenes were assigned to;
-    // empty = all of them. (macOS has no wallpaper mode yet, and main()
-    // refuses --output there.)
+    // empty = all of them.
     std::vector<std::string> filter = outputFilter;
     for (const auto& [name, path] : outputScenes) {
         filter.push_back(name);
     }
     app.setOutputFilter(std::move(filter));
-#else
-    (void)outputFilter;
-#endif
     if (!app.setup(gpu, mode, width, height)) {
         return 1;
     }
@@ -513,14 +508,7 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
 
     const wgpu::Device device = gpu.device();
     const wgpu::TextureFormat format = app.targetFormat();
-    // Animation is decided over every validation instance — including ones
-    // dropped below — so a named output hotplugging later still ticks.
-    bool animated = preloaded.empty(); // the placeholder animates
-    for (const auto& [key, scene] : preloaded) {
-        animated = animated || scene->animated();
-    }
 
-#ifndef __APPLE__
     // Validation instances for named outputs that are absent would idle
     // indefinitely (video decoder threads, module instances) — drop them;
     // the frame callback lazy-loads from the validated document when the
@@ -535,7 +523,21 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
                    claimed.end();
         });
     }
-#endif
+
+    // Animation is decided per output: only outputs whose scene animates
+    // are timer-ticked, so a static entry idles even while another
+    // output's scene animates (§11). An output not yet instantiated
+    // counts as animated until its first frame settles the answer.
+    app.setAnimatedQuery([&scenes, &scenePaths](uint32_t outputId) -> bool {
+        if (scenePaths.empty()) {
+            return true; // the builtin placeholder animates
+        }
+        auto it = scenes.find(outputId);
+        if (it == scenes.end()) {
+            return true;
+        }
+        return it->second && it->second->animated();
+    });
 
     // §4.4 module timers: the run loop asks each output's scene for its
     // earliest wake_after_ms deadline to size its idle sleep.
@@ -865,16 +867,12 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             }
             auto it = scenes.find(req.outputId);
             if (it == scenes.end()) {
-#ifdef __APPLE__
-                // Single window; --output is refused on macOS so far.
-                const std::string key;
-#else
                 // The entry assigned to this output, else the ""-keyed
-                // default (the positional scene).
+                // default (the positional scene; also every unnamed
+                // output — the dev window, mac).
                 const std::string key =
                     scenePaths.contains(req.outputName) ? req.outputName
                                                         : std::string();
-#endif
                 std::unique_ptr<drift::core::Scene> instance;
                 if (auto pre = preloaded.find(key); pre != preloaded.end()) {
                     instance = std::move(pre->second);
@@ -908,8 +906,7 @@ int runApp(const std::string& scenePath, drift::platform::SurfaceMode mode,
             ctx.targetHeight = req.height;
             ctx.targetFormat = format;
             return it->second->render(ctx);
-        },
-        animated);
+        });
 }
 
 } // namespace

@@ -1005,10 +1005,15 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     surf.framePending = true;
 }
 
-int WaylandApp::run(RenderFrame renderFrame, bool animated)
+int WaylandApp::run(RenderFrame renderFrame)
 {
     mRenderFrame = std::move(renderFrame);
-    mAnimated = animated;
+    // Per-output: only outputs whose scene animates are timer-ticked.
+    // Unresolved (not yet drawn) outputs count as animated until their
+    // first frame instantiates the scene and settles the answer.
+    auto animatedFor = [this](const OutputSurface& surf) {
+        return !mAnimatedQuery || mAnimatedQuery(surf.id);
+    };
     for (auto& surf : mSurfaces) {
         drawFrame(*surf);
     }
@@ -1036,17 +1041,16 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
         }
         wl_display_flush(mDisplay);
 
-        // Animated scene with at least one surface not mid-commit: tick at
-        // ~60Hz so time keeps flowing — the ticks are CPU-side value-graph
-        // evaluations only unless something dirties. Otherwise sleep until
-        // an event or frame callback.
+        // An animated output not mid-commit ticks at ~60Hz so time keeps
+        // flowing — the ticks are CPU-side value-graph evaluations only
+        // unless something dirties. Static outputs sleep until an event,
+        // frame callback, or armed module-timer deadline.
         bool tick = false;
-        if (mAnimated) {
-            for (const auto& surf : mSurfaces) {
-                if (surf->configured && !surf->framePending) {
-                    tick = true;
-                    break;
-                }
+        for (const auto& surf : mSurfaces) {
+            if (surf->configured && !surf->framePending &&
+                animatedFor(*surf)) {
+                tick = true;
+                break;
             }
         }
         int timeout = tick ? 16 : -1;
@@ -1058,12 +1062,13 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
         // wakeups (control traffic, pointer events) then shrink the
         // remaining wait instead of restarting it. A paused clock can
         // never reach a scene-time deadline, so paused surfaces do not
-        // arm (and do not wake the loop).
-        if (!tick && mWakeQuery) {
+        // arm (and do not wake the loop); animated surfaces do not arm
+        // because their ticks consume deadlines as they come due.
+        if (mWakeQuery) {
             const double tnow = now();
             for (const auto& surf : mSurfaces) {
                 if (!surf->configured || surf->framePending ||
-                    mScenePaused) {
+                    mScenePaused || animatedFor(*surf)) {
                     surf->wakeDueWall = -1.0;
                     continue;
                 }
@@ -1102,9 +1107,17 @@ int WaylandApp::run(RenderFrame renderFrame, bool animated)
                 return 1;
             }
             if (ready == 0) {
+                // Timeout: tick animated outputs; a static output draws
+                // only when its armed module-timer deadline is due.
+                const double tnow = now();
                 for (size_t i = 0; i < mSurfaces.size(); ++i) {
                     OutputSurface* surf = mSurfaces[i].get();
-                    if (!surf->framePending) {
+                    if (surf->framePending) {
+                        continue;
+                    }
+                    if (animatedFor(*surf) ||
+                        (surf->wakeDueWall >= 0.0 &&
+                         tnow >= surf->wakeDueWall)) {
                         drawFrame(*surf);
                     }
                 }

@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "Gpu.h"
 
@@ -35,15 +37,23 @@ public:
     // points; rendering happens at physical pixels (backing scale).
     bool setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t height);
 
+    // Interface parity with the Wayland layer's per-output claims: no
+    // output names exist here, so the filter is a no-op and the single
+    // window claims the unnamed ("") output.
+    void setOutputFilter(std::vector<std::string> names) { (void)names; }
+    std::vector<std::string> claimedOutputs() const { return { {} }; }
+
     wgpu::TextureFormat targetFormat() const;
 
-    // One render callback invocation per frame. outputId is 0 (single
-    // window). seconds is the scene clock: capped per-frame deltas, frozen
-    // across pauses (occlusion, miniaturization) per SCENE_FORMAT.md §9.7.
-    // Returns whether the target was written; when false nothing is
-    // presented (§11) and the previous frame stays on screen.
+    // One render callback invocation per frame. outputId is 0 and
+    // outputName is empty (single window). seconds is the scene clock:
+    // capped per-frame deltas, frozen across pauses (occlusion,
+    // miniaturization) per SCENE_FORMAT.md §9.7. Returns whether the
+    // target was written; when false nothing is presented (§11) and the
+    // previous frame stays on screen.
     struct FrameRequest {
         uint32_t outputId = 0;
+        std::string outputName;
         wgpu::TextureView target;
         uint32_t width = 0, height = 0;
         double seconds = 0.0;
@@ -72,6 +82,11 @@ public:
     using WakeQuery = std::function<double(uint32_t outputId)>;
     void setWakeQuery(WakeQuery query);
 
+    // Whether an output's scene animates (advances with time): consulted
+    // per display-link tick so a static scene quiesces. Unset = animated.
+    using AnimatedQuery = std::function<bool(uint32_t outputId)>;
+    void setAnimatedQuery(AnimatedQuery query);
+
     // Requests a redraw (a parameter changed): the frame evaluates the
     // graph, which decides what actually re-executes (§11).
     void requestRedrawAll();
@@ -88,10 +103,10 @@ public:
     // caller handles backward by re-creating the scene instances).
     void seekSceneTime(double seconds);
 
-    // Frame loop until the window closes (or Esc). animated: frames are
-    // produced continuously at the display rate; non-animated scenes render
-    // only on input/resize/wake events.
-    int run(RenderFrame renderFrame, bool animated);
+    // Frame loop until the window closes (or Esc). Animated scenes (per
+    // the animated query) produce frames continuously at the display rate;
+    // static scenes render only on input/resize/wake events.
+    int run(RenderFrame renderFrame);
 
     struct Impl; // all Cocoa state lives in the .mm
 

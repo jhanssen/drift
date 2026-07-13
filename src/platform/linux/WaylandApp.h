@@ -134,6 +134,15 @@ public:
     using WakeQuery = std::function<double(uint32_t outputId)>;
     void setWakeQuery(WakeQuery query) { mWakeQuery = std::move(query); }
 
+    // Whether an output's scene animates (advances with time): consulted
+    // per loop iteration, so only animated outputs are timer-ticked and a
+    // static scene's output idles at zero cost (§11). Unset = animated.
+    using AnimatedQuery = std::function<bool(uint32_t outputId)>;
+    void setAnimatedQuery(AnimatedQuery query)
+    {
+        mAnimatedQuery = std::move(query);
+    }
+
     // Requests a redraw on every surface (a parameter changed): the frame
     // evaluates the graph, which decides what actually re-executes (§11) —
     // for non-animated scenes this is the only wakeup a set would get.
@@ -172,11 +181,11 @@ public:
         }
     }
 
-    // Frame loop until the (windowed) surface is closed. animated: the
-    // scene advances with time, so frames are produced continuously
+    // Frame loop until the (windowed) surface is closed. Outputs whose
+    // scene animates (per the animated query) produce frames continuously
     // (frame-callback throttled, timer-ticked while nothing commits);
-    // non-animated scenes render only on input/configure events.
-    int run(RenderFrame renderFrame, bool animated);
+    // static outputs render only on input/configure/wake events.
+    int run(RenderFrame renderFrame);
 
     // -- internal, public for C listener trampolines --
     struct Buffer {
@@ -318,7 +327,6 @@ private:
     wgpu::TextureFormat mFormat = wgpu::TextureFormat::Undefined;
 
     bool mRunning = true;
-    bool mAnimated = false;
     bool mScenePaused = false;
     RenderFrame mRenderFrame;
     OutputRemoved mOutputRemoved;
@@ -326,6 +334,7 @@ private:
     std::function<void()> mControlCb;
     int mWakeFd = -1;
     WakeQuery mWakeQuery;
+    AnimatedQuery mAnimatedQuery;
     double mStartTime = 0.0;
 };
 

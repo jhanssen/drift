@@ -41,6 +41,7 @@ struct CocoaApp::Impl {
     RenderFrame renderFrame;
     OutputRemoved outputRemoved;
     WakeQuery wakeQuery;
+    AnimatedQuery animatedQuery;
     int controlFd = -1;
     std::function<void()> controlCb;
     int wakeFd = -1;
@@ -49,7 +50,6 @@ struct CocoaApp::Impl {
     NSTimer* wakeTimer = nil;
 
     bool running = true;
-    bool animated = false;
     bool scenePaused = false;
     bool visible = true;
     bool wantRedraw = false;
@@ -73,6 +73,12 @@ struct CocoaApp::Impl {
         timespec ts{};
         clock_gettime(CLOCK_MONOTONIC, &ts);
         return (ts.tv_sec + ts.tv_nsec * 1e-9) - startTime;
+    }
+
+    // Re-asked as instances come and go (outputId is always 0 here).
+    bool animated() const
+    {
+        return !animatedQuery || animatedQuery(0);
     }
 
     void kick()
@@ -118,7 +124,7 @@ struct CocoaApp::Impl {
         visible = nowVisible;
         if (visible) {
             // Frames resume; the capped clock delta absorbs the gap (§9.7).
-            if (animated || wantRedraw) {
+            if (animated() || wantRedraw) {
                 kick();
             }
             armWakeTimer();
@@ -232,12 +238,14 @@ struct CocoaApp::Impl {
         if (!running) {
             return;
         }
-        const bool draw = animated || wantRedraw;
+        const bool draw = animated() || wantRedraw;
         wantRedraw = false;
         if (draw) {
             drawFrame();
         }
-        if (!animated && !wantRedraw) {
+        // Re-asked after the draw: the first frame may have just
+        // instantiated the scene and settled whether it animates.
+        if (!animated() && !wantRedraw) {
             link.paused = YES;
             armWakeTimer();
         }
@@ -261,7 +269,7 @@ struct CocoaApp::Impl {
     void armWakeTimer()
     {
         disarmWakeTimer();
-        if (animated || scenePaused || !visible || !wakeQuery || !running) {
+        if (animated() || scenePaused || !visible || !wakeQuery || !running) {
             wakeDueWall = -1.0;
             return;
         }
@@ -576,6 +584,11 @@ void CocoaApp::setWakeQuery(WakeQuery query)
     mImpl->wakeQuery = std::move(query);
 }
 
+void CocoaApp::setAnimatedQuery(AnimatedQuery query)
+{
+    mImpl->animatedQuery = std::move(query);
+}
+
 void CocoaApp::requestRedrawAll()
 {
     mImpl->requestRedraw();
@@ -610,11 +623,10 @@ void CocoaApp::seekSceneTime(double seconds)
     mImpl->requestRedraw();
 }
 
-int CocoaApp::run(RenderFrame renderFrame, bool animated)
+int CocoaApp::run(RenderFrame renderFrame)
 {
     Impl& impl = *mImpl;
     impl.renderFrame = std::move(renderFrame);
-    impl.animated = animated;
 
     DriftLinkTarget* linkTarget = [DriftLinkTarget new];
     linkTarget.impl = &impl;
