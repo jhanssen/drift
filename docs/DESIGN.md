@@ -804,7 +804,7 @@ To be nailed down on paper before runtime implementation begins:
 
 ### 13.2 V1 Scope
 
-- Native runtime only, Wayland only (layer-shell compositors; GNOME out of scope) — since joined by a macOS runtime (2026-07-12): Metal presentation through a CAMetalLayer-backed `wgpu::Surface`, `--windowed` and `--headless` modes (wallpaper and fullscreen still pending there), VideoToolbox decode with IOSurface zero-copy import
+- Native runtime only, Wayland only (layer-shell compositors; GNOME out of scope) — since joined by a macOS runtime (2026-07-12): Metal presentation through CAMetalLayer-backed `wgpu::Surface`s, wallpaper (desktop-level window per display with hotplug, `--output` by display name), `--windowed`, and `--headless` modes (fullscreen still pending there), VideoToolbox decode with IOSurface zero-copy import
 - Scene loaded from a local `.sceneproject` directory (JSON; no `scene.bin`)
 - Node types: image texture, video, shader effect, transform/layer (2D position/rotation/scale/anchor as wireable ports), compositor, time/mouse input sources, basic value nodes (remap, wave)
 - Content model: a background layer (image or video) plus animated foreground layers with transparency; all texture edges carry premultiplied alpha

@@ -46,8 +46,8 @@ void usage(const char* argv0)
     fprintf(stderr,
             "usage: %s [scene.sceneproject] [options]\n"
 #ifdef __APPLE__
-            "  (default)          run as wallpaper (not yet available on\n"
-            "                     macOS; pass --windowed)\n"
+            "  (default)          run as wallpaper (desktop-level window\n"
+            "                     per display, behind the icons)\n"
 #else
             "  (default)          run as wallpaper (wlr-layer-shell background)\n"
 #endif
@@ -65,7 +65,12 @@ void usage(const char* argv0)
             "      --size WxH     initial window size / headless resolution\n"
             "                     (default 1280x720 windowed, 1920x1080 headless)\n"
             "      --output NAMES wallpaper: only claim the named outputs\n"
+#ifdef __APPLE__
+            "                     (comma-separated display names, e.g.\n"
+            "                     'Built-in Retina Display';\n"
+#else
             "                     (comma-separated connector names, e.g. DP-1;\n"
+#endif
             "                     repeatable; default: every output)\n"
             "      --output NAME=SCENE\n"
             "                     wallpaper: run SCENE on output NAME\n"
@@ -1046,11 +1051,11 @@ int main(int argc, char** argv)
     }
     if (width == 0) { width = 1280; height = 720; }
 #ifdef __APPLE__
-    // Wallpaper (the default) and fullscreen are not implemented on macOS
-    // yet; refuse rather than silently run something else.
-    if (!windowed || fullscreen) {
-        fprintf(stderr, "drift: only --windowed (and --headless) runs are "
-                        "supported on macOS so far\n");
+    // Fullscreen is not implemented on macOS yet; refuse rather than
+    // silently run something else.
+    if (fullscreen) {
+        fprintf(stderr,
+                "drift: --fullscreen is not supported on macOS so far\n");
         return 2;
     }
 #endif

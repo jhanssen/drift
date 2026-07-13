@@ -1,15 +1,17 @@
 #pragma once
 
-// Cocoa presentation: a dev window backed by a CAMetalLayer that Dawn
-// presents through a wgpu::Surface. Windowed mode only so far — wallpaper
-// (per-screen desktop-level windows) and fullscreen are future work, and
-// setup() refuses those modes.
+// Cocoa presentation: CAMetalLayer-backed windows that Dawn presents
+// through wgpu::Surfaces. Wallpaper mode creates one borderless window per
+// NSScreen at desktop level (behind the icons; all Spaces; mouse-
+// transparent, so the pointer arrives via a global monitor) with runtime
+// display hotplug; windowed dev mode creates a single titled window.
+// Fullscreen is future work and setup() refuses it.
 //
 // Mirrors WaylandApp's contract so main.cpp drives either through one
-// alias: the same FrameRequest/RenderFrame shapes, the same scene-clock
-// rules (capped resume deltas per SCENE_FORMAT.md §9.7; only an armed
-// module-timer sleep may stride past the cap; occlusion freezes the
-// clock), and the same control/wake fd integration.
+// alias: the same FrameRequest/RenderFrame shapes, the same per-surface
+// scene-clock rules (capped resume deltas per SCENE_FORMAT.md §9.7; only
+// an armed module-timer sleep may stride past the cap; occlusion freezes
+// the clock), and the same control/wake fd integration.
 
 #include <cstdint>
 #include <functional>
@@ -22,7 +24,7 @@
 namespace drift::platform {
 
 enum class SurfaceMode {
-    Wallpaper,  // per-output background surfaces (not yet implemented here)
+    Wallpaper,  // desktop-level window per display, with hotplug
     Windowed,   // single dev window
     Fullscreen, // single fullscreen window (not yet implemented here)
 };
@@ -32,25 +34,36 @@ public:
     CocoaApp();
     ~CocoaApp();
 
-    // Creates the window, its CAMetalLayer and the wgpu::Surface, and picks
-    // the surface format. width/height are the initial content size in
-    // points; rendering happens at physical pixels (backing scale).
+    // Creates the window(s), their CAMetalLayers and wgpu::Surfaces, and
+    // picks the surface format. width/height are the initial content size
+    // in points for Windowed mode and ignored in Wallpaper mode (windows
+    // cover their screens); rendering happens at physical pixels (backing
+    // scale).
     bool setup(Gpu& gpu, SurfaceMode mode, uint32_t width, uint32_t height);
 
-    // Interface parity with the Wayland layer's per-output claims: no
-    // output names exist here, so the filter is a no-op and the single
-    // window claims the unnamed ("") output.
-    void setOutputFilter(std::vector<std::string> names) { (void)names; }
-    std::vector<std::string> claimedOutputs() const { return { {} }; }
+    // Wallpaper mode: only claim displays whose name (NSScreen
+    // localizedName, e.g. "Built-in Retina Display") is listed; empty =
+    // every display. Set before setup(). Names requested but not present
+    // attach if the display hotplugs later (with a filter, setup()
+    // succeeds even when no display matches yet and waits for hotplug).
+    void setOutputFilter(std::vector<std::string> names);
+
+    // Names of the displays claimed so far; the single unnamed ("")
+    // output in windowed mode. After setup() the app uses this to drop
+    // validation scene instances for named outputs that are absent.
+    std::vector<std::string> claimedOutputs() const;
 
     wgpu::TextureFormat targetFormat() const;
 
-    // One render callback invocation per frame. outputId is 0 and
-    // outputName is empty (single window). seconds is the scene clock:
-    // capped per-frame deltas, frozen across pauses (occlusion,
-    // miniaturization) per SCENE_FORMAT.md §9.7. Returns whether the
-    // target was written; when false nothing is presented (§11) and the
-    // previous frame stays on screen.
+    // One render callback invocation per surface per frame. outputId is a
+    // stable identity for the lifetime of that display's window (the
+    // CGDirectDisplayID; 0 in windowed mode) — the app keeps one scene
+    // instance per outputId. outputName is the display name (empty in
+    // windowed mode). seconds is that surface's scene clock: capped
+    // per-frame deltas, frozen across pauses (occlusion, miniaturization)
+    // per SCENE_FORMAT.md §9.7. Returns whether the target was written;
+    // when false nothing is presented (§11) and the previous frame stays
+    // on screen.
     struct FrameRequest {
         uint32_t outputId = 0;
         std::string outputName;
@@ -62,8 +75,8 @@ public:
     };
     using RenderFrame = std::function<bool(const FrameRequest&)>;
 
-    // Never fires in windowed mode; kept for interface parity (wallpaper
-    // mode will use it for display hotplug).
+    // Notifies when a display's window is destroyed (hotplug removal) so
+    // the app can drop that output's scene. Never fires in windowed mode.
     using OutputRemoved = std::function<void(uint32_t)>;
     void setOutputRemoved(OutputRemoved cb);
 
@@ -103,12 +116,14 @@ public:
     // caller handles backward by re-creating the scene instances).
     void seekSceneTime(double seconds);
 
-    // Frame loop until the window closes (or Esc). Animated scenes (per
-    // the animated query) produce frames continuously at the display rate;
-    // static scenes render only on input/resize/wake events.
+    // Frame loop: until the window closes (or Esc) in windowed mode, until
+    // killed in wallpaper mode. Outputs whose scene animates (per the
+    // animated query) produce frames continuously at their display's rate;
+    // static outputs render only on input/resize/wake events.
     int run(RenderFrame renderFrame);
 
-    struct Impl; // all Cocoa state lives in the .mm
+    struct Impl;   // all Cocoa state lives in the .mm
+    struct Output; // one presented surface (window/display)
 
 private:
     std::unique_ptr<Impl> mImpl;

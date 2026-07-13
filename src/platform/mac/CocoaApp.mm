@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <ctime>
+#include <set>
 
 #include <unistd.h>
 
@@ -10,47 +11,49 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CADisplayLink.h>
 
-// Forward declarations so Impl can hold the Objective-C helpers.
+// Forward declarations so the C++ state can hold the Objective-C helpers.
 @class DriftView;
 @class DriftWindowDelegate;
 @class DriftLinkTarget;
 
 namespace drift::platform {
 
-// All Cocoa state and the frame/clock logic. Single window (outputId 0);
-// everything runs on the main thread — AppKit events, the display link,
-// and the dispatch sources all land on the main run loop.
-struct CocoaApp::Impl {
-    Gpu* gpu = nullptr;
-    SurfaceMode mode = SurfaceMode::Windowed;
-    uint32_t initialWidth = 0, initialHeight = 0;
+namespace {
+
+uint32_t displayIdFor(NSScreen* screen)
+{
+    return [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+}
+
+std::string displayNameFor(NSScreen* screen)
+{
+    return std::string(screen.localizedName.UTF8String);
+}
+
+} // namespace
+
+// One presented surface: the dev window, or one desktop-level window per
+// display in wallpaper mode. Each has its own buffer swapchain, display
+// link, pointer state, and scene clock — mirroring WaylandApp's
+// OutputSurface. Everything runs on the main thread.
+struct CocoaApp::Output {
+    Impl* impl = nullptr;
+    uint32_t id = 0;  // CGDirectDisplayID; 0 = windowed
+    std::string name; // NSScreen localizedName; "" = windowed
 
     // The custom classes are only forward-declared at this point, so the
-    // members carry their AppKit base types; setup()/teardown cast.
+    // members carry their AppKit base types; creation/teardown cast.
     NSWindow* window = nil;
     NSView* view = nil;
-    id windowDelegate = nil;
-    id linkTarget = nil;
+    ::id windowDelegate = nil; // ::id — the member above shadows the type
+    ::id linkTarget = nil;
     CADisplayLink* link = nil;
     CAMetalLayer* layer = nil;
-
-    wgpu::Surface surface;
-    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-    uint32_t configuredWidth = 0, configuredHeight = 0;
-
-    RenderFrame renderFrame;
-    OutputRemoved outputRemoved;
-    WakeQuery wakeQuery;
-    AnimatedQuery animatedQuery;
-    int controlFd = -1;
-    std::function<void()> controlCb;
-    int wakeFd = -1;
-    dispatch_source_t controlSource = nullptr;
-    dispatch_source_t wakeSource = nullptr;
     NSTimer* wakeTimer = nil;
 
-    bool running = true;
-    bool scenePaused = false;
+    wgpu::Surface surface;
+    uint32_t configuredWidth = 0, configuredHeight = 0;
+
     bool visible = true;
     bool wantRedraw = false;
 
@@ -66,6 +69,32 @@ struct CocoaApp::Impl {
     // it) and cleared by every draw. Negative = not armed. Only armed
     // sleeps may stretch the scene clock past the §9.7 resume cap.
     double wakeDueWall = -1.0;
+};
+
+struct CocoaApp::Impl {
+    Gpu* gpu = nullptr;
+    SurfaceMode mode = SurfaceMode::Windowed;
+    uint32_t initialWidth = 0, initialHeight = 0;
+    std::vector<std::string> outputFilter;
+
+    std::vector<std::unique_ptr<Output>> outputs;
+    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+
+    RenderFrame renderFrame;
+    OutputRemoved outputRemoved;
+    WakeQuery wakeQuery;
+    AnimatedQuery animatedQuery;
+    int controlFd = -1;
+    std::function<void()> controlCb;
+    int wakeFd = -1;
+    dispatch_source_t controlSource = nullptr;
+    dispatch_source_t wakeSource = nullptr;
+    id mouseMonitor = nil;   // wallpaper: global pointer events
+    id screenObserver = nil; // wallpaper: display hotplug
+
+    bool running = true;
+    bool started = false; // run() reached; display links may tick
+    bool scenePaused = false;
     double startTime = 0.0;
 
     double now() const
@@ -75,23 +104,38 @@ struct CocoaApp::Impl {
         return (ts.tv_sec + ts.tv_nsec * 1e-9) - startTime;
     }
 
-    // Re-asked as instances come and go (outputId is always 0 here).
-    bool animated() const
+    bool matchesFilter(const std::string& name) const
     {
-        return !animatedQuery || animatedQuery(0);
+        return outputFilter.empty() ||
+               std::find(outputFilter.begin(), outputFilter.end(), name) !=
+                   outputFilter.end();
     }
 
-    void kick()
+    // Re-asked as instances come and go; unresolved (not yet drawn)
+    // outputs count as animated until their first frame settles it.
+    bool animated(const Output& surf) const
     {
-        if (link && visible) {
-            link.paused = NO;
+        return !animatedQuery || animatedQuery(surf.id);
+    }
+
+    void kick(Output& surf)
+    {
+        if (started && surf.link && surf.visible) {
+            surf.link.paused = NO;
         }
     }
 
-    void requestRedraw()
+    void requestRedraw(Output& surf)
     {
-        wantRedraw = true;
-        kick();
+        surf.wantRedraw = true;
+        kick(surf);
+    }
+
+    void requestRedrawAll()
+    {
+        for (auto& surf : outputs) {
+            requestRedraw(*surf);
+        }
     }
 
     void stopRun()
@@ -114,31 +158,53 @@ struct CocoaApp::Impl {
         [NSApp postEvent:wake atStart:YES];
     }
 
-    void onOcclusionChanged()
+    void onOcclusionChanged(Output& surf)
     {
         const bool nowVisible =
-            ([window occlusionState] & NSWindowOcclusionStateVisible) != 0;
-        if (nowVisible == visible) {
+            ([surf.window occlusionState] & NSWindowOcclusionStateVisible) != 0;
+        if (nowVisible == surf.visible) {
             return;
         }
-        visible = nowVisible;
-        if (visible) {
+        surf.visible = nowVisible;
+        if (surf.visible) {
             // Frames resume; the capped clock delta absorbs the gap (§9.7).
-            if (animated() || wantRedraw) {
-                kick();
+            if (animated(surf) || surf.wantRedraw) {
+                kick(surf);
             }
-            armWakeTimer();
+            armWakeTimer(surf);
         } else {
-            // Draws stop, freezing the scene clock; wantRedraw stays
-            // pending until frames resume.
-            if (link) {
-                link.paused = YES;
+            // Draws stop, freezing this surface's scene clock; wantRedraw
+            // stays pending until frames resume.
+            if (surf.link) {
+                surf.link.paused = YES;
             }
-            disarmWakeTimer();
+            disarmWakeTimer(surf);
         }
     }
 
-    bool configureSurface(uint32_t width, uint32_t height)
+    // Wallpaper windows are mouse-transparent, so the pointer arrives via
+    // a global monitor: route the location to the display under it.
+    void onGlobalMouse()
+    {
+        const NSPoint p = [NSEvent mouseLocation]; // global, bottom-left
+        for (auto& surfPtr : outputs) {
+            Output& surf = *surfPtr;
+            const NSRect frame = surf.window.frame;
+            const bool over = NSMouseInRect(p, frame, NO);
+            if (over) {
+                surf.pointerOver = true;
+                surf.pointerSeen = true;
+                surf.pointerX = p.x - frame.origin.x;
+                surf.pointerY = frame.size.height - (p.y - frame.origin.y);
+                requestRedraw(surf);
+            } else if (surf.pointerOver) {
+                surf.pointerOver = false;
+                requestRedraw(surf);
+            }
+        }
+    }
+
+    bool configureSurface(Output& surf, uint32_t width, uint32_t height)
     {
         wgpu::SurfaceConfiguration config{};
         config.device = gpu->device();
@@ -148,27 +214,28 @@ struct CocoaApp::Impl {
         config.height = height;
         config.presentMode = wgpu::PresentMode::Fifo;
         config.alphaMode = wgpu::CompositeAlphaMode::Opaque;
-        surface.Configure(&config);
-        configuredWidth = width;
-        configuredHeight = height;
+        surf.surface.Configure(&config);
+        surf.configuredWidth = width;
+        surf.configuredHeight = height;
         return true;
     }
 
-    void drawFrame()
+    void drawFrame(Output& surf)
     {
-        if (!running || !renderFrame || !visible) {
+        if (!running || !renderFrame || !surf.visible) {
             return;
         }
-        const NSSize bounds = view.bounds.size;
-        const double scale = window.backingScaleFactor;
+        const NSSize bounds = surf.view.bounds.size;
+        const double scale = surf.window.backingScaleFactor;
         const auto pixelWidth = (uint32_t)llround(bounds.width * scale);
         const auto pixelHeight = (uint32_t)llround(bounds.height * scale);
         if (pixelWidth == 0 || pixelHeight == 0) {
             return;
         }
-        if (pixelWidth != configuredWidth || pixelHeight != configuredHeight) {
-            layer.contentsScale = scale;
-            configureSurface(pixelWidth, pixelHeight);
+        if (pixelWidth != surf.configuredWidth ||
+            pixelHeight != surf.configuredHeight) {
+            surf.layer.contentsScale = scale;
+            configureSurface(surf, pixelWidth, pixelHeight);
         }
 
         // Scene time advances by capped wall-clock deltas: across a pause
@@ -178,28 +245,28 @@ struct CocoaApp::Impl {
         // (wakeDueWall), the slept wall time is elapsed scene time and the
         // clock may stride up to the deadline.
         const double t = now();
-        if (lastDrawTime >= 0.0 && !scenePaused) {
+        if (surf.lastDrawTime >= 0.0 && !scenePaused) {
             double cap = 0.1;
-            if (wakeDueWall >= 0.0 && wakeQuery) {
-                const double deadline = wakeQuery(0);
-                if (deadline > sceneTime) {
-                    cap = std::max(cap, deadline - sceneTime + 0.017);
+            if (surf.wakeDueWall >= 0.0 && wakeQuery) {
+                const double deadline = wakeQuery(surf.id);
+                if (deadline > surf.sceneTime) {
+                    cap = std::max(cap, deadline - surf.sceneTime + 0.017);
                 }
             }
-            sceneTime += std::min(t - lastDrawTime, cap);
+            surf.sceneTime += std::min(t - surf.lastDrawTime, cap);
         }
-        lastDrawTime = t;
-        wakeDueWall = -1.0; // deadlines re-derive after every draw
+        surf.lastDrawTime = t;
+        surf.wakeDueWall = -1.0; // deadlines re-derive after every draw
 
         wgpu::SurfaceTexture surfaceTexture{};
-        surface.GetCurrentTexture(&surfaceTexture);
+        surf.surface.GetCurrentTexture(&surfaceTexture);
         if (surfaceTexture.status !=
                 wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
             surfaceTexture.status !=
                 wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
             // e.g. Outdated after a resize race: reconfigure and retry once.
-            configureSurface(pixelWidth, pixelHeight);
-            surface.GetCurrentTexture(&surfaceTexture);
+            configureSurface(surf, pixelWidth, pixelHeight);
+            surf.surface.GetCurrentTexture(&surfaceTexture);
             if (surfaceTexture.status !=
                     wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
                 surfaceTexture.status !=
@@ -211,51 +278,53 @@ struct CocoaApp::Impl {
         }
 
         FrameRequest request;
-        request.outputId = 0;
+        request.outputId = surf.id;
+        request.outputName = surf.name;
         request.target = surfaceTexture.texture.CreateView();
         request.width = pixelWidth;
         request.height = pixelHeight;
-        request.seconds = sceneTime;
-        request.mouseX = pointerSeen && bounds.width > 0
-                             ? (float)(pointerX / bounds.width)
+        request.seconds = surf.sceneTime;
+        request.mouseX = surf.pointerSeen && bounds.width > 0
+                             ? (float)(surf.pointerX / bounds.width)
                              : 0.5f;
-        request.mouseY = pointerSeen && bounds.height > 0
-                             ? (float)(pointerY / bounds.height)
+        request.mouseY = surf.pointerSeen && bounds.height > 0
+                             ? (float)(surf.pointerY / bounds.height)
                              : 0.5f;
-        request.mouseActive = pointerOver;
+        request.mouseActive = surf.pointerOver;
 
         if (renderFrame(request)) {
-            surface.Present();
+            surf.surface.Present();
         }
         // Nothing rendered: no present, the previous frame stays visible
         // and the acquired drawable is dropped (§11).
     }
 
     // One display-link tick: draw if there is a reason to, then quiesce
-    // (pause the link, arm the module-timer sleep) when nothing animates.
-    void onTick()
+    // (pause this surface's link, arm its module-timer sleep) when the
+    // surface's scene does not animate.
+    void onTick(Output& surf)
     {
         if (!running) {
             return;
         }
-        const bool draw = animated() || wantRedraw;
-        wantRedraw = false;
+        const bool draw = animated(surf) || surf.wantRedraw;
+        surf.wantRedraw = false;
         if (draw) {
-            drawFrame();
+            drawFrame(surf);
         }
         // Re-asked after the draw: the first frame may have just
         // instantiated the scene and settled whether it animates.
-        if (!animated() && !wantRedraw) {
-            link.paused = YES;
-            armWakeTimer();
+        if (!animated(surf) && !surf.wantRedraw) {
+            surf.link.paused = YES;
+            armWakeTimer(surf);
         }
     }
 
-    void disarmWakeTimer()
+    void disarmWakeTimer(Output& surf)
     {
-        if (wakeTimer) {
-            [wakeTimer invalidate];
-            wakeTimer = nil;
+        if (surf.wakeTimer) {
+            [surf.wakeTimer invalidate];
+            surf.wakeTimer = nil;
         }
     }
 
@@ -265,46 +334,54 @@ struct CocoaApp::Impl {
     // time, which is frozen while idle, so it is anchored in wall clock
     // once per arming — later re-arms keep the anchor instead of
     // restarting the wait. A paused clock can never reach a scene-time
-    // deadline, so paused scenes do not arm. Animated scenes tick anyway.
-    void armWakeTimer()
+    // deadline, so paused scenes do not arm. Animated surfaces tick anyway.
+    void armWakeTimer(Output& surf)
     {
-        disarmWakeTimer();
-        if (animated() || scenePaused || !visible || !wakeQuery || !running) {
-            wakeDueWall = -1.0;
+        disarmWakeTimer(surf);
+        if (animated(surf) || scenePaused || !surf.visible || !wakeQuery ||
+            !running) {
+            surf.wakeDueWall = -1.0;
             return;
         }
-        const double deadline = wakeQuery(0);
+        const double deadline = wakeQuery(surf.id);
         if (deadline < 0.0) {
-            wakeDueWall = -1.0;
+            surf.wakeDueWall = -1.0;
             return;
         }
         const double tnow = now();
-        if (wakeDueWall < 0.0) {
-            wakeDueWall = tnow + std::max(0.0, deadline - sceneTime);
+        if (surf.wakeDueWall < 0.0) {
+            surf.wakeDueWall = tnow + std::max(0.0, deadline - surf.sceneTime);
         }
-        const double wait = std::max(0.0, wakeDueWall - tnow) + 0.001;
+        const double wait = std::max(0.0, surf.wakeDueWall - tnow) + 0.001;
         Impl* impl = this;
-        wakeTimer = [NSTimer
+        Output* surfPtr = &surf;
+        surf.wakeTimer = [NSTimer
             scheduledTimerWithTimeInterval:wait
                                    repeats:NO
                                      block:^(NSTimer*) {
-                                         impl->wakeTimer = nil;
+                                         surfPtr->wakeTimer = nil;
                                          // Draw with wakeDueWall still set:
                                          // the clock strides to the
                                          // deadline (§9.7 exception).
-                                         impl->requestRedraw();
+                                         impl->requestRedraw(*surfPtr);
                                      }];
     }
+
+    bool createOutput(NSScreen* screen); // nil = the dev window
+    void destroyOutput(Output* surf);
+    void syncScreens();
 };
 
 } // namespace drift::platform
 
 using Impl = drift::platform::CocoaApp::Impl;
+using Output = drift::platform::CocoaApp::Output;
 
-// The content view: owns the CAMetalLayer, tracks the pointer (top-left
-// origin via isFlipped) and closes on Esc, mirroring the Wayland toplevel.
+// The content view: owns the CAMetalLayer; in windowed mode it also tracks
+// the pointer (top-left origin via isFlipped) and closes on Esc, mirroring
+// the Wayland toplevel. Wallpaper windows never receive events.
 @interface DriftView : NSView
-@property(nonatomic, assign) Impl* impl;
+@property(nonatomic, assign) Output* surf;
 @end
 
 @implementation DriftView {
@@ -348,17 +425,17 @@ using Impl = drift::platform::CocoaApp::Impl;
 
 - (void)setPointer:(NSEvent*)event over:(BOOL)over
 {
-    if (!self.impl) {
+    if (!self.surf) {
         return;
     }
     const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
-    self.impl->pointerOver = over;
+    self.surf->pointerOver = over;
     if (over) {
-        self.impl->pointerSeen = true;
-        self.impl->pointerX = p.x;
-        self.impl->pointerY = p.y;
+        self.surf->pointerSeen = true;
+        self.surf->pointerX = p.x;
+        self.surf->pointerY = p.y;
     }
-    self.impl->requestRedraw();
+    self.surf->impl->requestRedraw(*self.surf);
 }
 
 - (void)mouseEntered:(NSEvent*)event
@@ -384,8 +461,8 @@ using Impl = drift::platform::CocoaApp::Impl;
 - (void)keyDown:(NSEvent*)event
 {
     if (event.keyCode == 53 /* Esc */) {
-        if (self.impl) {
-            self.impl->stopRun();
+        if (self.surf) {
+            self.surf->impl->stopRun();
         }
         return;
     }
@@ -395,38 +472,46 @@ using Impl = drift::platform::CocoaApp::Impl;
 - (void)viewDidChangeBackingProperties
 {
     [super viewDidChangeBackingProperties];
-    if (self.impl) {
-        self.impl->requestRedraw(); // drawFrame reconfigures for the scale
+    if (self.surf) {
+        // drawFrame reconfigures for the scale.
+        self.surf->impl->requestRedraw(*self.surf);
     }
 }
 
 - (void)setFrameSize:(NSSize)newSize
 {
     [super setFrameSize:newSize];
-    if (self.impl) {
-        self.impl->requestRedraw();
+    if (self.surf) {
+        self.surf->impl->requestRedraw(*self.surf);
     }
 }
 
 @end
 
 @interface DriftWindowDelegate : NSObject <NSWindowDelegate>
-@property(nonatomic, assign) Impl* impl;
+@property(nonatomic, assign) Output* surf;
 @end
 
 @implementation DriftWindowDelegate
 
 - (void)windowWillClose:(NSNotification*)notification
 {
-    if (self.impl) {
-        self.impl->stopRun();
+    if (!self.surf) {
+        return;
     }
+    Impl* impl = self.surf->impl;
+    if (impl->mode != drift::platform::SurfaceMode::Wallpaper) {
+        impl->stopRun();
+        return;
+    }
+    // Keep running with the other displays; this one may come back.
+    impl->destroyOutput(self.surf);
 }
 
 - (void)windowDidChangeOcclusionState:(NSNotification*)notification
 {
-    if (self.impl) {
-        self.impl->onOcclusionChanged();
+    if (self.surf) {
+        self.surf->impl->onOcclusionChanged(*self.surf);
     }
 }
 
@@ -434,7 +519,7 @@ using Impl = drift::platform::CocoaApp::Impl;
 
 // CADisplayLink needs an Objective-C target/selector pair.
 @interface DriftLinkTarget : NSObject
-@property(nonatomic, assign) Impl* impl;
+@property(nonatomic, assign) Output* surf;
 - (void)onTick:(CADisplayLink*)link;
 @end
 
@@ -442,8 +527,8 @@ using Impl = drift::platform::CocoaApp::Impl;
 
 - (void)onTick:(CADisplayLink*)link
 {
-    if (self.impl) {
-        self.impl->onTick();
+    if (self.surf) {
+        self.surf->impl->onTick(*self.surf);
     }
 }
 
@@ -451,15 +536,195 @@ using Impl = drift::platform::CocoaApp::Impl;
 
 namespace drift::platform {
 
+bool CocoaApp::Impl::createOutput(NSScreen* screen)
+{
+    auto surf = std::make_unique<Output>();
+    surf->impl = this;
+
+    NSRect rect;
+    if (screen) {
+        surf->id = displayIdFor(screen);
+        surf->name = displayNameFor(screen);
+        rect = screen.frame; // global coordinates
+        surf->window = [[NSWindow alloc]
+            initWithContentRect:rect
+                      styleMask:NSWindowStyleMaskBorderless
+                        backing:NSBackingStoreBuffered
+                          defer:NO
+                         screen:screen];
+        // Desktop level sits behind the icons; the window covers its
+        // screen on every Space, never moves in Mission Control, and
+        // passes the mouse through to the Finder desktop.
+        surf->window.level =
+            (NSWindowLevel)CGWindowLevelForKey(kCGDesktopWindowLevelKey);
+        surf->window.collectionBehavior =
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorStationary |
+            NSWindowCollectionBehaviorIgnoresCycle;
+        surf->window.ignoresMouseEvents = YES;
+        surf->window.hasShadow = NO;
+        [surf->window setFrame:rect display:NO];
+    } else {
+        rect = NSMakeRect(0, 0, initialWidth, initialHeight);
+        surf->window = [[NSWindow alloc]
+            initWithContentRect:rect
+                      styleMask:NSWindowStyleMaskTitled |
+                                NSWindowStyleMaskClosable |
+                                NSWindowStyleMaskMiniaturizable |
+                                NSWindowStyleMaskResizable
+                        backing:NSBackingStoreBuffered
+                          defer:NO];
+        surf->window.title = @"drift";
+    }
+    surf->window.releasedWhenClosed = NO;
+    surf->window.backgroundColor = [NSColor blackColor];
+
+    DriftView* view = [[DriftView alloc] initWithFrame:NSMakeRect(
+                                             0, 0, rect.size.width,
+                                             rect.size.height)];
+    view.surf = surf.get();
+    view.wantsLayer = YES;
+    surf->view = view;
+    surf->layer = (CAMetalLayer*)view.layer;
+    surf->layer.contentsScale = surf->window.backingScaleFactor;
+    surf->window.contentView = view;
+
+    DriftWindowDelegate* delegate = [DriftWindowDelegate new];
+    delegate.surf = surf.get();
+    surf->windowDelegate = delegate;
+    surf->window.delegate = delegate;
+
+    wgpu::SurfaceSourceMetalLayer layerSource{};
+    layerSource.layer = (__bridge void*)surf->layer;
+    wgpu::SurfaceDescriptor surfaceDesc{};
+    surfaceDesc.nextInChain = &layerSource;
+    surf->surface = gpu->instance().CreateSurface(&surfaceDesc);
+    if (!surf->surface) {
+        fprintf(stderr, "drift: cannot create surface for CAMetalLayer\n");
+        surf->window.delegate = nil;
+        view.surf = nullptr;
+        delegate.surf = nullptr;
+        [surf->window close];
+        return false;
+    }
+    if (format == wgpu::TextureFormat::Undefined) {
+        wgpu::SurfaceCapabilities caps{};
+        if (surf->surface.GetCapabilities(gpu->adapter(), &caps) !=
+                wgpu::Status::Success ||
+            caps.formatCount == 0) {
+            fprintf(stderr, "drift: no supported surface format\n");
+            return false;
+        }
+        format = caps.formats[0];
+    }
+
+    DriftLinkTarget* linkTarget = [DriftLinkTarget new];
+    linkTarget.surf = surf.get();
+    surf->linkTarget = linkTarget;
+    surf->link = [view displayLinkWithTarget:linkTarget
+                                    selector:@selector(onTick:)];
+    // Common modes keep frames coming during live window resize.
+    [surf->link addToRunLoop:[NSRunLoop mainRunLoop]
+                     forMode:NSRunLoopCommonModes];
+    surf->link.paused = YES; // kick() unpauses once run() has started
+
+    if (screen) {
+        [surf->window orderFront:nil];
+        printf("drift: output %u (%s) added\n", surf->id, surf->name.c_str());
+    } else {
+        [surf->window makeFirstResponder:view];
+        [surf->window center];
+        [surf->window makeKeyAndOrderFront:nil];
+        [NSApp activate];
+    }
+    surf->visible =
+        ([surf->window occlusionState] & NSWindowOcclusionStateVisible) != 0;
+
+    Output& ref = *surf;
+    outputs.push_back(std::move(surf));
+    if (started) {
+        requestRedraw(ref); // hotplug: first frame instantiates the scene
+    }
+    return true;
+}
+
+void CocoaApp::Impl::destroyOutput(Output* surf)
+{
+    disarmWakeTimer(*surf);
+    if (surf->link) {
+        [surf->link invalidate];
+        surf->link = nil;
+    }
+    ((DriftLinkTarget*)surf->linkTarget).surf = nullptr;
+    ((DriftView*)surf->view).surf = nullptr;
+    ((DriftWindowDelegate*)surf->windowDelegate).surf = nullptr;
+    surf->window.delegate = nil;
+    [surf->window close];
+    surf->window = nil;
+
+    const uint32_t id = surf->id;
+    const std::string name = surf->name;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        if (outputs[i].get() == surf) {
+            outputs.erase(outputs.begin() + i);
+            break;
+        }
+    }
+    if (mode == SurfaceMode::Wallpaper) {
+        printf("drift: output %u (%s) removed\n", id, name.c_str());
+    }
+    if (outputRemoved) {
+        outputRemoved(id);
+    }
+}
+
+// Display hotplug (and resolution changes): diff the current screens
+// against the live windows, one wallpaper window per matching display.
+void CocoaApp::Impl::syncScreens()
+{
+    std::set<uint32_t> present;
+    for (NSScreen* screen in [NSScreen screens]) {
+        const uint32_t id = displayIdFor(screen);
+        present.insert(id);
+        Output* existing = nullptr;
+        for (auto& surf : outputs) {
+            if (surf->id == id) {
+                existing = surf.get();
+                break;
+            }
+        }
+        if (existing) {
+            if (!NSEqualRects(existing->window.frame, screen.frame)) {
+                [existing->window setFrame:screen.frame display:NO];
+                requestRedraw(*existing);
+            }
+            continue;
+        }
+        if (!matchesFilter(displayNameFor(screen))) {
+            continue;
+        }
+        createOutput(screen);
+    }
+    for (size_t i = outputs.size(); i-- > 0;) {
+        if (!present.contains(outputs[i]->id)) {
+            destroyOutput(outputs[i].get());
+        }
+    }
+}
+
 CocoaApp::CocoaApp() : mImpl(std::make_unique<Impl>()) {}
 
 CocoaApp::~CocoaApp()
 {
     Impl& impl = *mImpl;
-    impl.disarmWakeTimer();
-    if (impl.link) {
-        [impl.link invalidate];
-        impl.link = nil;
+    impl.running = false;
+    if (impl.screenObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:impl.screenObserver];
+        impl.screenObserver = nil;
+    }
+    if (impl.mouseMonitor) {
+        [NSEvent removeMonitor:impl.mouseMonitor];
+        impl.mouseMonitor = nil;
     }
     if (impl.controlSource) {
         dispatch_source_cancel(impl.controlSource);
@@ -469,19 +734,8 @@ CocoaApp::~CocoaApp()
         dispatch_source_cancel(impl.wakeSource);
         impl.wakeSource = nullptr;
     }
-    if (impl.view) {
-        ((DriftView*)impl.view).impl = nullptr;
-    }
-    if (impl.windowDelegate) {
-        ((DriftWindowDelegate*)impl.windowDelegate).impl = nullptr;
-    }
-    if (impl.linkTarget) {
-        ((DriftLinkTarget*)impl.linkTarget).impl = nullptr;
-    }
-    if (impl.window) {
-        impl.window.delegate = nil;
-        [impl.window close];
-        impl.window = nil;
+    while (!impl.outputs.empty()) {
+        impl.destroyOutput(impl.outputs.back().get());
     }
 }
 
@@ -498,64 +752,88 @@ bool CocoaApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width,
     clock_gettime(CLOCK_MONOTONIC, &ts);
     impl.startTime = ts.tv_sec + ts.tv_nsec * 1e-9;
 
-    if (mode != SurfaceMode::Windowed) {
-        fprintf(stderr, "drift: only --windowed is implemented on macOS\n");
+    if (mode == SurfaceMode::Fullscreen) {
+        fprintf(stderr, "drift: --fullscreen is not implemented on macOS\n");
         return false;
     }
 
     [NSApplication sharedApplication];
+    if (mode == SurfaceMode::Wallpaper) {
+        // No Dock icon, no menu bar, never steals focus.
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+
+        if ([NSScreen screens].count == 0 && impl.outputFilter.empty()) {
+            fprintf(stderr, "drift: no display attached\n");
+            return false;
+        }
+        Impl* implPtr = &impl;
+        impl.screenObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification*) {
+                        if (implPtr->running) {
+                            implPtr->syncScreens();
+                        }
+                    }];
+        // Pointer position for mouse-transparent windows. Global monitors
+        // receive mouse events without extra permissions (unlike keyboard).
+        impl.mouseMonitor = [NSEvent
+            addGlobalMonitorForEventsMatchingMask:NSEventMaskMouseMoved |
+                                                  NSEventMaskLeftMouseDragged |
+                                                  NSEventMaskRightMouseDragged |
+                                                  NSEventMaskOtherMouseDragged
+                                          handler:^(NSEvent*) {
+                                              if (implPtr->running) {
+                                                  implPtr->onGlobalMouse();
+                                              }
+                                          }];
+        impl.syncScreens();
+        // Zero matches with a filter: keep waiting for hotplug (the named
+        // display may attach later). The format is still needed for the
+        // caller's pipelines before any window exists; probe a detached
+        // layer once.
+        if (impl.format == wgpu::TextureFormat::Undefined) {
+            wgpu::SurfaceSourceMetalLayer layerSource{};
+            CAMetalLayer* probe = [CAMetalLayer layer];
+            layerSource.layer = (__bridge void*)probe;
+            wgpu::SurfaceDescriptor surfaceDesc{};
+            surfaceDesc.nextInChain = &layerSource;
+            wgpu::Surface surface = gpu.instance().CreateSurface(&surfaceDesc);
+            wgpu::SurfaceCapabilities caps{};
+            if (!surface ||
+                surface.GetCapabilities(gpu.adapter(), &caps) !=
+                    wgpu::Status::Success ||
+                caps.formatCount == 0) {
+                fprintf(stderr, "drift: no supported surface format\n");
+                return false;
+            }
+            impl.format = caps.formats[0];
+        }
+        if (impl.outputs.empty() && !impl.outputFilter.empty()) {
+            fprintf(stderr,
+                    "drift: no display matched --output yet; waiting for "
+                    "hotplug\n");
+        }
+        return true;
+    }
+
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    return impl.createOutput(nil);
+}
 
-    const NSRect rect = NSMakeRect(0, 0, width, height);
-    impl.window = [[NSWindow alloc]
-        initWithContentRect:rect
-                  styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                            NSWindowStyleMaskMiniaturizable |
-                            NSWindowStyleMaskResizable
-                    backing:NSBackingStoreBuffered
-                      defer:NO];
-    impl.window.title = @"drift";
-    impl.window.releasedWhenClosed = NO;
+void CocoaApp::setOutputFilter(std::vector<std::string> names)
+{
+    mImpl->outputFilter = std::move(names);
+}
 
-    DriftView* view = [[DriftView alloc] initWithFrame:rect];
-    view.impl = &impl;
-    view.wantsLayer = YES;
-    impl.view = view;
-    impl.layer = (CAMetalLayer*)view.layer;
-    impl.layer.contentsScale = impl.window.backingScaleFactor;
-    impl.window.contentView = view;
-    [impl.window makeFirstResponder:view];
-
-    DriftWindowDelegate* delegate = [DriftWindowDelegate new];
-    delegate.impl = &impl;
-    impl.windowDelegate = delegate;
-    impl.window.delegate = delegate;
-
-    wgpu::SurfaceSourceMetalLayer layerSource{};
-    layerSource.layer = (__bridge void*)impl.layer;
-    wgpu::SurfaceDescriptor surfaceDesc{};
-    surfaceDesc.nextInChain = &layerSource;
-    impl.surface = gpu.instance().CreateSurface(&surfaceDesc);
-    if (!impl.surface) {
-        fprintf(stderr, "drift: cannot create surface for CAMetalLayer\n");
-        return false;
+std::vector<std::string> CocoaApp::claimedOutputs() const
+{
+    std::vector<std::string> names;
+    for (const auto& surf : mImpl->outputs) {
+        names.push_back(surf->name);
     }
-
-    wgpu::SurfaceCapabilities caps{};
-    if (impl.surface.GetCapabilities(gpu.adapter(), &caps) !=
-            wgpu::Status::Success ||
-        caps.formatCount == 0) {
-        fprintf(stderr, "drift: no supported surface format\n");
-        return false;
-    }
-    impl.format = caps.formats[0];
-
-    [impl.window center];
-    [impl.window makeKeyAndOrderFront:nil];
-    [NSApp activate];
-    impl.visible =
-        ([impl.window occlusionState] & NSWindowOcclusionStateVisible) != 0;
-    return true;
+    return names;
 }
 
 wgpu::TextureFormat CocoaApp::targetFormat() const
@@ -591,24 +869,32 @@ void CocoaApp::setAnimatedQuery(AnimatedQuery query)
 
 void CocoaApp::requestRedrawAll()
 {
-    mImpl->requestRedraw();
+    mImpl->requestRedrawAll();
 }
 
+// The shared clock (§17.6) is the furthest surface along, matching the
+// Wayland layer.
 double CocoaApp::currentSceneTime() const
 {
-    return mImpl->sceneTime;
+    double t = 0.0;
+    for (const auto& surf : mImpl->outputs) {
+        t = std::max(t, surf->sceneTime);
+    }
+    return t;
 }
 
 void CocoaApp::setScenePaused(bool paused)
 {
     Impl& impl = *mImpl;
     impl.scenePaused = paused;
-    if (paused) {
-        // A paused clock can never reach a scene-time deadline (§4.4).
-        impl.disarmWakeTimer();
-        impl.wakeDueWall = -1.0;
-    } else {
-        impl.armWakeTimer();
+    for (auto& surf : impl.outputs) {
+        if (paused) {
+            // A paused clock can never reach a scene-time deadline (§4.4).
+            impl.disarmWakeTimer(*surf);
+            surf->wakeDueWall = -1.0;
+        } else {
+            impl.armWakeTimer(*surf);
+        }
     }
 }
 
@@ -619,23 +905,16 @@ bool CocoaApp::scenePaused() const
 
 void CocoaApp::seekSceneTime(double seconds)
 {
-    mImpl->sceneTime = seconds;
-    mImpl->requestRedraw();
+    for (auto& surf : mImpl->outputs) {
+        surf->sceneTime = seconds;
+        mImpl->requestRedraw(*surf);
+    }
 }
 
 int CocoaApp::run(RenderFrame renderFrame)
 {
     Impl& impl = *mImpl;
     impl.renderFrame = std::move(renderFrame);
-
-    DriftLinkTarget* linkTarget = [DriftLinkTarget new];
-    linkTarget.impl = &impl;
-    impl.linkTarget = linkTarget;
-    impl.link = [impl.view displayLinkWithTarget:linkTarget
-                                        selector:@selector(onTick:)];
-    // Common modes keep frames coming during live window resize.
-    [impl.link addToRunLoop:[NSRunLoop mainRunLoop]
-                    forMode:NSRunLoopCommonModes];
 
     if (impl.controlFd >= 0 && impl.controlCb) {
         impl.controlSource = dispatch_source_create(
@@ -662,22 +941,24 @@ int CocoaApp::run(RenderFrame renderFrame)
             if (implPtr->running) {
                 // A module delivery is pending: redraw; the graph evaluates
                 // only the woken nodes (§11).
-                implPtr->requestRedraw();
+                implPtr->requestRedrawAll();
             }
         });
         dispatch_resume(impl.wakeSource);
     }
 
-    impl.wantRedraw = true;
-    impl.kick();
+    impl.started = true;
+    impl.requestRedrawAll();
 
     [NSApp run];
 
     impl.running = false;
-    impl.disarmWakeTimer();
-    if (impl.link) {
-        [impl.link invalidate];
-        impl.link = nil;
+    for (auto& surf : impl.outputs) {
+        impl.disarmWakeTimer(*surf);
+        if (surf->link) {
+            [surf->link invalidate];
+            surf->link = nil;
+        }
     }
     return 0;
 }
