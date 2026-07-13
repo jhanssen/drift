@@ -440,7 +440,8 @@ graphCanvas.addEventListener('wheel', (e) => {
 // Double- or middle-click opens what a node contains: a graph instance
 // drills into the subgraph (§19.5), a texture-producing node opens its
 // live output preview (shift forces the preview for graph instances,
-// which also emit textures). Double-click elsewhere refits the view.
+// which also emit textures). On a node with nothing to open it does
+// nothing; only double-clicking the background refits the view.
 function nodeAtClient(clientX, clientY) {
   const { x, y } = graphWorldOf(clientX, clientY);
   return [...(graph?.nodes ?? [])].reverse().find((n) =>
@@ -469,9 +470,12 @@ function openNode(hit, preferPreview) {
 }
 
 graphCanvas.ondblclick = (e) => {
-  if (!openNode(nodeAtClient(e.clientX, e.clientY), e.shiftKey)) {
-    fitGraphView();
+  const hit = nodeAtClient(e.clientX, e.clientY);
+  if (hit) {
+    openNode(hit, e.shiftKey);
+    return;
   }
+  fitGraphView();
 };
 graphCanvas.addEventListener('auxclick', (e) => {
   if (e.button !== 1) {
