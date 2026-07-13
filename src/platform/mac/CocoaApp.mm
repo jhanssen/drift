@@ -2,14 +2,18 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <set>
 
 #include <unistd.h>
 
 #import <AppKit/AppKit.h>
+#import <IOSurface/IOSurface.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/CADisplayLink.h>
+#import <QuartzCore/CATransaction.h>
 
 // Forward declarations so the C++ state can hold the Objective-C helpers.
 @class DriftView;
@@ -48,11 +52,29 @@ struct CocoaApp::Output {
     ::id windowDelegate = nil; // ::id — the member above shadows the type
     ::id linkTarget = nil;
     CADisplayLink* link = nil;
-    CAMetalLayer* layer = nil;
+    // CAMetalLayer on the swapchain path; a plain CALayer whose contents
+    // flip between IOSurfaces on the bypass path (DRIFT_PRESENT=iosurface).
+    CALayer* layer = nil;
     NSTimer* wakeTimer = nil;
 
-    wgpu::Surface surface;
+    wgpu::Surface surface; // swapchain path only
     uint32_t configuredWidth = 0, configuredHeight = 0;
+
+    // Swapchain bypass: a ring of self-allocated IOSurfaces imported into
+    // Dawn as render targets, presented by assigning layer.contents once
+    // the GPU is done — the CAMetalLayer drawable machinery (nextDrawable
+    // pacing, per-frame drawable churn) never runs. The display system
+    // marks a surface in use while it reads it, which is the ring's
+    // release signal.
+    struct Buffer {
+        IOSurfaceRef ioSurface = nullptr;
+        wgpu::SharedTextureMemory memory;
+        wgpu::Texture texture;
+        bool everInitialized = false;
+        bool pendingPresent = false; // GPU still writing; flip queued
+    };
+    std::vector<Buffer> ring;
+    uint64_t ringGeneration = 0; // invalidates in-flight present callbacks
 
     bool visible = true;
     bool wantRedraw = false;
@@ -95,6 +117,7 @@ struct CocoaApp::Impl {
     bool running = true;
     bool started = false; // run() reached; display links may tick
     bool scenePaused = false;
+    bool bypassSwapchain = false; // DRIFT_PRESENT=iosurface
     double startTime = 0.0;
 
     double now() const
@@ -220,6 +243,86 @@ struct CocoaApp::Impl {
         return true;
     }
 
+    void destroyRing(Output& surf)
+    {
+        for (auto& buf : surf.ring) {
+            buf.texture = nullptr;
+            buf.memory = nullptr;
+            if (buf.ioSurface) {
+                CFRelease(buf.ioSurface); // display holds its own reference
+            }
+        }
+        surf.ring.clear();
+        ++surf.ringGeneration;
+    }
+
+    bool ensureRing(Output& surf, uint32_t width, uint32_t height)
+    {
+        if (!surf.ring.empty() && surf.configuredWidth == width &&
+            surf.configuredHeight == height) {
+            return true;
+        }
+        destroyRing(surf);
+        for (int i = 0; i < 3; ++i) {
+            Output::Buffer buf;
+            NSDictionary* props = @{
+                (id)kIOSurfaceWidth : @(width),
+                (id)kIOSurfaceHeight : @(height),
+                (id)kIOSurfaceBytesPerElement : @4,
+                (id)kIOSurfacePixelFormat : @((uint32_t)'BGRA'),
+            };
+            buf.ioSurface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (!buf.ioSurface) {
+                destroyRing(surf);
+                return false;
+            }
+            wgpu::SharedTextureMemoryIOSurfaceDescriptor io{};
+            io.ioSurface = buf.ioSurface;
+            wgpu::SharedTextureMemoryDescriptor desc{};
+            desc.nextInChain = &io;
+            buf.memory = gpu->device().ImportSharedTextureMemory(&desc);
+            wgpu::SharedTextureMemoryProperties memProps{};
+            buf.memory.GetProperties(&memProps);
+            if (memProps.size.width == 0) {
+                CFRelease(buf.ioSurface);
+                destroyRing(surf);
+                return false;
+            }
+            buf.texture = buf.memory.CreateTexture();
+            surf.ring.push_back(std::move(buf));
+        }
+        surf.configuredWidth = width;
+        surf.configuredHeight = height;
+        return true;
+    }
+
+    // GPU completion for a bypass frame: flip the layer to the finished
+    // IOSurface. Runs on the main queue; generation and index re-validate
+    // against hotplug/resize teardown that may have raced the callback.
+    void presentBuffer(uint32_t outputId, uint64_t generation, size_t index)
+    {
+        if (!running) {
+            return;
+        }
+        for (auto& surfPtr : outputs) {
+            Output& surf = *surfPtr;
+            if (surf.id != outputId) {
+                continue;
+            }
+            if (surf.ringGeneration != generation ||
+                index >= surf.ring.size()) {
+                return;
+            }
+            Output::Buffer& buf = surf.ring[index];
+            buf.pendingPresent = false;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            surf.layer.contents = (__bridge id)buf.ioSurface;
+            [CATransaction commit];
+            return;
+        }
+    }
+
     void drawFrame(Output& surf)
     {
         if (!running || !renderFrame || !surf.visible) {
@@ -235,7 +338,33 @@ struct CocoaApp::Impl {
         if (pixelWidth != surf.configuredWidth ||
             pixelHeight != surf.configuredHeight) {
             surf.layer.contentsScale = scale;
-            configureSurface(surf, pixelWidth, pixelHeight);
+            if (bypassSwapchain) {
+                if (!ensureRing(surf, pixelWidth, pixelHeight)) {
+                    fprintf(stderr,
+                            "drift: buffer allocation failed for output %u\n",
+                            surf.id);
+                    return;
+                }
+            } else {
+                configureSurface(surf, pixelWidth, pixelHeight);
+            }
+        }
+
+        // Bypass: pick a ring buffer neither in flight on our queue nor
+        // still being read by the display; acquired before the clock
+        // advances so a fully busy ring doesn't consume scene time.
+        Output::Buffer* buffer = nullptr;
+        if (bypassSwapchain) {
+            for (auto& buf : surf.ring) {
+                if (!buf.pendingPresent && !IOSurfaceIsInUse(buf.ioSurface)) {
+                    buffer = &buf;
+                    break;
+                }
+            }
+            if (!buffer) {
+                surf.wantRedraw = true; // retry on the next tick
+                return;
+            }
         }
 
         // Scene time advances by capped wall-clock deltas: across a pause
@@ -258,6 +387,56 @@ struct CocoaApp::Impl {
         surf.lastDrawTime = t;
         surf.wakeDueWall = -1.0; // deadlines re-derive after every draw
 
+        FrameRequest request;
+        request.outputId = surf.id;
+        request.outputName = surf.name;
+        request.width = pixelWidth;
+        request.height = pixelHeight;
+        request.seconds = surf.sceneTime;
+        request.mouseX = surf.pointerSeen && bounds.width > 0
+                             ? (float)(surf.pointerX / bounds.width)
+                             : 0.5f;
+        request.mouseY = surf.pointerSeen && bounds.height > 0
+                             ? (float)(surf.pointerY / bounds.height)
+                             : 0.5f;
+        request.mouseActive = surf.pointerOver;
+
+        if (bypassSwapchain) {
+            wgpu::SharedTextureMemoryBeginAccessDescriptor ba{};
+            ba.initialized = buffer->everInitialized;
+            ba.concurrentRead = false;
+            if (buffer->memory.BeginAccess(buffer->texture, &ba) !=
+                wgpu::Status::Success) {
+                return;
+            }
+            request.target = buffer->texture.CreateView();
+            const bool presented = renderFrame(request);
+            wgpu::SharedTextureMemoryEndAccessState end{};
+            buffer->memory.EndAccess(buffer->texture, &end);
+            if (!presented) {
+                return; // nothing changed: no flip (§11)
+            }
+            buffer->everInitialized = true;
+            buffer->pendingPresent = true;
+            // Flip the layer only once the GPU has finished this frame's
+            // work — the display reads the IOSurface with no implicit
+            // sync against our queue. The completion fires on Dawn's
+            // thread; the flip belongs to the main one.
+            Impl* impl = this;
+            const uint32_t outputId = surf.id;
+            const uint64_t generation = surf.ringGeneration;
+            const size_t index = (size_t)(buffer - surf.ring.data());
+            gpu->device().GetQueue().OnSubmittedWorkDone(
+                wgpu::CallbackMode::AllowSpontaneous,
+                [impl, outputId, generation, index](wgpu::QueueWorkDoneStatus,
+                                                    wgpu::StringView) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        impl->presentBuffer(outputId, generation, index);
+                    });
+                });
+            return;
+        }
+
         wgpu::SurfaceTexture surfaceTexture{};
         surf.surface.GetCurrentTexture(&surfaceTexture);
         if (surfaceTexture.status !=
@@ -277,21 +456,7 @@ struct CocoaApp::Impl {
             }
         }
 
-        FrameRequest request;
-        request.outputId = surf.id;
-        request.outputName = surf.name;
         request.target = surfaceTexture.texture.CreateView();
-        request.width = pixelWidth;
-        request.height = pixelHeight;
-        request.seconds = surf.sceneTime;
-        request.mouseX = surf.pointerSeen && bounds.width > 0
-                             ? (float)(surf.pointerX / bounds.width)
-                             : 0.5f;
-        request.mouseY = surf.pointerSeen && bounds.height > 0
-                             ? (float)(surf.pointerY / bounds.height)
-                             : 0.5f;
-        request.mouseActive = surf.pointerOver;
-
         if (renderFrame(request)) {
             surf.surface.Present();
         }
@@ -405,6 +570,11 @@ using Output = drift::platform::CocoaApp::Output;
 
 - (CALayer*)makeBackingLayer
 {
+    // Bypass path presents by flipping contents on a plain layer; the
+    // swapchain path needs the Metal layer's drawable machinery.
+    if (self.surf && self.surf->impl->bypassSwapchain) {
+        return [CALayer layer];
+    }
     return [CAMetalLayer layer];
 }
 
@@ -585,7 +755,7 @@ bool CocoaApp::Impl::createOutput(NSScreen* screen)
     view.surf = surf.get();
     view.wantsLayer = YES;
     surf->view = view;
-    surf->layer = (CAMetalLayer*)view.layer;
+    surf->layer = view.layer;
     surf->layer.contentsScale = surf->window.backingScaleFactor;
     surf->window.contentView = view;
 
@@ -594,28 +764,33 @@ bool CocoaApp::Impl::createOutput(NSScreen* screen)
     surf->windowDelegate = delegate;
     surf->window.delegate = delegate;
 
-    wgpu::SurfaceSourceMetalLayer layerSource{};
-    layerSource.layer = (__bridge void*)surf->layer;
-    wgpu::SurfaceDescriptor surfaceDesc{};
-    surfaceDesc.nextInChain = &layerSource;
-    surf->surface = gpu->instance().CreateSurface(&surfaceDesc);
-    if (!surf->surface) {
-        fprintf(stderr, "drift: cannot create surface for CAMetalLayer\n");
-        surf->window.delegate = nil;
-        view.surf = nullptr;
-        delegate.surf = nullptr;
-        [surf->window close];
-        return false;
-    }
-    if (format == wgpu::TextureFormat::Undefined) {
-        wgpu::SurfaceCapabilities caps{};
-        if (surf->surface.GetCapabilities(gpu->adapter(), &caps) !=
-                wgpu::Status::Success ||
-            caps.formatCount == 0) {
-            fprintf(stderr, "drift: no supported surface format\n");
+    if (bypassSwapchain) {
+        // The ring's IOSurfaces are BGRA; drawFrame allocates it lazily.
+        format = wgpu::TextureFormat::BGRA8Unorm;
+    } else {
+        wgpu::SurfaceSourceMetalLayer layerSource{};
+        layerSource.layer = (__bridge void*)surf->layer;
+        wgpu::SurfaceDescriptor surfaceDesc{};
+        surfaceDesc.nextInChain = &layerSource;
+        surf->surface = gpu->instance().CreateSurface(&surfaceDesc);
+        if (!surf->surface) {
+            fprintf(stderr, "drift: cannot create surface for CAMetalLayer\n");
+            surf->window.delegate = nil;
+            view.surf = nullptr;
+            delegate.surf = nullptr;
+            [surf->window close];
             return false;
         }
-        format = caps.formats[0];
+        if (format == wgpu::TextureFormat::Undefined) {
+            wgpu::SurfaceCapabilities caps{};
+            if (surf->surface.GetCapabilities(gpu->adapter(), &caps) !=
+                    wgpu::Status::Success ||
+                caps.formatCount == 0) {
+                fprintf(stderr, "drift: no supported surface format\n");
+                return false;
+            }
+            format = caps.formats[0];
+        }
     }
 
     DriftLinkTarget* linkTarget = [DriftLinkTarget new];
@@ -651,6 +826,7 @@ bool CocoaApp::Impl::createOutput(NSScreen* screen)
 void CocoaApp::Impl::destroyOutput(Output* surf)
 {
     disarmWakeTimer(*surf);
+    destroyRing(*surf);
     if (surf->link) {
         [surf->link invalidate];
         surf->link = nil;
@@ -757,6 +933,21 @@ bool CocoaApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width,
         return false;
     }
 
+    // DRIFT_PRESENT=iosurface: render into a self-allocated IOSurface ring
+    // and flip layer contents, skipping the CAMetalLayer drawable
+    // machinery; =drawable (default) presents through the Dawn surface.
+    if (const char* present = getenv("DRIFT_PRESENT"); present && *present) {
+        if (!strcmp(present, "iosurface")) {
+            impl.bypassSwapchain = true;
+        } else if (strcmp(present, "drawable") != 0) {
+            fprintf(stderr, "drift: unknown DRIFT_PRESENT '%s' (drawable, "
+                            "iosurface)\n", present);
+            return false;
+        }
+        printf("drift: presentation: %s\n",
+               impl.bypassSwapchain ? "iosurface ring" : "drawable");
+    }
+
     [NSApplication sharedApplication];
     if (mode == SurfaceMode::Wallpaper) {
         // No Dock icon, no menu bar, never steals focus.
@@ -793,6 +984,9 @@ bool CocoaApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width,
         // display may attach later). The format is still needed for the
         // caller's pipelines before any window exists; probe a detached
         // layer once.
+        if (impl.bypassSwapchain) {
+            impl.format = wgpu::TextureFormat::BGRA8Unorm;
+        }
         if (impl.format == wgpu::TextureFormat::Undefined) {
             wgpu::SurfaceSourceMetalLayer layerSource{};
             CAMetalLayer* probe = [CAMetalLayer layer];
