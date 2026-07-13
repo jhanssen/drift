@@ -117,8 +117,11 @@ struct CocoaApp::Impl {
     bool running = true;
     bool started = false; // run() reached; display links may tick
     bool scenePaused = false;
-    bool bypassSwapchain = false; // DRIFT_PRESENT=iosurface
-    double maxFrameRate = 0.0;    // 0 = display rate
+    // IOSurface-ring presentation is the default (~30% less per-frame CPU
+    // than the drawable swapchain); DRIFT_PRESENT=drawable keeps the old
+    // path reachable until it has earned deletion.
+    bool bypassSwapchain = true;
+    double maxFrameRate = 0.0; // 0 = display rate
     double startTime = 0.0;
 
     double now() const
@@ -336,10 +339,21 @@ struct CocoaApp::Impl {
         if (pixelWidth == 0 || pixelHeight == 0) {
             return;
         }
+        uint32_t targetWidth = pixelWidth, targetHeight = pixelHeight;
         if (pixelWidth != surf.configuredWidth ||
             pixelHeight != surf.configuredHeight) {
-            surf.layer.contentsScale = scale;
-            if (bypassSwapchain) {
+            if (bypassSwapchain && !surf.ring.empty() &&
+                surf.view.inLiveResize) {
+                // Mid-drag: keep rendering the current ring and let the
+                // layer scale it; viewDidEndLiveResize rebuilds once at
+                // the final size. Rebuilding per tick would also outrun
+                // the completion flips (each rebuild bumps the ring
+                // generation, dropping them), freezing the image for the
+                // whole drag.
+                targetWidth = surf.configuredWidth;
+                targetHeight = surf.configuredHeight;
+            } else if (bypassSwapchain) {
+                surf.layer.contentsScale = scale;
                 if (!ensureRing(surf, pixelWidth, pixelHeight)) {
                     fprintf(stderr,
                             "drift: buffer allocation failed for output %u\n",
@@ -347,6 +361,7 @@ struct CocoaApp::Impl {
                     return;
                 }
             } else {
+                surf.layer.contentsScale = scale;
                 configureSurface(surf, pixelWidth, pixelHeight);
             }
         }
@@ -391,8 +406,8 @@ struct CocoaApp::Impl {
         FrameRequest request;
         request.outputId = surf.id;
         request.outputName = surf.name;
-        request.width = pixelWidth;
-        request.height = pixelHeight;
+        request.width = targetWidth;
+        request.height = targetHeight;
         request.seconds = surf.sceneTime;
         request.mouseX = surf.pointerSeen && bounds.width > 0
                              ? (float)(surf.pointerX / bounds.width)
@@ -653,6 +668,15 @@ using Output = drift::platform::CocoaApp::Output;
 {
     [super setFrameSize:newSize];
     if (self.surf) {
+        self.surf->impl->requestRedraw(*self.surf);
+    }
+}
+
+- (void)viewDidEndLiveResize
+{
+    [super viewDidEndLiveResize];
+    if (self.surf) {
+        // The drag rendered into the old ring; rebuild at the final size.
         self.surf->impl->requestRedraw(*self.surf);
     }
 }
@@ -940,20 +964,22 @@ bool CocoaApp::setup(Gpu& gpu, SurfaceMode mode, uint32_t width,
         return false;
     }
 
-    // DRIFT_PRESENT=iosurface: render into a self-allocated IOSurface ring
-    // and flip layer contents, skipping the CAMetalLayer drawable
-    // machinery; =drawable (default) presents through the Dawn surface.
+    // DRIFT_PRESENT=iosurface (default): render into a self-allocated
+    // IOSurface ring and flip layer contents, skipping the CAMetalLayer
+    // drawable machinery; =drawable presents through the Dawn surface —
+    // kept as an escape hatch, to be deleted once the ring has real
+    // desktop mileage.
     if (const char* present = getenv("DRIFT_PRESENT"); present && *present) {
-        if (!strcmp(present, "iosurface")) {
-            impl.bypassSwapchain = true;
-        } else if (strcmp(present, "drawable") != 0) {
-            fprintf(stderr, "drift: unknown DRIFT_PRESENT '%s' (drawable, "
-                            "iosurface)\n", present);
+        if (!strcmp(present, "drawable")) {
+            impl.bypassSwapchain = false;
+        } else if (strcmp(present, "iosurface") != 0) {
+            fprintf(stderr, "drift: unknown DRIFT_PRESENT '%s' (iosurface, "
+                            "drawable)\n", present);
             return false;
         }
-        printf("drift: presentation: %s\n",
-               impl.bypassSwapchain ? "iosurface ring" : "drawable");
     }
+    printf("drift: presentation: %s\n",
+           impl.bypassSwapchain ? "iosurface ring" : "drawable");
 
     [NSApplication sharedApplication];
     if (mode == SurfaceMode::Wallpaper) {
