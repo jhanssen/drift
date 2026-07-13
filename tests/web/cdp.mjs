@@ -3,6 +3,9 @@
 // replies out). Pipe mode needs no debug port and no WebSocket client,
 // so the harness stays dependency-free and can't race another Chrome.
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 export class Chrome {
     #child; #buf = ''; #id = 0; #pending = new Map(); #listeners = [];
@@ -13,8 +16,11 @@ export class Chrome {
         child.stdio[4].on('data', (d) => this.#onData(d));
     }
 
-    // Extra flags welcome; the caller owns userDataDir cleanup.
+    // Extra flags welcome; the caller owns userDataDir cleanup. Unset, it
+    // falls back to a fresh temp dir — interpolating undefined would make
+    // Chrome dump a profile into a literal ./undefined in the cwd.
     static launch(binary, { headful = false, userDataDir, flags = [] } = {}) {
+        userDataDir ??= mkdtempSync(join(tmpdir(), 'drift-cdp-'));
         const args = [
             '--remote-debugging-pipe',
             '--no-first-run',
