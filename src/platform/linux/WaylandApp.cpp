@@ -19,6 +19,8 @@
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "commit-timing-v1-client-protocol.h"
+#include "presentation-time-client-protocol.h"
 
 namespace drift::platform {
 
@@ -79,6 +81,12 @@ void seatCapabilities(void* data, wl_seat*, uint32_t capabilities)
 }
 void seatName(void*, wl_seat*, const char*) {}
 const wl_seat_listener kSeatListener = { seatCapabilities, seatName };
+
+void presentationClockId(void* data, wp_presentation*, uint32_t clkId)
+{
+    static_cast<WaylandApp*>(data)->onPresentationClock(clkId);
+}
+const wp_presentation_listener kPresentationListener = { presentationClockId };
 
 // The listener data starts as the PendingOutput and is nulled once the
 // output is adopted or released — later property bursts (mode changes
@@ -252,6 +260,9 @@ WaylandApp::~WaylandApp()
     if (mSeat) wl_seat_destroy(mSeat);
     if (mFractionalScaleManager)
         wp_fractional_scale_manager_v1_destroy(mFractionalScaleManager);
+    if (mCommitTimingManager)
+        wp_commit_timing_manager_v1_destroy(mCommitTimingManager);
+    if (mPresentation) wp_presentation_destroy(mPresentation);
     if (mViewporter) wp_viewporter_destroy(mViewporter);
     if (mFeedback) zwp_linux_dmabuf_feedback_v1_destroy(mFeedback);
     if (mFormatTable) munmap(const_cast<void*>(mFormatTable), mFormatTableSize);
@@ -297,6 +308,14 @@ void WaylandApp::onGlobal(uint32_t name, const char* interface, uint32_t version
         mFractionalScaleManager =
             (wp_fractional_scale_manager_v1*)wl_registry_bind(
                 mRegistry, name, &wp_fractional_scale_manager_v1_interface, 1);
+    } else if (!strcmp(interface, wp_commit_timing_manager_v1_interface.name)) {
+        mCommitTimingManager = (wp_commit_timing_manager_v1*)wl_registry_bind(
+            mRegistry, name, &wp_commit_timing_manager_v1_interface, 1);
+    } else if (!strcmp(interface, wp_presentation_interface.name)) {
+        mPresentation = (wp_presentation*)wl_registry_bind(
+            mRegistry, name, &wp_presentation_interface, 1);
+        wp_presentation_add_listener(mPresentation, &kPresentationListener,
+                                     this);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
         mSeat = (wl_seat*)wl_registry_bind(mRegistry, name, &wl_seat_interface,
                                            std::min(version, 2u));
@@ -568,9 +587,22 @@ void WaylandApp::onPreferredScale(OutputSurface* surf, uint32_t scale120)
     }
 }
 
+void WaylandApp::onPresentationClock(uint32_t clockId)
+{
+    mPresentationClock = (clockid_t)clockId;
+}
+
 void WaylandApp::onFrameDone(OutputSurface* surf)
 {
     surf->framePending = false;
+    // Timer pacing (--fps without commit-timing): skip the immediate
+    // redraw until the next slot; the run loop draws the surface when
+    // due. With commit-timing the compositor already held the commit, so
+    // this callback itself arrives at the capped cadence.
+    if (mMaxFrameRate > 0.0 && !surf->commitTimer && surf->nextDue >= 0.0 &&
+        now() < surf->nextDue) {
+        return;
+    }
     drawFrame(*surf);
 }
 
@@ -601,6 +633,13 @@ bool WaylandApp::createOutputSurface(wl_output* output, uint32_t id,
     surf->outputVersion = outputVersion;
     surf->output = output;
     surf->surface = wl_compositor_create_surface(mCompositor);
+    if (mCommitTimingManager) {
+        // Exactly one timer per surface (commit_timer_exists); it only
+        // constrains commits that set a timestamp (--fps), so an uncapped
+        // run behaves identically with or without it.
+        surf->commitTimer = wp_commit_timing_manager_v1_get_timer(
+            mCommitTimingManager, surf->surface);
+    }
 
     if (mMode == SurfaceMode::Wallpaper) {
         surf->layerSurface = zwlr_layer_shell_v1_get_layer_surface(
@@ -661,6 +700,7 @@ void WaylandApp::destroyOutputSurface(OutputSurface* surf)
     if (surf->layerSurface) zwlr_layer_surface_v1_destroy(surf->layerSurface);
     if (surf->toplevel) xdg_toplevel_destroy(surf->toplevel);
     if (surf->xdgSurface) xdg_surface_destroy(surf->xdgSurface);
+    if (surf->commitTimer) wp_commit_timer_v1_destroy(surf->commitTimer);
     if (surf->surface) wl_surface_destroy(surf->surface);
     if (surf->output) releaseOutput(surf->output, surf->outputVersion);
     if (mPointerSurface == surf->surface) {
@@ -959,6 +999,13 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     const double t = now();
     if (surf.lastDrawTime >= 0.0 && !mScenePaused) {
         double cap = 0.1;
+        if (mMaxFrameRate > 0.0) {
+            // A paced frame gap is elapsed scene time, not an occlusion
+            // pause: keep the resume cap above the pacing period so low
+            // caps (< 10fps) don't slow animations down (§9.7 still
+            // bounds a real pause to one period + slack).
+            cap = std::max(cap, 1.0 / mMaxFrameRate + 0.017);
+        }
         if (surf.wakeDueWall >= 0.0 && mWakeQuery) {
             const double deadline = mWakeQuery(surf.id);
             if (deadline > surf.sceneTime) {
@@ -1000,6 +1047,31 @@ void WaylandApp::drawFrame(OutputSurface& surf)
     wl_surface_damage_buffer(surf.surface, 0, 0, INT32_MAX, INT32_MAX);
     wl_callback* cb = wl_surface_frame(surf.surface);
     wl_callback_add_listener(cb, &kFrameListener, &surf);
+    if (mMaxFrameRate > 0.0) {
+        if (surf.commitTimer) {
+            // Latch this commit one period after the previous target (or
+            // now, when behind): the compositor holds it until then, so
+            // the frame callback arrives at the capped cadence and the
+            // draw-on-frame-done flow self-paces.
+            const uint64_t period = (uint64_t)(1e9 / mMaxFrameRate + 0.5);
+            timespec ts{};
+            clock_gettime(mPresentationClock, &ts);
+            const uint64_t pnow =
+                (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+            const uint64_t target =
+                std::max(surf.commitTargetNs + period, pnow);
+            const uint64_t sec = target / 1000000000ull;
+            wp_commit_timer_v1_set_timestamp(
+                surf.commitTimer, (uint32_t)(sec >> 32), (uint32_t)sec,
+                (uint32_t)(target % 1000000000ull));
+            surf.commitTargetNs = target;
+        } else {
+            // Timer pacing: the next draw for this surface is due one
+            // period on (drift-free: advanced from the previous due time,
+            // not from now, unless we fell behind).
+            surf.nextDue = std::max(surf.nextDue + 1.0 / mMaxFrameRate, t);
+        }
+    }
     wl_surface_commit(surf.surface);
     buf->busy = true;
     surf.framePending = true;
@@ -1044,16 +1116,31 @@ int WaylandApp::run(RenderFrame renderFrame)
         // An animated output not mid-commit ticks at ~60Hz so time keeps
         // flowing — the ticks are CPU-side value-graph evaluations only
         // unless something dirties. Static outputs sleep until an event,
-        // frame callback, or armed module-timer deadline.
+        // frame callback, or armed module-timer deadline. Under --fps
+        // timer pacing, a capped surface waiting out its slot sleeps
+        // exactly until it is due instead of forcing the 16ms tick.
         bool tick = false;
+        double dueWaitMs = -1.0;
+        const double tnow = now();
         for (const auto& surf : mSurfaces) {
-            if (surf->configured && !surf->framePending &&
-                animatedFor(*surf)) {
-                tick = true;
-                break;
+            if (!surf->configured || surf->framePending ||
+                !animatedFor(*surf)) {
+                continue;
             }
+            if (mMaxFrameRate > 0.0 && !surf->commitTimer &&
+                surf->nextDue > tnow) {
+                const double waitMs = (surf->nextDue - tnow) * 1000.0;
+                dueWaitMs =
+                    dueWaitMs < 0.0 ? waitMs : std::min(dueWaitMs, waitMs);
+                continue;
+            }
+            tick = true;
         }
         int timeout = tick ? 16 : -1;
+        if (dueWaitMs >= 0.0) {
+            const int ms = (int)std::min(dueWaitMs + 1.0, 86400000.0);
+            timeout = timeout < 0 ? ms : std::min(timeout, ms);
+        }
         // §4.4 module timers: a quiescent scene with a wake_after_ms
         // deadline sleeps exactly until it is due (drawFrame then lets
         // the clock stride to the deadline), instead of forever. The
@@ -1065,7 +1152,6 @@ int WaylandApp::run(RenderFrame renderFrame)
         // arm (and do not wake the loop); animated surfaces do not arm
         // because their ticks consume deadlines as they come due.
         if (mWakeQuery) {
-            const double tnow = now();
             for (const auto& surf : mSurfaces) {
                 if (!surf->configured || surf->framePending ||
                     mScenePaused || animatedFor(*surf)) {
@@ -1109,15 +1195,23 @@ int WaylandApp::run(RenderFrame renderFrame)
             if (ready == 0) {
                 // Timeout: tick animated outputs; a static output draws
                 // only when its armed module-timer deadline is due.
-                const double tnow = now();
+                const double twake = now();
                 for (size_t i = 0; i < mSurfaces.size(); ++i) {
                     OutputSurface* surf = mSurfaces[i].get();
                     if (surf->framePending) {
                         continue;
                     }
+                    // --fps timer pacing: an animated capped surface
+                    // draws only once its slot is due (static surfaces
+                    // stay ungated — nothing periodic to pace, §4.4
+                    // deadline draws are one-offs).
+                    if (mMaxFrameRate > 0.0 && !surf->commitTimer &&
+                        animatedFor(*surf) && twake < surf->nextDue) {
+                        continue;
+                    }
                     if (animatedFor(*surf) ||
                         (surf->wakeDueWall >= 0.0 &&
-                         tnow >= surf->wakeDueWall)) {
+                         twake >= surf->wakeDueWall)) {
                         drawFrame(*surf);
                     }
                 }

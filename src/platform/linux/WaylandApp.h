@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <time.h> // clockid_t (wp_presentation clock domain)
+
 #include "Gpu.h"
 
 struct wl_display;
@@ -41,6 +43,9 @@ struct wp_viewporter;
 struct wp_viewport;
 struct wp_fractional_scale_manager_v1;
 struct wp_fractional_scale_v1;
+struct wp_commit_timing_manager_v1;
+struct wp_commit_timer_v1;
+struct wp_presentation;
 
 namespace drift::platform {
 
@@ -144,10 +149,15 @@ public:
     }
 
     // Present at most fps frames per second (0 = compositor rate). Set
-    // before setup(). NOT ENFORCED YET on this backend — the run loop's
-    // pacing (wp_commit_timing_v1 latch timestamps where available, timer
-    // pacing otherwise) is pending; until then the cap is stored and
-    // ignored.
+    // before setup(). Two mechanisms: with wp_commit_timing_v1 each
+    // presented commit carries a latch timestamp paced one period apart
+    // (in the wp_presentation clock domain) — the compositor holds the
+    // commit until then, so frame callbacks arrive at the capped cadence
+    // and the draw-on-frame-done flow self-paces. Without it, timer
+    // pacing: onFrameDone defers the redraw until the surface's next due
+    // time and the run loop draws it when due. Scene time stays
+    // wall-clock-driven either way — animations play at speed with fewer
+    // frames (§13.3); static scenes are unaffected (nothing to pace).
     void setMaxFrameRate(double fps) { mMaxFrameRate = fps; }
 
     // Requests a redraw on every surface (a parameter changed): the frame
@@ -212,6 +222,13 @@ public:
         xdg_toplevel* toplevel = nullptr;
         wp_viewport* viewport = nullptr;
         wp_fractional_scale_v1* fractionalScale = nullptr;
+        // --fps pacing. commitTimer latches capped commits (exactly one
+        // timer per wl_surface); commitTargetNs is the last latch target
+        // (wp_presentation clock, ns). nextDue is the timer-pacing
+        // fallback's earliest next draw in now() time; negative = none.
+        wp_commit_timer_v1* commitTimer = nullptr;
+        uint64_t commitTargetNs = 0;
+        double nextDue = -1.0;
         std::vector<Buffer> buffers;
         // Logical (surface-coordinate) size from configure; buffers are
         // allocated at logical x scale physical pixels and mapped back via
@@ -274,6 +291,7 @@ public:
     void onPreferredScale(OutputSurface* surf, uint32_t scale120);
     void onFrameDone(OutputSurface* surf);
     void onBufferRelease(wl_buffer* buffer);
+    void onPresentationClock(uint32_t clockId);
 
 private:
     bool createOutputSurface(wl_output* output, uint32_t id,
@@ -316,6 +334,12 @@ private:
     const void* mFormatTable = nullptr;
     uint32_t mFormatTableSize = 0;
     bool mFeedbackAccumulating = false;
+
+    // --fps pacing: commit-timing latches when advertised; wp_presentation
+    // supplies the clock domain those latch timestamps live in.
+    wp_commit_timing_manager_v1* mCommitTimingManager = nullptr;
+    wp_presentation* mPresentation = nullptr;
+    clockid_t mPresentationClock = CLOCK_MONOTONIC;
 
     wl_seat* mSeat = nullptr;
     wl_pointer* mPointer = nullptr;

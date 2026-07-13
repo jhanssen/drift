@@ -217,6 +217,8 @@ else()
         ${WLGEN}/linux-dmabuf-v1-protocol.c
         ${WLGEN}/viewporter-protocol.c
         ${WLGEN}/fractional-scale-v1-protocol.c
+        ${WLGEN}/commit-timing-v1-protocol.c
+        ${WLGEN}/presentation-time-protocol.c
     )
     target_include_directories(drift PRIVATE
         ${WLGEN}
