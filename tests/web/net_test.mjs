@@ -310,11 +310,15 @@ try {
                     { url: `http://127.0.0.1:${staticPort}/drift.html` });
 
     // The app is up once the default scene loads (device + storage
-    // preload both gated behind it).
+    // preload both gated behind it). Gated on describe answering, not on
+    // Module.calledRun — emscripten stopped exposing that; before the
+    // runtime is initialized the ccall throws and we keep polling.
     for (;;) {
         const desc = await page.eval(
-            `typeof Module !== 'undefined' && Module.calledRun
-                 ? Module.ccall('drift_describe', 'string', [], []) : null`);
+            `(() => { try {
+                 return typeof Module !== 'undefined' && Module.ccall
+                     ? Module.ccall('drift_describe', 'string', [], []) : null;
+             } catch { return null; } })()`);
         if (desc && JSON.parse(desc).scene) {
             break;
         }
