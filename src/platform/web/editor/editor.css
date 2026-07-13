@@ -94,10 +94,14 @@
   .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
   .row label { flex: 0 0 110px; overflow: hidden; text-overflow: ellipsis;
                white-space: nowrap; }
+  /* Rows that hold only buttons wrap whole buttons instead of squeezing
+     them into breaking their labels. */
+  .row.wrap { flex-wrap: wrap; }
+  .row button { white-space: nowrap; }
   /* A select's min-content width is its longest option, and flex items
      won't shrink below min-content by default — a long project name would
-     push the row's buttons out of the panel. The opened list still shows
-     full names; only the closed control truncates. */
+     otherwise widen the panel. The opened list still shows full names;
+     only the closed control truncates. */
   #sceneSelect { flex: 1 1 auto; min-width: 0; }
   input, select, button {
     font: inherit; color: var(--text); background: var(--bg);
